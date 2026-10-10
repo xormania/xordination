@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Contracts and package (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile and contract tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+      - name: Build and install package
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python -m pip install --no-deps dist/*.whl
+          cd "$(mktemp -d)"
+          python -I -c 'import xordination; assert xordination.__version__ == "0.1.0"'
+          xordination --version
+          xordination --help
+      - name: Detect image changes
+        if: matrix.python == '3.12'
+        id: image
+        env:
+          XORDINATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          XORDINATION_HEAD_SHA: ${{ github.sha }}
+          XORDINATION_EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$XORDINATION_EVENT" = workflow_dispatch ]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          else
+            if git cat-file -e "$XORDINATION_BASE_SHA^{commit}" 2>/dev/null; then
+              git diff --name-only "$XORDINATION_BASE_SHA" "$XORDINATION_HEAD_SHA" > /tmp/xordination-changes
+            else
+              git show --format= --name-only "$XORDINATION_HEAD_SHA" > /tmp/xordination-changes
+            fi
+            if grep -Eq '^(src/|Dockerfile$|\.dockerignore$|README\.md$|pyproject\.toml$|MANIFEST\.in$|LICENSE$|NOTICE$|\.github/workflows/ci\.yml$)' /tmp/xordination-changes; then
+              echo 'build=true' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Build optional broker image
+        if: steps.image.outputs.build == 'true'
+        run: |
+          docker build --tag xordination-ci .
+          docker run --rm xordination-ci --version
+          docker run --rm xordination-ci --help
+
