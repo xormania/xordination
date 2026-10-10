@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+build
+dist
+*.egg-info
+tests
+docs
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
