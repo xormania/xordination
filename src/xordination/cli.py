@@ -16,17 +16,10 @@ def token_from_env(name):
     return value
 
 
-def write_json(value, output=None):
+def write_json(value):
     text = json.dumps(value, indent=2, allow_nan=False) + "\n"
-    if output:
-        path = Path(output)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(text)
-    else:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
 
 def issue_binding(store, args):

@@ -127,23 +127,31 @@ class MCPTests(unittest.TestCase):
     def test_wait_saturation_does_not_starve_send_and_cancellation_ends_waits(self):
         self.initialize()
         entered = threading.Condition()
-        count = [0]
+        active_requests = set()
+        active_workers = set()
+        release = threading.Event()
+        self.addCleanup(release.set)
 
         def handler(operation, params):
             if operation == "wait":
                 with entered:
-                    count[0] += 1
+                    active_requests.add(params["cursor"])
+                    active_workers.add(threading.get_ident())
                     entered.notify_all()
-                time.sleep(min(params["timeout"], 0.1))
+                if not release.wait(5):
+                    raise TimeoutError("Active wait requests were not released")
                 return {"messages": [], "cursor": "position-0"}
             return {"id": "accepted", "state": "queued"}
 
         self.client.handler = handler
         for ident in range(4):
             self.server.receive({"jsonrpc": "2.0", "id": ident, "method": "tools/call",
-                                 "params": {"name": "xordination_wait", "arguments": {"timeout": 30}}})
+                                 "params": {"name": "xordination_wait", "arguments": {
+                                     "cursor": "request-" + str(ident), "timeout": 30}}})
         with entered:
-            self.assertTrue(entered.wait_for(lambda: count[0] >= 4, timeout=2))
+            self.assertTrue(entered.wait_for(lambda: len(active_requests) == 4, timeout=2))
+            self.assertEqual({"request-" + str(ident) for ident in range(4)}, active_requests)
+            self.assertEqual(4, len(active_workers))
         self.server.receive({"jsonrpc": "2.0", "id": "overload", "method": "tools/call",
                              "params": {"name": "xordination_wait", "arguments": {"timeout": 30}}})
         self.assertEqual(-32000, self.output.await_packet(lambda p: p.get("id") == "overload")["error"]["code"])
@@ -152,6 +160,7 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(self.output.await_packet(lambda p: p.get("id") == "send")["result"]["isError"])
         for ident in range(4):
             self.server.receive({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": ident}})
+        release.set()
         for ident in range(4):
             self.assertEqual(-32800, self.output.await_packet(lambda p: p.get("id") == ident)["error"]["code"])
 

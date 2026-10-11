@@ -10,4 +10,6 @@ dist/
 *.db-*
 .env
 .xordination/
+.coverage*
+coverage-artifacts/
 

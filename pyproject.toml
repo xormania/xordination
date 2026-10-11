@@ -21,6 +21,9 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 
+[project.optional-dependencies]
+ci = ["coverage==7.16.2"]
+
 [project.scripts]
 xordination = "xordination.cli:main"
 

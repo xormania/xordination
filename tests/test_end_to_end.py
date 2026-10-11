@@ -1,6 +1,5 @@
 """Exercise the actual stdio -> authenticated HTTP -> SQLite boundary."""
 
-import contextlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ import tempfile
 import threading
 import unittest
 
-from xordination.server import BrokerServer
+from helpers import owned_broker
 from xordination.store import Store
 
 
@@ -112,30 +111,11 @@ class MCPProcess:
         self.stderr.close()
 
 
-@contextlib.contextmanager
-def broker(path):
-    store = Store(path)
-    server = None
-    thread = None
-    try:
-        server = BrokerServer(("127.0.0.1", 0), store)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        yield store, "http://127.0.0.1:" + str(server.server_port)
-    finally:
-        if server:
-            server.shutdown()
-            server.server_close()
-        if thread:
-            thread.join(timeout=2)
-        store.close()
-
-
 class EndToEndTests(unittest.TestCase):
     def test_two_stdio_clients_exchange_authenticated_message_and_durable_receipt(self):
         with tempfile.TemporaryDirectory() as temp:
             state = str(Path(temp) / "broker.sqlite3")
-            with broker(state) as (store, endpoint):
+            with owned_broker(state) as (store, _, endpoint):
                 store.create_space("independent-project")
                 alice = store.join("independent-project", "alice")
                 bob = store.join("independent-project", "bob")

@@ -12,4 +12,6 @@ docs
 *.sqlite3-*
 *.db
 *.db-*
+.coverage*
+coverage-artifacts
 
