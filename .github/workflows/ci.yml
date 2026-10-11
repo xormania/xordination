@@ -6,6 +6,23 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      benchmark_messages:
+        description: Broker work units per trial (1–128)
+        type: number
+        default: 8
+      benchmark_trials:
+        description: Measured trials after one warmup (2–12)
+        type: number
+        default: 3
+      benchmark_workers:
+        description: Concurrent independent peer pairs (1–16)
+        type: number
+        default: 4
+      benchmark_base:
+        description: Optional complete baseline commit SHA for a same-runner comparison
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -52,7 +69,7 @@ jobs:
           PY
       - name: Compile selected contract context
         if: steps.selection.outputs.contracts == 'true'
-        run: python -m compileall -q src tests scripts/ci
+        run: python -m compileall -q src tests scripts/ci scripts/testing
       - name: Selected contracts and canonical coverage
         if: matrix.python == '3.12' && steps.selection.outputs.contracts == 'true'
         env:
@@ -63,9 +80,13 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          python scripts/ci/run_contracts.py --selection "$RUNNER_TEMP/xordination-selection.json"
+          python scripts/ci/run_contracts.py --selection "$RUNNER_TEMP/xordination-selection.json" --report "$RUNNER_TEMP/xordination-test-execution.json"
           python -m xordination --version
           python -m xordination --help
+      - name: Broker performance evidence (base and head, report-only timing)
+        id: benchmark
+        if: matrix.python == '3.12' && steps.selection.outputs.benchmark == 'true'
+        run: python scripts/ci/benchmark_compare.py --output "$RUNNER_TEMP/xordination-performance"
       - name: Source archive to isolated installed package
         if: matrix.python == '3.12' && steps.selection.outputs.package == 'true'
         run: python scripts/ci/check_package.py
@@ -83,6 +104,14 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+      - name: Preserve performance evidence
+        if: always() && matrix.python == '3.12' && steps.selection.outputs.benchmark == 'true' && steps.benchmark.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-python-3.12
+          path: ${{ runner.temp }}/xordination-performance/
+          if-no-files-found: error
+          retention-days: 14
       - name: Report selected checks
         if: always()
         run: |
@@ -94,4 +123,13 @@ jobs:
                   report.write('Selected checks:\n\n```json\n' + json.dumps(json.loads(selection.read_text()), indent=2) + '\n```\n')
               else:
                   report.write('Selection failed before publishing a result; this job cannot authorize a skip.\n')
+              for name, filename in (
+                  ('Contract execution census', 'xordination-test-execution.json'),
+                  ('Canonical contract execution census', 'xordination-coverage/test-execution.json'),
+                  ('Performance context', 'xordination-performance/ci-context.json'),
+                  ('Performance comparison', 'xordination-performance/comparison.json'),
+              ):
+                  evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / filename
+                  if evidence.is_file():
+                      report.write('\n' + name + ':\n\n```json\n' + json.dumps(json.loads(evidence.read_text()), indent=2) + '\n```\n')
           PY
