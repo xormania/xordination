@@ -9,24 +9,25 @@ import subprocess
 
 
 GROUPS = ("store", "adapters", "mcp", "server", "cli", "end_to_end", "ci_selection",
-          "behavior", "performance", "live_acceptance")
+          "behavior", "performance", "live_acceptance", "live_native_busy")
 SOURCE_GROUPS = {
-    "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
-    "adapters.py": ("adapters", "cli", "behavior", "live_acceptance"),
-    "rpc.py": ("adapters", "behavior", "live_acceptance"),
+    "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
+    "adapters.py": ("adapters", "cli", "behavior", "live_acceptance", "live_native_busy"),
+    "rpc.py": ("adapters", "behavior", "live_acceptance", "live_native_busy"),
     # Native adapters consume TOOLS and INSTRUCTIONS through lazy imports.
-    "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance"),
-    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
-    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
+    "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"),
+    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
+    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
-    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance"),
+    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }
 TEST_GROUPS = {"tests/test_" + name + ".py": (name,) for name in GROUPS}
+TEST_GROUPS["tests/live_native_fixture.py"] = ("live_native_busy",)
 SCRIPT_GROUPS = {
     "scripts/testing/benchmark.py": ("performance",),
-    "scripts/testing/live.py": ("live_acceptance",),
+    "scripts/testing/live.py": ("live_acceptance", "live_native_busy"),
 }
 BUILD_INPUTS = {"pyproject.toml", "MANIFEST.in"}
 IMAGE_PACKAGE_INPUTS = {"README.md", "LICENSE", "NOTICE", "Dockerfile"}

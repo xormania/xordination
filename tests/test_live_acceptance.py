@@ -3,13 +3,18 @@ import hashlib
 import importlib.util
 import json
 import os
+import queue
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+import threading
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from helpers import owned_broker
+from xordination.client import Client
 from xordination.store import Store
 
 
@@ -39,7 +44,8 @@ class LiveAcceptanceTests(unittest.TestCase):
 
     def emit(self, name, tool, arguments, *, call_id=None, native_id=None):
         binding = self.frozen["bindings"][name]
-        origin = {"codex": "codex/item/tool/call", "grok": "grok/session/update"}[binding["harness"]]
+        origin = {"codex": "codex/item/tool/call", "grok": "grok/session/update",
+                  "claude": "claude/PreToolUse"}[binding["harness"]]
         live.record_native(self.directory, name, native_id or binding["native_id"],
                            call_id or os.urandom(8).hex(), tool, arguments, origin)
 
@@ -105,6 +111,28 @@ class LiveAcceptanceTests(unittest.TestCase):
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["passed_cases"], 1)
         self.assertIn("required_case_unexercised", report["cases"][1]["failures"])
+
+    def test_selected_pair_does_not_require_capture_from_unused_configured_participant(self):
+        self.directory = Path(self.temporary.name) / "selected-run"
+        config = {"participants": [{"name": "alice", "harness": "codex"},
+                                   {"name": "bob", "harness": "grok"},
+                                   {"name": "unused", "harness": "claude"}], "pairs": [["alice", "bob"]]}
+        live.prepare(config, self.directory)
+        self.store = Store(self.directory / "broker.sqlite3")
+        self.addCleanup(self.store.close)
+        for name in ("alice", "bob"):
+            token = live.load(self.directory / (name + ".connection.json"))["token"]
+            context = self.store.authenticate(token)
+            self.store.bind(context, "native-" + name)
+            self.contexts[name] = self.store.authenticate(token)
+        live.capture(self.directory)
+        self.frozen = live.load(self.directory / "frozen.json")
+        self.exercise(self.frozen["cases"][0])
+        report = live.verify(self.directory)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["required_cases"], 1)
+        self.assertEqual(report["passed_cases"], 1)
+        self.assertFalse((self.directory / "native" / "unused.jsonl").exists())
 
     def test_wrong_native_session_invalidates_partial_phase_counts(self):
         for case in self.frozen["cases"]:
@@ -223,6 +251,167 @@ class LiveAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(list(self.directory.glob("report-*.json"))), 2)
         with self.assertRaises(FileExistsError):
             live.prepare(self.frozen["config"], self.directory)
+
+    def test_claude_observer_cli_failures_preserve_native_tool_flow(self):
+        self.directory = Path(self.temporary.name) / "claude-observer-run"
+        live.prepare({"participants": [{"name": "alice", "harness": "codex"},
+                                        {"name": "bob", "harness": "claude"}],
+                      "pairs": [["alice", "bob"]]}, self.directory)
+        self.store = Store(self.directory / "broker.sqlite3")
+        self.addCleanup(self.store.close)
+        for name in ("alice", "bob"):
+            token = live.load(self.directory / (name + ".connection.json"))["token"]
+            self.store.bind(self.store.authenticate(token), "native-" + name)
+            self.contexts[name] = self.store.authenticate(token)
+        live.capture(self.directory)
+        self.frozen = live.load(self.directory / "frozen.json")
+        message = self.exercise(self.frozen["cases"][0])
+        self.assertEqual(live.verify(self.directory)["status"], "pass")
+        packet = {"hook_event_name": "PreToolUse", "session_id": "native-bob", "tool_use_id": "native-call",
+                  "tool_name": "mcp__xordination__xordination_ack", "tool_input": {"message_id": message["id"]}}
+        original = (self.directory / "prepared.json").read_bytes()
+        native = self.directory / "native" / "bob.jsonl"
+        original_capture = native.read_bytes()
+        diagnostic = self.directory / "observation-errors.jsonl"
+        command = [sys.executable, str(SCRIPT), "observe-claude", "--run", str(self.directory), "--participant", "bob"]
+        for failure in ("malformed", "source_changed", "stale_session", "capture_io", "diagnostic_io"):
+            with self.subTest(failure=failure):
+                self.assertEqual(live.verify(self.directory)["status"], "pass")
+                value = dict(packet)
+                text = json.dumps(value)
+                if failure == "malformed":
+                    text = "{malformed-native-hook"
+                elif failure == "source_changed":
+                    prepared = live.load(self.directory / "prepared.json")
+                    prepared["source_sha256"] = "changed"
+                    (self.directory / "prepared.json").write_bytes(live.encoded(prepared))
+                elif failure == "stale_session":
+                    value["session_id"] = "retired-session"
+                    text = json.dumps(value)
+                elif failure == "capture_io":
+                    native.unlink()
+                    native.mkdir()
+                else:
+                    diagnostic.mkdir()
+                    text = "{malformed-native-hook"
+                result = subprocess.run(command, input=text, text=True, capture_output=True,
+                                        timeout=5, cwd=SCRIPT.parents[2])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                token = live.load(self.directory / "bob.connection.json")["token"]
+                self.assertNotIn(token, result.stderr)
+                (self.directory / "prepared.json").write_bytes(original)
+                report = live.verify(self.directory)
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["passed_cases"], 0)
+                reason = {"diagnostic_io": "native_observer_diagnostics_invalid",
+                          "stale_session": "native_capture_identity:bob"}.get(failure, "native_observer_error:bob")
+                self.assertIn(reason, report["errors"])
+                if failure == "capture_io":
+                    self.assertIn("native_capture_invalid:bob", report["errors"])
+                for path in (native, diagnostic):
+                    if path.is_dir():
+                        path.rmdir()
+                    elif path.exists():
+                        path.unlink()
+                native.write_bytes(original_capture)
+                self.assertEqual(live.verify(self.directory)["status"], "pass")
+
+    def test_observation_logging_failure_does_not_escape_passive_observer(self):
+        def fail():
+            raise ValueError("Injected observation failure")
+        with patch.object(live.sys.stderr, "write", side_effect=OSError("Broken diagnostic stream")):
+            self.assertIsNone(live.passive_observe(self.directory, "bob", fail))
+        report = live.verify(self.directory)
+        self.assertIn("native_observer_error:bob", report["errors"])
+
+    def test_actual_grok_stdio_and_claude_hook_hold_requests_until_controlled_release(self):
+        for harness in ("grok", "claude"):
+            with self.subTest(harness=harness):
+                directory = Path(self.temporary.name) / ("held-" + harness)
+                config = {"participants": [{"name": "alice", "harness": "codex"}, {"name": "bob", "harness": harness}],
+                          "pairs": [["alice", "bob"]], "scenarios": ["busy"]}
+                live.prepare(config, directory)
+                with owned_broker(directory / "broker.sqlite3") as (store, _, endpoint):
+                    tokens = {name: live.load(directory / (name + ".connection.json"))["token"] for name in ("alice", "bob")}
+                    for name, token in tokens.items():
+                        store.bind(store.authenticate(token), "native-" + name)
+                    live.capture(directory)
+                    frozen = live.load(directory / "frozen.json")
+                    case = frozen["cases"][0]
+                    path, arm = live.arm_busy_gate(directory, frozen, case, endpoint, 2)
+                    command = [sys.executable, str(SCRIPT), "stdio" if harness == "grok" else "observe-claude",
+                               "--run", str(directory), "--participant", "bob"]
+                    if harness == "grok":
+                        command += ["--endpoint", endpoint]
+                    process = subprocess.Popen(command, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, cwd=SCRIPT.parents[2], env={**os.environ, "XORDINATION_TOKEN": tokens["bob"]})
+                    frames = queue.Queue()
+                    def reader():
+                        for line in process.stdout:
+                            frames.put(line)
+                    thread = threading.Thread(target=reader, daemon=True)
+                    thread.start()
+                    try:
+                        if harness == "grok":
+                            live.record_native(directory, "bob", "native-bob", "held-acp-call", "xordination_wait",
+                                               arm["wait_arguments"], "grok/session/update")
+                            self.assertFalse((path / "ready.json").exists(),
+                                             "ACP announcement alone is not a held MCP request")
+                            initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                                "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "fixture", "version": "1"}}}
+                            process.stdin.write(json.dumps(initialize) + "\n")
+                            process.stdin.flush()
+                            self.assertEqual(json.loads(frames.get(timeout=3))["id"], 1)
+                            packet = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                                "name": "xordination_wait", "arguments": arm["wait_arguments"]}}
+                        else:
+                            packet = {"hook_event_name": "PreToolUse", "session_id": "native-bob", "tool_use_id": "held-native-call",
+                                      "tool_name": "mcp__xordination__xordination_wait", "tool_input": arm["wait_arguments"]}
+                        process.stdin.write(json.dumps(packet) + "\n")
+                        process.stdin.flush()
+                        if harness == "claude":
+                            process.stdin.close()
+                        live.wait_until(lambda: (path / "ready.json").exists(), 3)
+                        self.assertIsNone(process.poll())
+                        self.assertTrue(frames.empty(), "Held native request must not complete before release")
+                        ready = live.load(path / "ready.json")
+                        self.assertEqual(ready["native_id"], "native-bob")
+                        self.assertEqual(ready["generation"], frozen["bindings"]["bob"]["generation"])
+                        if harness == "grok":
+                            message = Client(endpoint, tokens["alice"]).call("send", to="bob", body=case["body"],
+                                key=case["key"], metadata=case["metadata"],
+                                to_generation=frozen["bindings"]["bob"]["generation"])
+                        live.release_gate(path, arm, "test_release")
+                        if harness == "grok":
+                            result = json.loads(frames.get(timeout=3))
+                            self.assertEqual(result["id"], 2)
+                            self.assertEqual(result["result"]["structuredContent"]["messages"][0]["id"], message["id"])
+                            process.stdin.close()
+                        self.assertEqual(process.wait(timeout=3), 0)
+                        thread.join(timeout=3)
+                        self.assertFalse(thread.is_alive())
+                        if harness == "claude":
+                            self.assertTrue(frames.empty(), "Observation hook must not emit a permission decision")
+                            events, _, errors = live.native_events(directory, frozen)
+                            waits = [event for event in events if event["tool"] == "xordination_wait"]
+                            self.assertEqual(len(waits), 1)
+                            self.assertEqual(waits[0]["call_id"], "held-native-call")
+                            self.assertNotIn("native_capture_identity:bob", errors)
+                        self.assertEqual(live.load(path / "closed.json")["reason"], "released")
+                    finally:
+                        live.release_gate(path, arm, "cleanup")
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(timeout=2)
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream and not stream.closed:
+                                stream.close()
+                        thread.join(timeout=2)
 
     def test_control_dispatch_uses_real_http_and_cannot_exercise_pairs(self):
         with owned_broker(self.directory / "broker.sqlite3") as (_, _, endpoint):

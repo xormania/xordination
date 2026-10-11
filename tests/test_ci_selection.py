@@ -23,20 +23,22 @@ benchmark_spec.loader.exec_module(benchmark)
 class SelectionTests(unittest.TestCase):
     def test_dependency_groups_and_packaging_inputs(self):
         cases = (
-            (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance"}, True, True),
-            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance"}, True, True),
-            (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance"}, True, True),
+            (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"}, True, True),
+            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"}, True, True),
+            (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance", "live_native_busy"}, True, True),
             (["tests/test_store.py"], {"store"}, True, False),
             (["docs/ci.md"], set(), True, False),
             (["AGENTS.md"], set(), True, False),
             (["README.md"], set(), True, True),
             ([".dockerignore"], set(), False, True),
             (["MANIFEST.in"], set(selector.GROUPS), True, False),
-            (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance"}, True, True),
+            (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy"}, True, True),
             (["tests/test_behavior.py"], {"behavior"}, True, False),
             (["tests/test_performance.py"], {"performance"}, True, False),
             (["scripts/testing/benchmark.py"], {"performance"}, True, False),
-            (["scripts/testing/live.py"], {"live_acceptance"}, True, False),
+            (["scripts/testing/live.py"], {"live_acceptance", "live_native_busy"}, True, False),
+            (["tests/test_live_native_busy.py"], {"live_native_busy"}, True, False),
+            (["tests/live_native_fixture.py"], {"live_native_busy"}, True, False),
         )
         for paths, groups, package, image in cases:
             with self.subTest(paths=paths):
@@ -95,7 +97,7 @@ class SelectionTests(unittest.TestCase):
             head = git("rev-parse", "HEAD")
             result = selector.select_change(repo, "pull_request", {"pull_request": {"base": {"sha": base}}}, head)
             self.assertEqual(set(result["paths"]), {"src/xordination/mcp.py", "docs/moved.md", "tests/test_cli.py"})
-            self.assertEqual(set(result["groups"]), {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance"})
+            self.assertEqual(set(result["groups"]), {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"})
             self.assertTrue(result["image"])
             self.assertTrue(selector.select_change(repo, "push", {"before": "f" * 40}, head)["full"])
 

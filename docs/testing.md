@@ -42,7 +42,7 @@ Create a configuration file outside version control. This minimal example requir
     {"name": "alpha", "harness": "codex"},
     {"name": "beta", "harness": "grok"}
   ],
-  "scenarios": ["idle"]
+  "scenarios": ["idle", "busy"]
 }
 ```
 
@@ -67,13 +67,21 @@ After both adapters report native bindings, freeze the run, dispatch its source 
 
 ```sh
 PYTHONPATH=src python scripts/testing/live.py capture --run /tmp/xordination-live-run
-XORDINATION_ENDPOINT=http://127.0.0.1:8765 PYTHONPATH=src python scripts/testing/live.py send --run /tmp/xordination-live-run
+XORDINATION_ENDPOINT=http://127.0.0.1:8765 PYTHONPATH=src python scripts/testing/live.py send --run /tmp/xordination-live-run --phase-timeout 30
 PYTHONPATH=src python scripts/testing/live.py verify --run /tmp/xordination-live-run
 ```
 
-Use a fresh directory for every attempt. Retain the run privately: it includes scoped credentials and native observations. The verifier requires each declared directed pair/scenario; missing cases prevent a pass while verified neighboring cases remain reported. It checks both exchange legs, including native submission, broker receipt and correlated native acknowledgement of the reply. Each verification produces a new immutable report so a rerun retains earlier failed evidence. The optional `pairs` list selects the expressly requested matrix. A `"busy"` scenario requires recipient native activity during delivery, correlated native tool use, receipt and reply; it does not establish a held tool, simultaneous token generation or the PoC's separate retained-private-context proof.
+Use a fresh directory for every attempt. Retain the run privately: it includes scoped credentials and native observations. The verifier requires each declared directed pair/scenario; missing cases prevent a pass while verified neighboring cases remain reported. It checks both exchange legs, including native submission, broker receipt and correlated native acknowledgement of the reply. Each verification produces a new immutable report so a rerun retains earlier failed evidence. The optional `pairs` list selects the expressly requested matrix; unused configured participants need not launch or qualify a required pair.
 
-Codex and Grok use the test runner's native request observers. Claude uses the production managed adapter with its prepared participant credential and the test-only `INITIAL_PROMPT` from `live.py` supplied through `--prompt`. It additionally requires an additive `PreToolUse` hook invoking `python /absolute/path/scripts/testing/live.py observe-claude --run /absolute/run --participant <name>` in that actual Claude session. Preserve existing hooks, model choices and permissions; hook configuration/reload depends on the installed harness. A missing native observer is an unverified result, never a fallback pass. The current Claude observer captures tool calls without a correlated active-turn observation, so a required Claude busy case cannot pass from that capture alone. This is a current evidence gap; busy communication remains a product target. The run-local capture lock currently requires a POSIX host.
+Dispatch completes the required idle roundtrips before priming busy work. For each busy case, the controller asks the recipient to execute an exact `xordination_wait` with its current scoped cursor. A test-only hold keeps that actual native request unfinished. The controller waits for both held-request readiness and a separately captured native call ID before asking the source to send its challenge. It records the committed exact message/attempt submission while the hold remains open, releases the hold in cleanup, and waits for its closure before the next case. Later correlated acknowledgement/reply establishes handling; dispatch alone does not. Gate artifacts retain arm, hold readiness, native readiness, exact submission, release and closure; failures retain their stage/reason. The verifier requires their run/case/generation/native/call correlations and monotonic order. An activity flag or an arbitrary sleep cannot replace these observations.
+
+`--phase-timeout` defaults to 30 seconds and accepts a finite positive value up to 300 seconds. A busy pass establishes native submission during an unfinished native request followed by correlated handling. It does not certify simultaneous model computation, token-generation interruption or the PoC's separate retained-private-context proof.
+
+Codex holds fulfillment in its observed native tool handler. Grok uses an owned test-only `live.py stdio` frontend around the existing MCP server, retaining its public tool schemas and normal tool behavior while holding the selected wait. Both retain native tool observations. These controls are acceptance tooling; the broker's normal wait contract is unchanged.
+
+Claude uses the production managed adapter with its prepared participant credential and the test-only `INITIAL_PROMPT` from `live.py` supplied through `--prompt`. It additionally requires an additive `PreToolUse` hook invoking `python /absolute/path/scripts/testing/live.py observe-claude --run /absolute/run --participant <name>` in that actual Claude session. The hook holds the selected native request before its normal permission/tool flow. Configure its timeout above twice `--phase-timeout`, allowing additional cleanup time, so the harness does not terminate the hold prematurely. Preserve existing hooks, model choices and permissions; hook configuration/reload depends on the installed harness. A missing observer or a prematurely closed hold is unverified, never a fallback pass. The run-local capture lock currently requires a POSIX host.
+
+Observation failures write bounded diagnostics and invalidate required acceptance evidence. The passive hook returns empty output and zero exit on capture failure; it issues no permission decision, rewrites no tool arguments and does not turn a recording error into denial of an otherwise permitted native tool. Normal harness permissions remain authoritative.
 
 Native IDs are adapter-reported; configured versions/settings are operator observations. Observer files are correlated run-local evidence, not attestation against hostile local editing. A deterministic validator test is evidence that the oracle accepts/rejects its fixtures, not evidence that an actual vendor run passed. Publish a live compatibility claim only with the actual retained run and its precise evidence boundary.
 

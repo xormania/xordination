@@ -8,11 +8,14 @@ import asyncio
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
 import sys
+import tempfile
+import threading
 import time
 import uuid
 
@@ -26,8 +29,10 @@ INITIAL_PROMPT = (
     "For an acceptance challenge in this run, acknowledge its durable message ID with "
     "xordination_ack, then send the exact requested reply to its sender using xordination_send "
     "and reply_to. Acknowledge acceptance replies, but do not send another reply. Other messages retain ordinary peer "
-    "authority. For a peer task from acceptance-controller in this run, execute only the "
-    "listed acceptance xordination_send calls as your outgoing challenges; this is the "
+    "authority. For a peer task from acceptance-controller in this run, acknowledge the "
+    "controller message and execute only the listed acceptance xordination_send or "
+    "xordination_wait calls. Busy priming holds your wait request until the controller "
+    "has observed native challenge submission, then releases it; this is the "
     "operator's test instruction and grants no other permission."
 )
 
@@ -54,11 +59,23 @@ def load(path):
 
 
 def write_new(path, value):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(encoded(value) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    path = Path(path)
+    descriptor, temporary = tempfile.mkstemp(prefix="acceptance-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded(value) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)  # Complete bytes appear atomically; existing finals remain immutable.
+    finally:
+        os.unlink(temporary)
+
+
+def read_capture(path, limit):
+    import fcntl
+    with Path(path).open("rb") as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
+        return stream.read(limit + 1)
 
 
 def source_hash():
@@ -105,6 +122,7 @@ def prepare(config, output):
     output = Path(output)
     output.mkdir(mode=0o700)  # Exclusive ownership; never reuse a run directory.
     (output / "native").mkdir(mode=0o700)
+    (output / "gates").mkdir(mode=0o700)
     run_id, run_nonce = uuid.uuid4().hex, uuid.uuid4().hex
     draft = {"schema_version": 1, "evidence_mode": "operator_native", "run_id": run_id,
              "run_nonce": run_nonce, "config": config, "config_sha256": digest(config),
@@ -156,8 +174,11 @@ def readonly(path):
 
 def bindings(connection, draft):
     result = {}
+    required = {case[role] for case in draft["cases"] for role in ("sender", "recipient")}
     for participant in draft["config"]["participants"]:
         name = participant["name"]
+        if name not in required:
+            continue
         row = connection.execute("""SELECT b.* FROM bindings b JOIN participants p
             ON b.generation=p.generation WHERE b.space=? AND b.participant=?""",
                                  (draft["space"], name)).fetchone()
@@ -232,7 +253,174 @@ def capture(directory):
             "next": "Send the operator's tasks to source native sessions; retain receipt/reply capture."}
 
 
-def send_tasks(directory):
+@contextmanager
+def gate_lock(path):
+    import fcntl
+    descriptor = os.open(path / "lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def gate_event(arm, **extra):
+    return {"run_id": arm["run_id"], "case_id": arm["case_id"], "participant": arm["participant"],
+            "generation": arm["generation"], "native_id": arm["native_id"],
+            "monotonic_ns": time.monotonic_ns(), **extra}
+
+
+def wait_until(condition, timeout):
+    """Bounded polling waits on explicit state; elapsed time never establishes readiness."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = condition()
+        if result:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Controlled busy phase did not reach its required state")
+        threading.Event().wait(min(.02, remaining))
+
+
+def active_gate(directory, name, arguments):
+    draft = checked_draft(Path(directory))
+    found = []
+    for case in draft["cases"]:
+        if case["scenario"] != "busy" or case["recipient"] != name:
+            continue
+        path = Path(directory) / "gates" / case["case_id"]
+        if (path / "armed.json").exists() and not (path / "closed.json").exists():
+            arm = load(path / "armed.json")
+            if arm["wait_arguments"] == arguments:
+                found.append((path, arm))
+    if len(found) > 1:
+        raise ValueError("More than one busy gate matches a native wait request")
+    return found[0] if found else None
+
+
+def hold_wait(directory, name, native_id, call_id, arguments, origin, cancelled=None):
+    """Hold an actual native tool request in test code; always release normal tool flow."""
+    selected = active_gate(directory, name, arguments)
+    if not selected:
+        return
+    path, arm = selected
+    if native_id != arm["native_id"]:
+        raise ValueError("Busy hold does not belong to the frozen native session")
+    with gate_lock(path):
+        write_new(path / "ready.json", gate_event(arm, native_call_id=call_id, origin=origin))
+    reason = "released"
+    try:
+        while True:
+            with gate_lock(path):
+                if (path / "released.json").exists():
+                    break
+                if cancelled is not None and cancelled.is_set():
+                    reason = "cancelled"
+                    break
+                if time.monotonic_ns() >= arm["deadline_monotonic_ns"]:
+                    reason = "timed_out"
+                    break
+            threading.Event().wait(.02)
+    finally:
+        with gate_lock(path):
+            write_new(path / "closed.json", gate_event(arm, reason=reason))
+
+
+def release_gate(path, arm, reason):
+    with gate_lock(path):
+        if not (path / "released.json").exists():
+            write_new(path / "released.json", gate_event(arm, reason=reason))
+
+
+def arm_busy_gate(directory, frozen, case, endpoint, phase_timeout):
+    from xordination.client import Client
+    name = case["recipient"]
+    binding = frozen["bindings"][name]
+    descriptor = load(directory / (name + ".connection.json"))
+    recipient = Client(endpoint, descriptor["token"])
+    wait_arguments = {"cursor": recipient.call("inbox")["cursor"], "timeout": 30}
+    path = directory / "gates" / case["case_id"]
+    path.mkdir(mode=0o700)
+    arm = {"run_id": frozen["run_id"], "case_id": case["case_id"], "participant": name,
+           **binding, "wait_arguments": wait_arguments, "phase_timeout": phase_timeout,
+           "armed_monotonic_ns": time.monotonic_ns(),
+           "deadline_monotonic_ns": time.monotonic_ns() + int(2 * phase_timeout * 1e9)}
+    write_new(path / "armed.json", arm)
+    return path, arm
+
+
+def busy_case(directory, frozen, case, client, send_task, phase_timeout):
+    path, arm = arm_busy_gate(directory, frozen, case, client.endpoint, phase_timeout)
+    name = case["recipient"]
+    binding = frozen["bindings"][name]
+    wait_arguments = arm["wait_arguments"]
+    reason = "failed"
+    stage = "readiness"
+    try:
+        client.call("send", to=name, to_generation=binding["generation"],
+            key="acceptance-prime-" + case["case_id"],
+            body=json.dumps({"acceptance_run": frozen["run_id"], "run_nonce": frozen["run_nonce"],
+                             "phase": "busy_prime", "case_id": case["case_id"],
+                             "instruction": "Acknowledge this controller message, then execute the exact wait task.",
+                             "tasks": [{"tool": "xordination_wait", "arguments": wait_arguments}]}, sort_keys=True),
+            metadata={"acceptance_run": frozen["run_id"], "phase": "busy_prime", "case_id": case["case_id"]})
+        def ready():
+            if not (path / "ready.json").exists() or (path / "closed.json").exists():
+                return None
+            events, _, errors = native_events(directory, frozen)
+            if any(error.endswith(":" + name) for error in errors):
+                return None
+            capture = load(path / "ready.json")
+            matches = [event for event in events if event["participant"] == name and
+                       event["native_id"] == binding["native_id"] and event["tool"] == "xordination_wait" and
+                       event["arguments"] == wait_arguments and event["monotonic_ns"] >= arm["armed_monotonic_ns"] and
+                       (capture["native_call_id"] is None or capture["native_call_id"] == event["call_id"])]
+            if len({event["call_id"] for event in matches}) > 1:
+                raise ValueError("Ambiguous native readiness for one held wait request")
+            return matches[0] if matches else None
+        observation = wait_until(ready, phase_timeout)
+        write_new(path / "native-ready.json", gate_event(arm, native_call_id=observation["call_id"],
+                                                        native_sequence=observation["sequence"]))
+        stage = "submission"
+        send_task(case)  # The source receives its challenge only after held native readiness.
+        def submitted():
+            with gate_lock(path):
+                if (path / "closed.json").exists() or (path / "released.json").exists():
+                    raise TimeoutError("Native busy hold ended before challenge submission")
+                with readonly(directory / "broker.sqlite3") as connection:
+                    row = connection.execute("""SELECT m.id AS message_id,a.id AS attempt_id FROM messages m
+                        JOIN attempts a ON a.message_id=m.id WHERE m.space=? AND m.sender=? AND m.idempotency_key=?
+                        AND m.sender_generation=? AND m.recipient=? AND m.body=? AND m.metadata=?
+                        AND m.original_generation=? AND m.delivery_generation=? AND a.generation=?
+                        AND a.native_id=? AND a.state='submitted'""", (frozen["space"], case["sender"], case["key"],
+                        frozen["bindings"][case["sender"]]["generation"], name, case["body"],
+                        encoded(case["metadata"]).decode(), binding["generation"], binding["generation"],
+                        binding["generation"], binding["native_id"])).fetchone()
+                if not row:
+                    return None
+                value = gate_event(arm, message_id=row["message_id"], attempt_id=row["attempt_id"],
+                                   native_call_id=observation["call_id"])
+                write_new(path / "submitted.json", value)
+                return value
+        result = wait_until(submitted, phase_timeout)
+        reason = "submitted"
+        return result
+    except Exception as error:
+        failure = gate_event(arm, stage=stage,
+                             reason="native_" + stage + "_timeout" if isinstance(error, TimeoutError) else "busy_phase_failed")
+        write_new(path / "failed.json", failure)
+        return {**failure, "status": "fail"}
+    finally:
+        release_gate(path, arm, reason)
+        if (path / "ready.json").exists():
+            try:
+                wait_until(lambda: (path / "closed.json").exists(), phase_timeout)
+            except TimeoutError:
+                if not (path / "failed.json").exists():
+                    write_new(path / "failed.json", gate_event(arm, stage="release", reason="native_release_timeout"))
+                raise
+
+
+def send_tasks(directory, phase_timeout=30):
     """Trigger source-native work; these controller messages are never pair evidence."""
     from xordination.client import Client
     directory = Path(directory)
@@ -240,9 +428,13 @@ def send_tasks(directory):
     if digest(frozen) != load(directory / "frozen.sha256.json")["sha256"]:
         raise ValueError("Frozen manifest was altered")
     checked_draft(directory)
+    if not isinstance(phase_timeout, (int, float)) or not math.isfinite(phase_timeout) or not 0 < phase_timeout <= 300:
+        raise ValueError("Busy phase timeout must be finite, positive and at most 300 seconds")
     # Reconstruct required tasks from the frozen manifest rather than trusting edited tasks.json.
     tasks = {}
     for case in frozen["cases"]:
+        if case["scenario"] == "busy":
+            continue
         tasks.setdefault(case["sender"], []).append({"scenario": case["scenario"], "tool": "xordination_send",
             "arguments": {"to": case["recipient"], "to_generation": frozen["bindings"][case["recipient"]]["generation"],
                           "body": case["body"], "key": case["key"], "metadata": case["metadata"]}})
@@ -257,7 +449,42 @@ def send_tasks(directory):
                              "tasks": work}, sort_keys=True),
             metadata={"acceptance_run": frozen["run_id"], "phase": "operator_tasks"})
         messages.append({"participant": name, "message_id": message["id"]})
+    idle_cases = {case["case_id"] for case in frozen["cases"] if case["scenario"] == "idle"}
+    if idle_cases and any(case["scenario"] == "busy" for case in frozen["cases"]):
+        try:
+            def idle_complete():
+                report = verify(directory, retain=False)
+                return all(case["status"] == "pass" for case in report["cases"] if case["case_id"] in idle_cases)
+            wait_until(idle_complete, phase_timeout)
+            write_new(directory / "idle-complete.json", {"run_id": frozen["run_id"], "case_ids": sorted(idle_cases),
+                                                       "monotonic_ns": time.monotonic_ns()})
+        except TimeoutError:
+            failure = {"run_id": frozen["run_id"], "stage": "idle", "reason": "idle_completion_timeout",
+                       "case_ids": sorted(idle_cases), "monotonic_ns": time.monotonic_ns()}
+            write_new(directory / "idle-failed.json", failure)
+            return {"run_id": frozen["run_id"], "status": "fail", "tasks_dispatched": messages, "failure": failure,
+                    "busy_submissions": [], "next": "Required idle exchanges did not finish; busy cases remain unexercised."}
+    def send_task(case):
+        name = case["sender"]
+        message = client.call("send", to=name, to_generation=frozen["bindings"][name]["generation"],
+            key="acceptance-task-" + case["case_id"],
+            body=json.dumps({"acceptance_run": frozen["run_id"], "run_nonce": frozen["run_nonce"],
+                             "phase": "challenge", "case_id": case["case_id"],
+                             "tasks": [{"scenario": "busy", "tool": "xordination_send", "arguments": {
+                                 "to": case["recipient"], "to_generation": frozen["bindings"][case["recipient"]]["generation"],
+                                 "body": case["body"], "key": case["key"], "metadata": case["metadata"]}}]}, sort_keys=True),
+            metadata={"acceptance_run": frozen["run_id"], "phase": "operator_tasks", "case_id": case["case_id"]})
+        messages.append({"participant": name, "message_id": message["id"]})
+    busy_results = []
+    for case in frozen["cases"]:
+        if case["scenario"] == "busy":
+            try:
+                busy_results.append(busy_case(directory, frozen, case, client, send_task, phase_timeout))
+            except (OSError, ValueError, TimeoutError) as error:
+                busy_results.append({"case_id": case["case_id"], "status": "fail", "reason": type(error).__name__})
     return {"run_id": frozen["run_id"], "tasks_dispatched": messages,
+            "busy_submissions": busy_results,
+            "status": "fail" if any(result.get("status") == "fail" for result in busy_results) else "pass",
             "next": "Allow real native sessions to acknowledge/reply, then verify; dispatch is not a pass."}
 
 
@@ -266,7 +493,7 @@ def tool_name(name):
         return None
     for prefix in ("mcp__xordination__", "xordination__", ""):
         candidate = name.removeprefix(prefix)
-        if candidate in {"xordination_send", "xordination_ack"}:
+        if candidate in {"xordination_send", "xordination_ack", "xordination_wait"}:
             return candidate
     return None
 
@@ -317,9 +544,13 @@ def record_native(directory, participant, native_id, call_id, tool, arguments, o
     if tool == "xordination_send":
         if arguments.get("body") not in {case["reply"] for case in draft["cases"]} | {case["body"] for case in draft["cases"]}:
             return  # Do not retain unrelated project content.
+    elif tool == "xordination_wait":
+        if not active_gate(directory, participant, arguments):
+            return  # Observe only the run's explicitly armed wait, not normal project waits.
     elif tool != "xordination_ack":
         return
-    allowed = {"to", "to_generation", "body", "key", "reply_to", "metadata", "expires_in"} if tool == "xordination_send" else {"message_id"}
+    allowed = ({"to", "to_generation", "body", "key", "reply_to", "metadata", "expires_in"}
+               if tool == "xordination_send" else {"cursor", "timeout"} if tool == "xordination_wait" else {"message_id"})
     if set(arguments) - allowed or len(encoded(arguments)) > 70000:
         raise ValueError("Native communication observation has unexpected/oversized inputs")
     event = {"run_id": draft["run_id"], "run_nonce": draft["run_nonce"],
@@ -342,7 +573,10 @@ def record_native(directory, participant, native_id, call_id, tool, arguments, o
 def native_events(directory, frozen):
     events, artifacts, errors = [], [], []
     origins = {"codex": "codex/item/tool/call", "grok": "grok/session/update", "claude": "claude/PreToolUse"}
+    required = {case[role] for case in frozen["cases"] for role in ("sender", "recipient")}
     for name, binding in frozen["bindings"].items():
+        if name not in required:
+            continue  # Configured availability is distinct from expressly requested coverage.
         path = directory / "native" / (name + ".jsonl")
         if not path.exists():
             errors.append("native_capture_missing:" + name)
@@ -350,8 +584,11 @@ def native_events(directory, frozen):
         if path.stat().st_size > MAX_ARTIFACT:
             errors.append("native_capture_limit:" + name)
             continue
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_ARTIFACT + 1)
+        try:
+            raw = read_capture(path, MAX_ARTIFACT)
+        except OSError:
+            errors.append("native_capture_invalid:" + name)
+            continue
         if len(raw) > MAX_ARTIFACT:
             errors.append("native_capture_limit:" + name)
             continue
@@ -375,7 +612,7 @@ def native_events(directory, frozen):
             if (not isinstance(event.get("call_id"), str) or not event["call_id"] or
                     not isinstance(event.get("native_id"), str) or not event["native_id"] or
                     not isinstance(event.get("tool"), str) or
-                    event.get("tool") not in {"xordination_ack", "xordination_send"}):
+                    event.get("tool") not in {"xordination_ack", "xordination_send", "xordination_wait"}):
                 errors.append("native_capture_invalid:" + name)
                 participant_error = True
                 continue
@@ -407,10 +644,71 @@ def native_events(directory, frozen):
             offset += len(line)
         if not participant_error:
             events.extend(participant_events)
+    diagnostic = directory / "observation-errors.jsonl"
+    if diagnostic.exists():
+        try:
+            raw = read_capture(diagnostic, 32768)
+            if len(raw) > 32768:
+                raise ValueError("Observer diagnostic size limit")
+            artifacts.append({"path": diagnostic.name, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+            compromised = set()
+            for line in raw.splitlines():
+                entry = json.loads(line)
+                name = entry["participant"]
+                if name in required or name == "unknown":
+                    compromised.add(name)
+                    errors.append("native_observer_error:" + name)
+            events = [event for event in events if event["participant"] not in compromised]
+        except (OSError, ValueError, TypeError, KeyError):
+            errors.append("native_observer_diagnostics_invalid")
+            events = []
     return events, artifacts, errors
 
 
-def verify(directory):
+def controlled_busy(directory, frozen, case, message, attempts, events):
+    path = directory / "gates" / case["case_id"]
+    if (path / "failed.json").exists():
+        return False
+    try:
+        arm, ready, native_ready, submitted, released, closed = [load(path / (name + ".json")) for name in
+                                                   ("armed", "ready", "native-ready", "submitted", "released", "closed")]
+        binding = frozen["bindings"][case["recipient"]]
+        expected = {"run_id": frozen["run_id"], "case_id": case["case_id"], "participant": case["recipient"],
+                    "generation": binding["generation"], "native_id": binding["native_id"]}
+        if any(any(value.get(key) != item for key, item in expected.items()) for value in
+               (arm, ready, native_ready, submitted, released, closed)):
+            return False
+        if (ready["origin"] != {"codex": "codex/tool-handler", "grok": "grok/mcp-wait", "claude": "claude/native-hook"}[binding["harness"]]
+                or released["reason"] != "submitted" or closed["reason"] != "released"):
+            return False
+        if not (arm["armed_monotonic_ns"] <= ready["monotonic_ns"] <= native_ready["monotonic_ns"] <=
+                submitted["monotonic_ns"] <= released["monotonic_ns"] <= closed["monotonic_ns"]
+                and submitted["monotonic_ns"] < arm["deadline_monotonic_ns"]):
+            return False
+        if (submitted["message_id"] != message["id"] or not any(attempt["id"] == submitted["attempt_id"] and
+                attempt["state"] == "submitted" and attempt["generation"] == binding["generation"] and
+                attempt["native_id"] == binding["native_id"] for attempt in attempts)):
+            return False
+        if ready["native_call_id"] is not None and ready["native_call_id"] != submitted["native_call_id"]:
+            return False
+        if native_ready["native_call_id"] != submitted["native_call_id"]:
+            return False
+        # One actual invocation cannot qualify two gates, even if an artifact is replayed.
+        for other in frozen["cases"]:
+            other_path = directory / "gates" / other["case_id"] / "submitted.json"
+            if other["case_id"] != case["case_id"] and other["recipient"] == case["recipient"] and other_path.exists():
+                if load(other_path)["native_call_id"] == submitted["native_call_id"]:
+                    return False
+        return any(event["participant"] == case["recipient"] and event["native_id"] == binding["native_id"] and
+                   event["call_id"] == submitted["native_call_id"] and event["tool"] == "xordination_wait" and
+                   event["sequence"] == native_ready["native_sequence"] and event["monotonic_ns"] >= arm["armed_monotonic_ns"] and
+                   event["monotonic_ns"] <= native_ready["monotonic_ns"] and
+                   event["arguments"] == arm["wait_arguments"] for event in events)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def verify(directory, retain=True):
     directory = Path(directory)
     frozen = load(directory / "frozen.json")
     if digest(frozen) != load(directory / "frozen.sha256.json")["sha256"]:
@@ -451,9 +749,10 @@ def verify(directory):
                 phases["native_send"] = bool(matching(sender, "xordination_send", send_args))
                 attempts = connection.execute("SELECT * FROM attempts WHERE message_id=?", (message["id"],)).fetchall()
                 phases["native_submitted"] = any(attempt["generation"] == target["generation"] and
-                    attempt["native_id"] == target["native_id"] and attempt["state"] == "submitted" and
-                    (case["scenario"] != "busy" or json.loads(attempt["detail"] or "{}").get("busy") is True)
+                    attempt["native_id"] == target["native_id"] and attempt["state"] == "submitted"
                     for attempt in attempts)
+                if case["scenario"] == "busy":
+                    phases["controlled_busy"] = controlled_busy(directory, frozen, case, message, attempts, events)
                 phases["broker_receipt"] = connection.execute("""SELECT 1 FROM receipts WHERE message_id=?
                     AND generation=? AND observer=? AND native_id=? AND kind='client_ack'""",
                     (message["id"], target["generation"], recipient, target["native_id"])).fetchone() is not None
@@ -486,24 +785,53 @@ def verify(directory):
               "cases": cases, "errors": sorted(set(errors)), "native_artifacts": artifacts,
               "configured_participants": frozen["config"]["participants"],
               "evidence_boundary": "Run-local observer capture, not authenticated against hostile local file editing. "
-                  "Busy means adapter-reported active submission; no held-tool or token-interruption claim. "
+                  "Busy means exact native submission observed while a run-local native wait request was held. "
+                  "No token-generation interruption or simultaneous model computation claim. "
                   "Configured versions/settings are operator observations, not independently certified."}
     # Each verification is retained separately; failed evidence cannot be overwritten by a rerun.
-    write_new(directory / ("report-" + uuid.uuid4().hex + ".json"), report)
+    if retain:
+        write_new(directory / ("report-" + uuid.uuid4().hex + ".json"), report)
     return report
 
 
-def launch_adapter(directory, name, project, binary=None):
-    """Explicit operator-only launch, with real native request/notification observers."""
-    from xordination.adapters import CodexAdapter, GrokAdapter, _binary
-    from xordination.client import Client
+def observation_error(directory, participant, error):
+    """Capture failure is diagnostic, never a native permission decision."""
+    try:
+        print("Xordination acceptance observation failed; normal native tool flow continues.", file=sys.stderr)
+    except Exception:
+        pass
+    try:
+        # Fixed owned filename and bounded fields; never export arbitrary exception text.
+        if not isinstance(participant, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", participant):
+            participant = "unknown"
+        descriptor = os.open(Path(directory) / "observation-errors.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "ab") as stream:
+            import fcntl
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            if os.fstat(stream.fileno()).st_size >= 32700:
+                return
+            stream.write(encoded({"participant": participant, "error_type": type(error).__name__, "time": time.time()}) + b"\n")
+            stream.flush()
+    except Exception:
+        pass  # Disk/capture failure must not deny a vendor tool or rewrite native policy.
+
+
+def passive_observe(directory, participant, action):
+    try:
+        return action()
+    except Exception as error:
+        observation_error(directory, participant, error)
+        return None
+
+
+def observed_adapter(directory, name, client, binary, project):
+    """Add test-only observation/holds while preserving the inherited native adapter."""
+    from xordination.adapters import CodexAdapter, GrokAdapter
     directory = Path(directory)
     draft = checked_draft(directory)
     participant = next((row for row in draft["config"]["participants"] if row["name"] == name), None)
     if not participant or participant["harness"] == "claude":
         raise ValueError("Choose a configured Codex/Grok participant; Claude uses its native PreToolUse hook")
-    connection = load(directory / (name + ".connection.json"))
-    endpoint = os.environ.get("XORDINATION_ENDPOINT", "http://127.0.0.1:8765")
     recorder = lambda native, call, tool, args, origin: record_native(directory, name, native, call, tool, args, origin)
     class ObservedCodex(CodexAdapter):
         async def request(self, method, params):
@@ -511,21 +839,68 @@ def launch_adapter(directory, name, project, binary=None):
                 arguments = params.get("arguments", {})
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
-                recorder(params.get("threadId"), params.get("callId"), tool_name(params["tool"]),
-                         arguments, "codex/item/tool/call")
+                passive_observe(directory, name, lambda: recorder(params.get("threadId"), params.get("callId"),
+                                tool_name(params["tool"]), arguments, "codex/item/tool/call"))
+                if tool_name(params["tool"]) == "xordination_wait":
+                    cancelled = threading.Event()
+                    try:
+                        await asyncio.to_thread(passive_observe, directory, name, lambda: hold_wait(
+                            directory, name, params.get("threadId"), params.get("callId"), arguments,
+                            "codex/tool-handler", cancelled))
+                    finally:
+                        cancelled.set()
             return await super().request(method, params)
     class ObservedGrok(GrokAdapter):
         async def notification(self, method, params):
             if method == "session/update":
-                observation = grok_observation(params)
-                if observation:
-                    recorder(*observation, "grok/session/update")
+                def observe():
+                    observation = grok_observation(params)
+                    if observation:
+                        recorder(*observation, "grok/session/update")
+                passive_observe(directory, name, observe)
             return await super().notification(method, params)
+        async def spawn(self, *args, **kwargs):
+            await super().spawn(*args, **kwargs)
+            original_request = self.rpc.request
+            async def request(method, params, **options):
+                if method == "session/new":
+                    params = dict(params)
+                    params["mcpServers"] = [{**server, "args": [str(Path(__file__).resolve()), "stdio",
+                        "--run", str(directory.resolve()), "--participant", name, "--endpoint", client.endpoint]}
+                        if server.get("name") == "xordination" else server for server in params.get("mcpServers", [])]
+                return await original_request(method, params, **options)
+            self.rpc.request = request  # This owned RPC only; concurrent adapters keep their own settings.
     harness = participant["harness"]
-    adapter = (ObservedCodex if harness == "codex" else ObservedGrok)(
-        Client(endpoint, connection["token"]), _binary(harness, binary), project,
+    return (ObservedCodex if harness == "codex" else ObservedGrok)(
+        client, binary, project,
         model=participant.get("model"), reasoning=participant.get("reasoning"), prompt=INITIAL_PROMPT)
+
+
+def launch_adapter(directory, name, project, binary=None):
+    """Explicit operator-only launch; never invoked by ordinary CI."""
+    from xordination.adapters import _binary
+    from xordination.client import Client
+    directory = Path(directory)
+    participant = next(row for row in checked_draft(directory)["config"]["participants"] if row["name"] == name)
+    connection = load(directory / (name + ".connection.json"))
+    endpoint = os.environ.get("XORDINATION_ENDPOINT", "http://127.0.0.1:8765")
+    adapter = observed_adapter(directory, name, Client(endpoint, connection["token"]),
+                               _binary(participant["harness"], binary), project)
     asyncio.run(adapter.run())
+
+
+def run_test_stdio(directory, name, endpoint, token_env):
+    from unittest.mock import patch
+    from xordination import mcp
+    class HeldServer(mcp._Server):
+        def _wait(self, arguments, cancelled):
+            def hold():
+                identity = self.client.call("identity")
+                hold_wait(directory, name, identity["native_id"], None, arguments, "grok/mcp-wait", cancelled)
+            passive_observe(directory, name, hold)
+            return super()._wait(arguments, cancelled)
+    with patch("xordination.mcp._Server", HeldServer):
+        return mcp.run_stdio(endpoint, os.environ[token_env])
 
 
 def main(argv=None):
@@ -534,15 +909,32 @@ def main(argv=None):
     p = sub.add_parser("prepare")
     p.add_argument("--config", required=True)
     p.add_argument("--output", required=True)
-    for command in ("capture", "send", "verify", "adapter", "observe-claude"):
+    for command in ("capture", "send", "verify", "adapter", "observe-claude", "stdio"):
         p = sub.add_parser(command)
         p.add_argument("--run", required=True)
-        if command in {"adapter", "observe-claude"}:
+        if command in {"adapter", "observe-claude", "stdio"}:
             p.add_argument("--participant", required=True)
         if command == "adapter":
             p.add_argument("--project", required=True)
             p.add_argument("--binary")
+        if command == "send":
+            p.add_argument("--phase-timeout", type=float, default=30)
+        if command == "stdio":
+            p.add_argument("--endpoint", required=True)
+            p.add_argument("--token-env", default="XORDINATION_TOKEN")
     args = parser.parse_args(argv)
+    if args.command == "observe-claude":
+        def observe():
+            packet = json.load(sys.stdin)
+            if packet.get("hook_event_name") == "PreToolUse" and tool_name(packet.get("tool_name")):
+                tool, arguments = tool_name(packet["tool_name"]), packet.get("tool_input")
+                record_native(args.run, args.participant, packet.get("session_id"), packet.get("tool_use_id"),
+                              tool, arguments, "claude/PreToolUse")
+                if tool == "xordination_wait":
+                    hold_wait(args.run, args.participant, packet.get("session_id"), packet.get("tool_use_id"),
+                              arguments, "claude/native-hook")
+        passive_observe(args.run, args.participant, observe)
+        return 0  # Empty output/zero exit preserves Claude's original permission/tool flow.
     try:
         if args.command == "prepare":
             result = prepare(load(args.config), args.output)
@@ -551,16 +943,12 @@ def main(argv=None):
         elif args.command == "verify":
             result = verify(args.run)
         elif args.command == "send":
-            result = send_tasks(args.run)
+            result = send_tasks(args.run, args.phase_timeout)
         elif args.command == "adapter":
             launch_adapter(args.run, args.participant, args.project, args.binary)
             return 0
         else:
-            packet = json.load(sys.stdin)
-            if packet.get("hook_event_name") == "PreToolUse" and tool_name(packet.get("tool_name")):
-                record_native(args.run, args.participant, packet.get("session_id"), packet.get("tool_use_id"),
-                              tool_name(packet["tool_name"]), packet.get("tool_input"), "claude/PreToolUse")
-            return 0  # Empty hook output; no permission decision or tool rewrite.
+            return run_test_stdio(args.run, args.participant, args.endpoint, args.token_env)
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0 if result.get("status", "pass") == "pass" else 1
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:

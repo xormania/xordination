@@ -6,17 +6,18 @@ The selector compares the complete event base with the tested commit. Pull reque
 
 | Changed input | Contract groups | Package | Image | Benchmark |
 | --- | --- | --- | --- | --- |
-| `store.py` | store, adapters, server, cli, end_to_end, behavior, performance, live_acceptance | yes | yes | yes |
-| `adapters.py` | adapters, cli, behavior, live_acceptance | yes | yes | no |
-| `rpc.py` | adapters, behavior, live_acceptance | yes | yes | no |
-| `mcp.py` | adapters, mcp, cli, end_to_end, behavior, live_acceptance | yes | yes | no |
-| `server.py` | server, cli, end_to_end, behavior, performance, live_acceptance | yes | yes | yes |
-| `client.py` | adapters, mcp, server, cli, end_to_end, behavior, performance, live_acceptance | yes | yes | yes |
-| `cli.py` | adapters, mcp, server, cli, end_to_end, behavior, live_acceptance | yes | yes | no |
+| `store.py` | store, adapters, server, cli, end_to_end, behavior, performance, live_acceptance, live_native_busy | yes | yes | yes |
+| `adapters.py` | adapters, cli, behavior, live_acceptance, live_native_busy | yes | yes | no |
+| `rpc.py` | adapters, behavior, live_acceptance, live_native_busy | yes | yes | no |
+| `mcp.py` | adapters, mcp, cli, end_to_end, behavior, live_acceptance, live_native_busy | yes | yes | no |
+| `server.py` | server, cli, end_to_end, behavior, performance, live_acceptance, live_native_busy | yes | yes | yes |
+| `client.py` | adapters, mcp, server, cli, end_to_end, behavior, performance, live_acceptance, live_native_busy | yes | yes | yes |
+| `cli.py` | adapters, mcp, server, cli, end_to_end, behavior, live_acceptance, live_native_busy | yes | yes | no |
 | `__init__.py`, `__main__.py`, unknown runtime input | all | yes | yes | yes |
 | Existing registered test module | its group | yes | no | when performance |
 | `scripts/testing/benchmark.py` | performance | yes | no | yes |
-| `scripts/testing/live.py` | live_acceptance | yes | no | no |
+| `scripts/testing/live.py` | live_acceptance, live_native_busy | yes | no | no |
+| `tests/live_native_fixture.py` | live_native_busy | yes | no | no |
 | New/shared test input, CI helper, workflow, unknown path | all | yes | yes | yes |
 | `pyproject.toml` | all | yes | yes | yes |
 | `MANIFEST.in` | all | yes | no | yes |
@@ -24,7 +25,7 @@ The selector compares the complete event base with the tested commit. Pull reque
 | `docs/*.md`, `AGENTS.md` | none | yes | no | no |
 | `.dockerignore` | none | no | yes | no |
 
-The map includes lazy imports from MCP into adapters, public CLI dispatch, the real stdio subprocess in end-to-end/behavior tests, native RPC fixtures used by behavior, and broker inputs consumed by the performance driver. The live_acceptance group runs deterministic evidence-validator and observer tests; selection never launches a paid native session. A full selection discovers every `test*.py`, including new modules. An absent or empty registered selected module is an error. Update the map when dependencies change; uncertainty should retain the full fallback.
+The map includes lazy imports from MCP into adapters, public CLI dispatch, the real stdio subprocess in end-to-end/behavior tests, native RPC fixtures used by behavior, and broker inputs consumed by the performance driver. The live_acceptance group runs deterministic evidence-validator, held-request and passive-observer tests; live_native_busy exercises actual adapter/observer/broker orchestration with owned scripted native executables. Its passing control starts an idle recipient, primes a real unfinished native request, submits the correlated pair only after readiness, then verifies receipt/reply handling after release. Its planted no-readiness red requires the exact failure stage. The dedicated immutable native fixture selects only that group. Selection never launches a paid native session. A full selection discovers every `test*.py`, including new modules. An absent or empty registered selected module is an error. Update the map when dependencies change; uncertainty should retain the full fallback.
 
 Every selected case is required. The runner reports collected cases, starts, actual execution, skipped cases and unexercised cases separately. Required skips, fixture failures that prevent case execution, and `expectedFailure` markers fail the check. Intentional fault probes must assert the intended failure reason within an otherwise passing test. The canonical coverage artifact retains `test-execution.json`; other matrix jobs retain their census in the job summary.
 
