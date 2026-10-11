@@ -38,6 +38,10 @@ This mapping describes the assertions in Xordination's deterministic tests. “C
 
 ## Remaining verification work
 
+[Behavior journeys](../tests/behavior.py) now add complete directed exchanges through owned stdio clients plus duplicate, replacement/recovery, uncertain-restart/retry and held native protocol journeys. Their frozen-manifest oracle rejects cross-run/generation/attempt evidence and missing required cases while preserving partial results. [Behavior oracle tests](../tests/test_behavior.py) exercise intended planted reds after passing controls. These remain protocol-fixture observations, not vendor model acceptance.
+
+[Native acceptance](../scripts/testing/live.py) provides operator-invoked preparation, frozen bindings, exact source tasks and a read-only verifier requiring actual native tool observations. [Performance](../scripts/testing/benchmark.py) separates setup/work/cleanup and checks authenticated loopback workload correctness before reporting timing. [Testing guide](testing.md) describes their evidence boundaries and commands. Neither a live-validator fixture nor a broker benchmark establishes a current vendor capability.
+
 Native fresh-challenge exchanges, response/event order where not already exercised, trace provenance, independently observed runtime settings, and process-family cleanup require their own evidence if supported. Mock subprocesses and durable broker tests establish narrower guarantees than live vendor verification.
 
 Keep one shared broker contract suite and focused adapter ordering cases. Add a regression when it protects an actual Xordination capability or failure boundary, and preserve the exact scenario in its assertions. A differently scoped test does not establish equivalent coverage.

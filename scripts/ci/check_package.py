@@ -37,7 +37,8 @@ def main(argv=None):
         with tarfile.open(sources[0]) as archive:
             archived = {name.split("/", 1)[1] for name in archive.getnames() if "/" in name}
             expected = {"LICENSE", "NOTICE", "README.md", "AGENTS.md", "Dockerfile", "pyproject.toml", "MANIFEST.in"}
-            for folder, pattern in (("src", "*.py"), ("tests", "*.py"), ("docs", "*.md"), ("scripts/ci", "*.py")):
+            for folder, pattern in (("src", "*.py"), ("tests", "*.py"), ("docs", "*.md"),
+                                    ("scripts/ci", "*.py"), ("scripts/testing", "*.py")):
                 expected.update(str(path.relative_to(repo)) for path in (repo / folder).rglob(pattern))
             missing = expected - archived
             if missing:

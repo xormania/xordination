@@ -39,7 +39,7 @@ def main() -> int:
     groups = selection.get("groups", [])
     # The shared runner validates group names and rejects absent/empty suites.
     full = isinstance(groups, list) and set(groups) == set(GROUPS)
-    cli_expected = full or any(group in groups for group in ("cli", "end_to_end"))
+    cli_expected = full or any(group in groups for group in ("cli", "end_to_end", "behavior"))
 
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -51,7 +51,7 @@ def main() -> int:
         selected = working / "selection.json"
         selected.write_text(json.dumps(selection), encoding="utf-8")
         command = [sys.executable, str(ROOT / "scripts" / "ci" / "run_contracts.py"),
-                   "--selection", str(selected)]
+                   "--selection", str(selected), "--report", str(output / "test-execution.json")]
         config = working / "coverage.ini"
         config.write_text(
             "[run]\n"
@@ -122,6 +122,8 @@ def main() -> int:
         "selection": selection,
         "duration_seconds": round(duration, 3),
         "tests_exit_code": result.returncode,
+        "execution_census": (json.loads((output / "test-execution.json").read_text(encoding="utf-8"))
+                             if (output / "test-execution.json").is_file() else None),
         "process_data_files": len(process_data),
         "product_processes": measured_processes,
         "cli_processes": cli_processes,

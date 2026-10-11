@@ -8,27 +8,32 @@ import re
 import subprocess
 
 
-GROUPS = ("store", "adapters", "mcp", "server", "cli", "end_to_end", "ci_selection")
+GROUPS = ("store", "adapters", "mcp", "server", "cli", "end_to_end", "ci_selection",
+          "behavior", "performance", "live_acceptance")
 SOURCE_GROUPS = {
-    "store.py": ("store", "adapters", "server", "cli", "end_to_end"),
-    "adapters.py": ("adapters", "cli"),
-    "rpc.py": ("adapters",),
+    "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
+    "adapters.py": ("adapters", "cli", "behavior", "live_acceptance"),
+    "rpc.py": ("adapters", "behavior", "live_acceptance"),
     # Native adapters consume TOOLS and INSTRUCTIONS through lazy imports.
-    "mcp.py": ("adapters", "mcp", "cli", "end_to_end"),
-    "server.py": ("server", "cli", "end_to_end"),
-    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end"),
+    "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance"),
+    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
+    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
-    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end"),
+    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }
 TEST_GROUPS = {"tests/test_" + name + ".py": (name,) for name in GROUPS}
+SCRIPT_GROUPS = {
+    "scripts/testing/benchmark.py": ("performance",),
+    "scripts/testing/live.py": ("live_acceptance",),
+}
 BUILD_INPUTS = {"pyproject.toml", "MANIFEST.in"}
 IMAGE_PACKAGE_INPUTS = {"README.md", "LICENSE", "NOTICE", "Dockerfile"}
 
 
 def full_selection(reason, paths=()):
-    return {"groups": list(GROUPS), "package": True, "image": True,
+    return {"groups": list(GROUPS), "package": True, "image": True, "benchmark": True,
             "full": True, "paths": sorted(set(paths)), "reasons": [reason]}
 
 
@@ -50,6 +55,10 @@ def classify_paths(paths):
             groups.update(TEST_GROUPS[path])
             package = True
             reasons.append("Test/source-archive input: " + path)
+        elif path in SCRIPT_GROUPS:
+            groups.update(SCRIPT_GROUPS[path])
+            package = True
+            reasons.append("Testing driver/source-archive input: " + path)
         elif path.startswith("tests/"):
             return full_selection("New or shared test input: " + path, paths)
         elif path in BUILD_INPUTS:
@@ -72,6 +81,7 @@ def classify_paths(paths):
         else:
             return full_selection("Unknown input: " + path, paths)
     return {"groups": [name for name in GROUPS if name in groups], "package": package,
+            "benchmark": "performance" in groups,
             "image": image, "full": groups == set(GROUPS), "paths": paths,
             "reasons": reasons or ["Complete tested diff is empty"]}
 
@@ -149,6 +159,7 @@ def main(argv=None):
         with open(args.github_output, "a", encoding="utf-8") as stream:
             for name, value in (("contracts", bool(result["groups"])),
                                 ("package", result["package"]), ("image", result["image"]),
+                                ("benchmark", result["benchmark"]),
                                 ("full", result["full"])):
                 stream.write(name + "=" + str(value).lower() + "\n")
     print(json.dumps(result, indent=2))
