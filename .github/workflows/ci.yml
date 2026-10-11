@@ -28,47 +28,70 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Select complete change checks
+        id: selection
+        run: python scripts/ci/select_checks.py --selection-file "$RUNNER_TEMP/xordination-selection.json"
       - uses: actions/setup-python@v7
+        if: steps.selection.outputs.contracts == 'true' || (matrix.python == '3.12' && (steps.selection.outputs.package == 'true' || steps.selection.outputs.image == 'true'))
         with:
           python-version: ${{ matrix.python }}
-      - name: Compile and contract tests
+          cache: ${{ matrix.python == '3.12' && (steps.selection.outputs.contracts == 'true' || steps.selection.outputs.package == 'true') && 'pip' || '' }}
+          cache-dependency-path: pyproject.toml
+      - name: Install canonical build and measurement tools
+        if: matrix.python == '3.12' && (steps.selection.outputs.contracts == 'true' || steps.selection.outputs.package == 'true')
+        env:
+          XORDINATION_CONTRACTS: ${{ steps.selection.outputs.contracts }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess, sys, tomllib
+          config = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          dependencies = config['build-system']['requires']
+          if os.environ['XORDINATION_CONTRACTS'] == 'true':
+              dependencies += config['project']['optional-dependencies']['ci']
+          subprocess.run([sys.executable, '-m', 'pip', 'install', *dependencies], check=True)
+          PY
+      - name: Compile selected contract context
+        if: steps.selection.outputs.contracts == 'true'
+        run: python -m compileall -q src tests scripts/ci
+      - name: Selected contracts and canonical coverage
+        if: matrix.python == '3.12' && steps.selection.outputs.contracts == 'true'
+        env:
+          PYTHONPATH: src
+        run: python scripts/ci/coverage_baseline.py --selection "$RUNNER_TEMP/xordination-selection.json" --output "$RUNNER_TEMP/xordination-coverage"
+      - name: Selected contracts
+        if: matrix.python != '3.12' && steps.selection.outputs.contracts == 'true'
         env:
           PYTHONPATH: src
         run: |
-          python -m compileall -q src tests
-          python -m unittest discover -s tests -v
-      - name: Build and install package
-        run: |
-          python -m pip wheel --no-deps --wheel-dir dist .
-          python -m pip install --no-deps dist/*.whl
-          cd "$(mktemp -d)"
-          python -I -c 'import xordination; assert xordination.__version__ == "0.1.0"'
-          xordination --version
-          xordination --help
-      - name: Detect image changes
-        if: matrix.python == '3.12'
-        id: image
-        env:
-          XORDINATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          XORDINATION_HEAD_SHA: ${{ github.sha }}
-          XORDINATION_EVENT: ${{ github.event_name }}
-        run: |
-          if [ "$XORDINATION_EVENT" = workflow_dispatch ]; then
-            echo 'build=true' >> "$GITHUB_OUTPUT"
-          else
-            if git cat-file -e "$XORDINATION_BASE_SHA^{commit}" 2>/dev/null; then
-              git diff --name-only "$XORDINATION_BASE_SHA" "$XORDINATION_HEAD_SHA" > /tmp/xordination-changes
-            else
-              git show --format= --name-only "$XORDINATION_HEAD_SHA" > /tmp/xordination-changes
-            fi
-            if grep -Eq '^(src/|Dockerfile$|\.dockerignore$|README\.md$|pyproject\.toml$|MANIFEST\.in$|LICENSE$|NOTICE$|\.github/workflows/ci\.yml$)' /tmp/xordination-changes; then
-              echo 'build=true' >> "$GITHUB_OUTPUT"
-            fi
-          fi
-      - name: Build optional broker image
-        if: steps.image.outputs.build == 'true'
+          python scripts/ci/run_contracts.py --selection "$RUNNER_TEMP/xordination-selection.json"
+          python -m xordination --version
+          python -m xordination --help
+      - name: Source archive to isolated installed package
+        if: matrix.python == '3.12' && steps.selection.outputs.package == 'true'
+        run: python scripts/ci/check_package.py
+      - name: Build and exercise durable nonroot broker image
+        if: matrix.python == '3.12' && steps.selection.outputs.image == 'true'
         run: |
           docker build --tag xordination-ci .
-          docker run --rm xordination-ci --version
-          docker run --rm xordination-ci --help
-
+          python scripts/ci/image_smoke.py --image xordination-ci
+      - name: Preserve selected coverage evidence
+        if: always() && matrix.python == '3.12' && steps.selection.outputs.contracts == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-python-3.12
+          path: ${{ runner.temp }}/xordination-coverage/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Report selected checks
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          selection = pathlib.Path(os.environ['RUNNER_TEMP']) / 'xordination-selection.json'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as report:
+              if selection.is_file():
+                  report.write('Selected checks:\n\n```json\n' + json.dumps(json.loads(selection.read_text()), indent=2) + '\n```\n')
+              else:
+                  report.write('Selection failed before publishing a result; this job cannot authorize a skip.\n')
+          PY

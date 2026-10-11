@@ -129,7 +129,7 @@ python -m compileall -q src tests
 python -m pip wheel --no-deps --wheel-dir dist .
 ```
 
-CI runs contract tests and installed-package smoke checks on Python 3.10, 3.12, and 3.14. The optional image is built only for changes to its inputs or an explicit workflow dispatch. Ordinary CI does not authenticate or charge native model sessions.
+CI selects complete contract groups from the tested change and runs them on Python 3.10, 3.12, and 3.14. Python 3.12 measures branch/thread/subprocess coverage and validates a wheel rebuilt from the source archive in a clean installation. The other runtimes retain source contract and CLI checks. Package/image inputs select their own checks, with full validation for unknown changes or manual dispatch. The image check exercises authenticated durable state across container replacement. See [CI checks](docs/ci.md) and [coverage baseline](docs/coverage-baseline.md). Ordinary CI does not authenticate or charge native model sessions.
 
 The repository's existing `master` rules also require a Python CodeQL scan. Its workflow can upload security results and has read-only access to source contents.
 

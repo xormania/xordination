@@ -58,6 +58,9 @@ for line in sys.stdin:
     elif method=="thread/start":
         write({"id":row["id"],"result":{"thread":{"id":"thread-one"},"params":row["params"]}})
     elif method=="turn/start":
+        if row["params"].get("threadId")!="thread-one":
+            write({"id":row["id"],"error":{"code":-32602,"message":"Fixture rejected mismatched native thread"}})
+            continue
         turn="turn-busy" if row["params"].get("input") else "turn-delivery"
         if row["params"].get("input"):
             write({"method":"turn/started","params":{"threadId":"thread-one","turn":{"id":turn}}})
@@ -81,6 +84,9 @@ def write(row):
 for line in sys.stdin:
     row=json.loads(line)
     method=row.get("method")
+    if method in ("session/prompt","_x.ai/interject") and row["params"].get("sessionId")!="grok-one":
+        write({"id":row["id"],"error":{"code":-32602,"message":"Fixture rejected mismatched native session"}})
+        continue
     if method=="initialize":
         write({"id":row["id"],"result":{"authMethods":[]}})
     elif method=="session/new":
@@ -107,6 +113,9 @@ def write(row):
 for line in sys.stdin:
     row=json.loads(line)
     if row.get("method")=="turn/start":
+        if row["params"].get("threadId")!="thread-one":
+            write({"id":row["id"],"error":{"code":-32602,"message":"Fixture rejected mismatched native thread"}})
+            continue
         write({"method":"turn/started","params":{"threadId":"thread-one","turn":{"id":"finished-turn"}}})
         write({"method":"turn/completed","params":{"threadId":"thread-one","turn":{"id":"finished-turn"}}})
         write({"id":row["id"],"result":{"turn":{"id":"finished-turn"}}})
@@ -117,6 +126,34 @@ def message(identifier="message-one", attempt="attempt-one"):
     return {"id": identifier, "from": "sender", "from_generation": "s-one", "to": "recipient",
             "to_generation": "r-one", "delivery_generation": "r-one", "body": "Review this change", "reply_to": None,
             "metadata": {}, "attempt_id": attempt}
+
+
+class OrderedFinishClient(ClientFixture):
+    """Hold each submission until both independent finishes are recorded."""
+
+    def __init__(self, first_transport):
+        super().__init__()
+        self.first_transport = first_transport
+        self.recorded = {transport: threading.Event() for transport in
+                         ("grok/session/prompt", "grok/_x.ai/interject")}
+
+    def call(self, operation, **params):
+        transport = params.get("detail", {}).get("transport")
+        if operation != "finish" or params.get("outcome") != "submitted":
+            return super().call(operation, **params)
+        if transport != self.first_transport and not self.recorded[self.first_transport].wait(5):
+            raise TimeoutError("First finish did not reach its recording barrier")
+        result = super().call(operation, **params)
+        self.recorded[transport].set()
+        if transport == self.first_transport:
+            second = next(event for name, event in self.recorded.items() if name != transport)
+            if not second.wait(5):
+                raise TimeoutError("Second finish did not reach its recording barrier")
+        return result
+
+    def release(self):
+        for event in self.recorded.values():
+            event.set()
 
 
 class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -167,6 +204,13 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
             while not condition():
                 await asyncio.sleep(.01)
         await asyncio.wait_for(poll(), 3)
+
+    def submitted_finish(self, msg):
+        matches = [params for operation, params in self.client.calls if operation == "finish"
+                   and params["message_id"] == msg["id"] and params["attempt_id"] == msg["attempt_id"]
+                   and params["outcome"] == "submitted"]
+        self.assertEqual(len(matches), 1, "Expected one submission for this message and attempt")
+        return matches[0]
 
     async def test_codex_busy_delivery_survives_held_tool_and_retains_thread(self):
         adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
@@ -278,7 +322,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         second = message("message-two", "attempt-two")
         adapter.pending_attempts[second["attempt_id"]] = second
         await adapter.deliver(second)
-        finished = [params for op, params in self.client.calls if op == "finish"][-1]
+        finished = self.submitted_finish(second)
         self.assertEqual(finished["detail"]["transport"], "grok/_x.ai/interject")
         self.assertEqual(finished["detail"]["native_id"], "grok-one")
         await adapter.rpc.request("fixture/complete", {})
@@ -294,6 +338,65 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         await adapter.refresh_delivery_state()
         self.assertFalse(adapter.busy)
         self.assertEqual(len([op for op, _ in self.client.calls if op == "finish"]), 2)
+
+    async def test_grok_finish_evidence_correlates_attempts_in_either_record_order(self):
+        for first_transport in ("grok/session/prompt", "grok/_x.ai/interject"):
+            with self.subTest(first_transport=first_transport):
+                self.client = OrderedFinishClient(first_transport)
+                adapter = self.adapter = GrokAdapter(self.client, sys.executable, self.temporary.name)
+                try:
+                    await self.process(MOCK_GROK, adapter)
+                    adapter.session = "grok-one"
+                    first, second = message(), message("message-two", "attempt-two")
+                    for msg in (first, second):
+                        adapter.pending_attempts[msg["attempt_id"]] = msg
+                        await adapter.deliver(msg)
+                    self.assertEqual(self.submitted_finish(first)["detail"]["transport"], "grok/session/prompt")
+                    self.assertEqual(self.submitted_finish(second)["detail"]["transport"], "grok/_x.ai/interject")
+                    recorded = [params["detail"]["transport"] for op, params in self.client.calls
+                                if op == "finish" and params["outcome"] == "submitted"]
+                    second_transport = next(name for name in self.client.recorded if name != first_transport)
+                    self.assertEqual(recorded, [first_transport, second_transport])
+                    await adapter.rpc.request("fixture/complete", {})
+                    await self.until(lambda: adapter.prompts_in_flight == 0)
+                finally:
+                    self.client.release()
+                    await adapter.close()
+
+    async def test_managed_grok_loop_uses_receipt_to_release_interjection_barrier(self):
+        self.store_client()
+        adapter = self.adapter = GrokAdapter(self.client, sys.executable, self.temporary.name, poll_interval=.01)
+        async def spawn(argv, **kwargs):
+            await self.process(MOCK_GROK, adapter)
+        adapter.spawn = spawn
+        first = self.store.send(self.sender_context, "recipient", "Original task", "original")
+        runner = asyncio.create_task(adapter.run())
+        try:
+            await self.until(lambda: self.store.status(self.recipient_context, first["id"])["state"] == "submitted")
+            second = self.store.send(self.sender_context, "recipient", "Peer update", "interjected")
+            await self.until(lambda: self.store.status(self.recipient_context, second["id"])["state"] == "submitted")
+            self.assertEqual(self.store.status(self.recipient_context, second["id"])["attempts"][0]["detail"]["transport"],
+                             "grok/_x.ai/interject")
+            await adapter.rpc.request("fixture/complete", {})
+            await self.until(lambda: adapter.prompts_in_flight == 0)
+            self.assertTrue(adapter.busy)
+            self.assertEqual(set(adapter.pending_interjections), {second["id"]})
+            self.store.ack(self.recipient_context, second["id"])
+            await self.until(lambda: not adapter.busy and not adapter.pending_interjections)
+            third = self.store.send(self.sender_context, "recipient", "Next task", "after-receipt")
+            await self.until(lambda: self.store.status(self.recipient_context, third["id"])["state"] == "submitted")
+            self.assertEqual(self.store.status(self.recipient_context, third["id"])["attempts"][0]["detail"]["transport"],
+                             "grok/session/prompt")
+            await adapter.rpc.request("fixture/complete", {})
+            await self.until(lambda: adapter.prompts_in_flight == 0)
+        finally:
+            runner.cancel()
+            result = (await asyncio.gather(runner, return_exceptions=True))[0]
+        self.assertIsInstance(result, asyncio.CancelledError)
+        self.assertIsNotNone(adapter.rpc.process.returncode)
+        recipient = next(peer for peer in self.store.peers(self.sender_context)["peers"]
+                         if peer["participant"] == "recipient")
+        self.assertFalse(recipient["active"])
 
     async def test_grok_unacknowledged_interjection_survives_original_prompt_completion(self):
         # Native prompt completion and authenticated receipt are independent.

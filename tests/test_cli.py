@@ -3,13 +3,12 @@ import io
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
+from helpers import observe_fsync
 from xordination.cli import main
 from xordination.store import Store
 
@@ -23,20 +22,8 @@ class BootstrapSafety(unittest.TestCase):
             store = Store(state)
             store.create_space("project")
             original = store.join("project", "one")
-            original_fsync = os.fsync
-            reached_directory = []
-
-            def fail_directory(descriptor_fd):
-                info = os.fstat(descriptor_fd)
-                if (stat.S_ISDIR(info.st_mode) and descriptor.parent.exists()
-                        and (info.st_dev, info.st_ino) ==
-                        (descriptor.parent.stat().st_dev, descriptor.parent.stat().st_ino)):
-                    reached_directory.append(True)
-                    raise OSError("directory sync unavailable")
-                original_fsync(descriptor_fd)
-
             try:
-                with patch("xordination.cli.os.fsync", side_effect=fail_directory):
+                with observe_fsync([descriptor.parent], fail=descriptor.parent) as reached_directory:
                     with contextlib.redirect_stderr(io.StringIO()):
                         result = main(["join", "--state", state, "--space", "project",
                                        "--participant", "one", "--replace", "--output", str(descriptor)])
@@ -56,23 +43,15 @@ class BootstrapSafety(unittest.TestCase):
             store = Store(state)
             store.create_space("project")
             store.join("project", "one")
-            original_fsync = os.fsync
-            synced = set()
-
-            def observe_sync(descriptor_fd):
-                info = os.fstat(descriptor_fd)
-                if stat.S_ISDIR(info.st_mode) and descriptor.exists():
-                    synced.add((info.st_dev, info.st_ino))
-                original_fsync(descriptor_fd)
-
+            directories = (descriptor.parent, descriptor.parent.parent, Path(folder))
             try:
-                with patch("xordination.cli.os.fsync", side_effect=observe_sync):
+                with observe_fsync([descriptor, *directories]) as synced:
                     result = main(["join", "--state", state, "--space", "project",
                                    "--participant", "one", "--replace", "--output", str(descriptor)])
                 self.assertEqual(result, 0)
-                for directory in (descriptor.parent, descriptor.parent.parent, Path(folder)):
-                    info = directory.stat()
-                    self.assertIn((info.st_dev, info.st_ino), synced)
+                self.assertIn(descriptor, synced)
+                for directory in directories:
+                    self.assertIn(directory, synced[synced.index(descriptor) + 1:])
                 issued = json.loads(descriptor.read_text())
                 self.assertEqual(store.authenticate(issued["token"])["generation"], issued["generation"])
             finally:
@@ -116,18 +95,7 @@ class BootstrapSafety(unittest.TestCase):
                 self.assertEqual(store.authenticate(original["token"])["generation"], original["generation"])
                 self.assertEqual(json.loads(descriptor.read_text())["token"], original["token"])
                 descriptor.unlink()
-                original_fsync = os.fsync
-                failed_descriptor = []
-
-                def fail_descriptor(descriptor_fd):
-                    info = os.fstat(descriptor_fd)
-                    if (descriptor.exists() and (info.st_dev, info.st_ino) ==
-                            (descriptor.stat().st_dev, descriptor.stat().st_ino)):
-                        failed_descriptor.append(True)
-                        raise OSError("disk unavailable")
-                    original_fsync(descriptor_fd)
-
-                with patch("xordination.cli.os.fsync", side_effect=fail_descriptor):
+                with observe_fsync([descriptor], fail=descriptor) as failed_descriptor:
                     with contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(main(args), 2)
                 self.assertTrue(failed_descriptor)

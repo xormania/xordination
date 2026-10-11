@@ -1,9 +1,16 @@
 """Observable durability, authority, and replay contracts from the specification."""
 
 import concurrent.futures
+import base64
+from contextlib import closing
+import json
 import os
+import queue
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -64,7 +71,8 @@ class StoreContracts(unittest.TestCase):
 
     def test_replacement_fences_captured_context_and_requires_recovery(self):
         message = self.send()
-        new_join = self.store.join("project", "b", replace=True)
+        with closing(Store(self.path)) as operator:
+            new_join = operator.join("project", "b", replace=True)
         new = self.store.authenticate(new_join["token"])
         self.assertCode("stale_generation", self.store.send, self.b, "a", "stale", "stale")
         self.assertCode("stale_generation", self.store.claim, self.b)
@@ -119,6 +127,57 @@ class StoreContracts(unittest.TestCase):
         self.store.finish(self.b, message["id"], second["attempt_id"], "submitted")
         self.assertEqual("submitted", self.store.status(self.a, message["id"])["state"])
 
+    def test_unclean_claim_writer_restart_requires_explicit_retry(self):
+        """Exercise an unclean SQLite writer and explicit core reconciliation."""
+        message = self.send()
+        self.store.close()
+        env = dict(os.environ, XORDINATION_TEST_TOKEN=self.b_join["token"],
+                   PYTHONDONTWRITEBYTECODE="1")
+        source = str(Path(__file__).resolve().parents[1] / "src")
+        env["PYTHONPATH"] = source + os.pathsep + env.get("PYTHONPATH", "")
+        code = """
+import json, os, sys
+from xordination.store import Store
+store = Store(sys.argv[1])
+context = store.authenticate(os.environ['XORDINATION_TEST_TOKEN'])
+claimed = store.claim(context)
+print(json.dumps({'message_id': claimed['message']['id'], 'attempt_id': claimed['attempt_id']}), flush=True)
+sys.stdin.buffer.read(1)
+"""
+        with tempfile.TemporaryFile(mode="w+b") as stderr:
+            process = subprocess.Popen([sys.executable, "-u", "-c", code, str(self.path)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=stderr, env=env, text=True)
+            ready = queue.Queue()
+            reader = threading.Thread(target=lambda: ready.put(process.stdout.readline()), daemon=True)
+            reader.start()
+            try:
+                notification = ready.get(timeout=5)
+                self.assertTrue(notification, "Claim writer closed stdout before committing its claim")
+                claimed = json.loads(notification)
+                self.assertEqual(message["id"], claimed["message_id"])
+                self.assertIsNone(process.poll())
+                process.kill()
+                self.assertNotEqual(0, process.wait(timeout=5))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                reader.join(timeout=2)
+                process.stdin.close()
+                process.stdout.close()
+        self.store = Store(self.path)
+        persisted = self.store.status(self.a, message["id"])
+        self.assertEqual("claimed", persisted["state"])
+        self.assertEqual(claimed["attempt_id"], persisted["attempts"][0]["id"])
+        self.store.recover_claims()
+        self.assertEqual("uncertain", self.store.status(self.a, message["id"])["state"])
+        self.assertIsNone(self.store.claim(self.b)["message"])
+        self.store.retry(self.a, message["id"])
+        retry = self.store.claim(self.b)
+        self.assertEqual(message["id"], retry["message"]["id"])
+        self.assertNotEqual(claimed["attempt_id"], retry["attempt_id"])
+
     def test_receipt_and_transport_uncertainty_remain_independent(self):
         message = self.send()
         attempt = self.store.claim(self.b)
@@ -144,6 +203,24 @@ class StoreContracts(unittest.TestCase):
         self.store.retry(self.a, message["id"])
         self.assertCode("stale_attempt", self.store.finish, self.b, message["id"], attempt["attempt_id"], "submitted")
 
+    def test_failed_retry_and_late_confirmation_preserve_attempt_history(self):
+        message = self.send()
+        failed = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], failed["attempt_id"], "failed", {"reason": "before_native_write"})
+        self.store.retry(self.a, message["id"])
+        retry = self.store.claim(self.b)
+        self.assertNotEqual(failed["attempt_id"], retry["attempt_id"])
+        self.store.finish(self.b, message["id"], retry["attempt_id"], "uncertain")
+        self.store.finish(self.b, message["id"], retry["attempt_id"], "submitted", {"native_response": "confirmed"})
+        status = self.store.status(self.a, message["id"])
+        self.assertEqual("submitted", status["state"])
+        self.assertEqual(["failed", "submitted"], [attempt["state"] for attempt in status["attempts"]])
+        self.assertEqual(["uncertain", "submitted"], [event["outcome"] for event in status["attempts"][1]["evidence"]])
+        self.assertTrue(status["uncertain"])
+        self.assertFalse(status["unresolved_uncertainty"])
+        self.assertFalse(status["acknowledged"])
+        self.assertIsNone(self.store.claim(self.b)["message"])
+
     def test_recovery_of_submitted_unacknowledged_message_requires_explicit_retry(self):
         message = self.send()
         attempt = self.store.claim(self.b)
@@ -157,6 +234,25 @@ class StoreContracts(unittest.TestCase):
         self.assertIsNone(self.store.claim(new)["message"])
         self.store.retry(self.a, message["id"])
         self.assertEqual(message["id"], self.store.claim(new)["message"]["id"])
+
+    def test_recovery_cannot_transfer_received_or_expired_messages(self):
+        received = self.send("received")
+        receipt = self.store.ack(self.b, received["id"])["receipt"]
+        expired = self.send("expired", expires_in=10)
+        replacement = self.store.join("project", "b", replace=True)
+        new = self.store.authenticate(replacement["token"])
+        epoch = self.store.identity(new)["visibility_epoch"]
+        self.assertCode("already_received", self.store.recover, new, received["id"])
+        with patch("xordination.store.time.time", return_value=time.time() + 11):
+            self.assertCode("expired", self.store.recover, new, expired["id"])
+        self.assertEqual(epoch, self.store.identity(new)["visibility_epoch"])
+        self.assertEqual([], self.store.inbox(new)["messages"])
+        for message in (received, expired):
+            with self.subTest(message=message["key"]):
+                status = self.store.status(self.a, message["id"])
+                self.assertEqual(message["to_generation"], status["delivery_generation"])
+                self.assertEqual([], status["recoveries"])
+        self.assertEqual([receipt], self.store.status(self.a, received["id"])["receipts"])
 
     def test_delayed_retired_attempt_cannot_settle_recovered_generation(self):
         message = self.send()
@@ -179,6 +275,8 @@ class StoreContracts(unittest.TestCase):
             page = self.store.inbox(self.b, cursor=cursor, limit=2)
             seen += [message["id"] for message in page["messages"]]
             cursor = page["cursor"]
+            if len(seen) == 2:
+                expected.append(self.send("between-pages")["id"])
             if not page["has_more"]:
                 break
         empty = self.store.inbox(self.b, cursor=cursor, limit=2)
@@ -211,6 +309,11 @@ class StoreContracts(unittest.TestCase):
         self.assertCode("forbidden", self.store.ack, self.a, message["id"])
         self.assertCode("forbidden", self.store.send, outsider, "a", "fake reply", "fake", reply_to=message["id"])
         self.assertCode("invalid_cursor", self.store.inbox, outsider, cursor=self.store.inbox(self.b)["cursor"])
+        cursor = self.store.inbox(self.b)["cursor"]
+        wire = bytearray(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        wire[-1] ^= 1
+        forged = base64.urlsafe_b64encode(wire).decode().rstrip("=")
+        self.assertCode("invalid_cursor", self.store.inbox, self.b, cursor=forged)
         spoofed = dict(self.a, participant="b", generation=self.b["generation"], space="other")
         self.assertCode("forbidden", self.store.ack, spoofed, message["id"])
         self.assertEqual("a", self.store.send(spoofed, "b", "actual identity", "real")["from"])
@@ -219,12 +322,33 @@ class StoreContracts(unittest.TestCase):
         self.assertEqual([reply["id"]], [m["id"] for m in self.store.status(self.a, message["id"])["replies"]])
 
     def test_concurrent_duplicate_acceptance_and_claim_have_one_owner(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-            accepted = list(executor.map(lambda _: self.send(), range(24)))
-        self.assertEqual(1, len({m["id"] for m in accepted}))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-            claims = list(executor.map(lambda _: self.store.claim(self.b), range(24)))
-        self.assertEqual(1, sum(claim["message"] is not None for claim in claims))
+        connections = [Store(self.path), Store(self.path)]
+        ready = threading.Barrier(3)
+
+        def send(connection):
+            context = connection.authenticate(self.a_join["token"])
+            ready.wait(timeout=5)
+            return connection.send(context, "b", "A question", "same-acceptance")
+
+        def claim(connection):
+            context = connection.authenticate(self.b_join["token"])
+            ready.wait(timeout=5)
+            return connection.claim(context)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(send, connection) for connection in connections]
+                ready.wait(timeout=5)
+                accepted = [future.result(timeout=5) for future in futures]
+                self.assertEqual(1, len({message["id"] for message in accepted}))
+                self.assertEqual(1, len(self.store.inbox(self.b)["messages"]))
+                futures = [executor.submit(claim, connection) for connection in connections]
+                ready.wait(timeout=5)
+                claims = [future.result(timeout=5) for future in futures]
+            self.assertEqual(1, sum(claim["message"] is not None for claim in claims))
+        finally:
+            for connection in connections:
+                connection.close()
 
     def test_operator_connection_does_not_imply_broker_restart(self):
         message = self.send()

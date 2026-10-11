@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -7,32 +8,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from pathlib import Path
+from unittest.mock import patch
 
+from helpers import owned_broker
 from xordination.client import Client, BrokerError
-from xordination.server import BrokerServer
-from xordination.store import Store
+from xordination.server import BrokerServer, Handler
 
 
 class BrokerIntegration(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.store = Store(str(Path(self.temp.name) / "state.sqlite"))
+        self.addCleanup(self.temp.cleanup)
+        fixture = owned_broker(Path(self.temp.name) / "state.sqlite", max_waits=1)
+        self.store, self.server, self.endpoint = fixture.__enter__()
+        self.addCleanup(fixture.__exit__, None, None, None)
         self.store.create_space("project")
         a = self.store.join("project", "one")
         b = self.store.join("project", "two")
-        self.server = BrokerServer(("127.0.0.1", 0), self.store, max_waits=1)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.endpoint = "http://127.0.0.1:" + str(self.server.server_port)
-        self.one = Client(self.endpoint, a["token"])
-        self.two = Client(self.endpoint, b["token"])
-
-    def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        self.store.close()
-        self.temp.cleanup()
+        self.one = Client(self.endpoint, a["token"], timeout=5)
+        self.two = Client(self.endpoint, b["token"], timeout=5)
 
     def test_native_boundary_and_authenticated_exchange(self):
         with urlopen(self.endpoint + "/health") as response:
@@ -49,11 +43,104 @@ class BrokerIntegration(unittest.TestCase):
         self.assertEqual(self.two.call("inbox")["messages"][0]["id"], message_id)
 
     def test_long_wait_does_not_block_send_or_ack(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pending = pool.submit(self.two.call, "wait", timeout=2)
-            self.one.call("send", to="two", body="wake", key="wake-1")
-            inbox = pending.result(timeout=3)
+        # Seed directly so the only HTTP send occurs after the empty wait is
+        # observed. A future merely being scheduled is not evidence of waiting.
+        seed = self.store.send(self.store.authenticate(self.one.token),
+                               to="two", body="acknowledge during wait", key="seed")
+        cursor = self.two.call("inbox")["cursor"]
+        empty_wait = threading.Event()
+        original_inbox = self.store.inbox
+
+        def observe_empty(ctx, **params):
+            result = original_inbox(ctx, **params)
+            if params.get("cursor") == cursor and not result["messages"]:
+                empty_wait.set()
+            return result
+
+        with patch.object(self.store, "inbox", side_effect=observe_empty), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.two.call, "wait", timeout=3, cursor=cursor)
+            try:
+                self.assertTrue(empty_wait.wait(1), "HTTP wait never inspected an empty inbox before send")
+                self.assertFalse(pending.done())
+                receipt = self.two.call("ack", message_id=seed["id"])
+                self.assertTrue(receipt["acknowledged"])
+                self.assertFalse(pending.done(), "Wait ended before the concurrent acknowledgement")
+                self.one.call("send", to="two", body="wake", key="wake-1")
+                inbox = pending.result(timeout=2)
+            finally:
+                self.server.stopping.set()
         self.assertEqual(inbox["messages"][0]["body"], "wake")
+
+    def test_wait_quota_is_released_after_wake_and_store_error(self):
+        empty_wait = threading.Event()
+        original_inbox = self.store.inbox
+
+        def observe_empty(ctx, **params):
+            result = original_inbox(ctx, **params)
+            if not result["messages"]:
+                empty_wait.set()
+            return result
+
+        with patch.object(self.store, "inbox", side_effect=observe_empty), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.two.call, "wait", timeout=3)
+            try:
+                self.assertTrue(empty_wait.wait(1))
+                with self.assertRaises(BrokerError) as caught:
+                    self.one.call("wait", timeout=0)
+                self.assertEqual("backpressure", caught.exception.code)
+                self.assertFalse(pending.done())
+                sent = self.one.call("send", to="two", body="release wait slot", key="quota")
+                self.assertEqual(sent["id"], pending.result(timeout=2)["messages"][0]["id"])
+            finally:
+                if not pending.done():
+                    self.server.stopping.set()
+        self.assertFalse(self.server.stopping.is_set())
+        self.assertEqual([], self.one.call("wait", timeout=0)["messages"])
+        # Invalid cursor validation fails inside the acquired wait slot.
+        with self.assertRaises(BrokerError) as caught:
+            self.one.call("wait", timeout=0, cursor="invalid-signature")
+        self.assertEqual("invalid_cursor", caught.exception.code)
+        self.assertEqual([], self.one.call("wait", timeout=0)["messages"])
+
+    def test_slow_headers_occupy_connection_budget_until_owned_socket_closes(self):
+        with owned_broker(Path(self.temp.name) / "connections.sqlite", max_requests=1) as (_, server, endpoint):
+            entered, released = threading.Event(), threading.Event()
+            setup_count = []
+            original_setup = Handler.setup
+            original_thread = server.process_request_thread
+
+            def observe_setup(handler):
+                original_setup(handler)
+                if handler.server is server:
+                    setup_count.append(handler.client_address)
+                    entered.set()
+
+            def observe_release(*args):
+                try:
+                    return original_thread(*args)
+                finally:
+                    released.set()
+
+            with patch.object(Handler, "setup", observe_setup), \
+                    patch.object(server, "process_request_thread", side_effect=observe_release):
+                with socket.create_connection(server.server_address, timeout=1) as slow:
+                    slow.sendall(b"POST /rpc HTTP/1.1\r\nHost: localhost\r\n")
+                    self.assertTrue(entered.wait(1), "Slow header connection was never owned")
+                    with socket.create_connection(server.server_address, timeout=1) as overflow:
+                        try:
+                            overflow.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            self.assertEqual(b"", overflow.recv(1))
+                        except (ConnectionResetError, BrokenPipeError):
+                            pass
+                    self.assertEqual(1, len(setup_count), "Overflow client bypassed the connection quota")
+                    self.assertFalse(released.is_set(), "Incomplete headers did not retain the owned slot")
+                    slow.shutdown(socket.SHUT_RDWR)
+                self.assertTrue(released.wait(1), "Closed client did not release its connection slot")
+                with urlopen(endpoint + "/health", timeout=1) as response:
+                    self.assertEqual("xordination", json.load(response)["service"])
+                self.assertEqual(2, len(setup_count))
 
     def test_rejects_browser_origin_and_payload_without_exposing_identity(self):
         request = Request(self.endpoint + "/rpc",
@@ -83,7 +170,8 @@ class BrokerIntegration(unittest.TestCase):
             def log_message(handler, *args):
                 pass
         redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
-        thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+        thread = threading.Thread(target=redirect.serve_forever,
+                                  kwargs={"poll_interval": 0.02}, daemon=True)
         thread.start()
         try:
             with self.assertRaises(BrokerError):
