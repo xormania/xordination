@@ -83,6 +83,36 @@ Claude uses the production managed adapter with its prepared participant credent
 
 Observation failures write bounded diagnostics and invalidate required acceptance evidence. The passive hook returns empty output and zero exit on capture failure; it issues no permission decision, rewrites no tool arguments and does not turn a recording error into denial of an otherwise permitted native tool. Normal harness permissions remain authoritative.
 
+### Managed tmux launcher
+
+The [managed launcher](../scripts/testing/live_tmux.py) runs the same procedure from one command in a new tmux session it owns. Its session ownership, window options and owned-pane cleanup follow the [multi-harness-proof launcher](https://github.com/xormania/multi-harness-proof/blob/master/OPERATIONS.md). It requires tmux and the selected harnesses already installed and authenticated; it installs nothing and changes no global harness or tmux configuration.
+
+```sh
+python scripts/testing/live_tmux.py self-check   # Real tmux on a private socket; no broker, harness or model
+python scripts/testing/live_tmux.py start --config /tmp/xordination-live-config.json
+```
+
+`start` creates a fresh job directory under `$XDG_STATE_HOME/xordination/live-runs/` (default `~/.local/state/...`), outside any checkout, so native sessions do not load this repository's agent guidance. It runs `doctor` for each required harness without model calls and refuses before preparing credentials when any is not `supported`. Observed `--version` output fills a participant's absent `version`. The job holds `session.json`, `preflight.json`, the resolved `config.json`, the live run in `run/`, one workspace per participant in `workspaces/`, and redacted pane logs in `logs/`.
+
+The dashboard window supervises the run:
+
+1. It starts the broker on a free loopback port and waits for `/health`.
+2. It opens one window per required participant and selects Claude's window, if any, for the operator's trust and development-channel prompts.
+3. It waits up to `--startup-timeout` for every required native binding and, for Claude, fresh channel registration.
+4. It captures bindings and dispatches tasks with `--phase-timeout`, then polls the read-only verifier for up to `--reply-timeout`.
+5. It retains one final immutable report even after a timeout or stop, then closes only its own windows (participants before the broker) and writes `summary.json`.
+
+Participant windows read their credentials from the run directory; tokens never appear on tmux command lines and are redacted from captured pane logs. A Claude participant's workspace receives an additive `.claude/settings.local.json` whose `PreToolUse` hook runs `observe-claude` with a timeout above twice the phase timeout; the production adapter keeps its own `SessionStart` hook. Codex and Grok use `live.py adapter`.
+
+```sh
+python scripts/testing/live_tmux.py status JOB
+python scripts/testing/live_tmux.py attach JOB
+python scripts/testing/live_tmux.py stop JOB    # Finalize evidence, then close owned windows
+python scripts/testing/live_tmux.py close JOB   # Remove a finished run's dashboard; files remain
+```
+
+Approvals remain the operator's; the launcher never answers a native prompt. A stopped, timed-out or failed run reports **INCOMPLETE** or **FAIL** with the passed and failed cases; it never substitutes a fixture. Ordinary CI exercises the supervisor with a subprocess stand-in for tmux, a real broker and scripted native participants (`tests/test_live_tmux.py`); that establishes orchestration, not vendor compatibility.
+
 Native IDs are adapter-reported; configured versions/settings are operator observations. Observer files are correlated run-local evidence, not attestation against hostile local editing. A deterministic validator test is evidence that the oracle accepts/rejects its fixtures, not evidence that an actual vendor run passed. Publish a live compatibility claim only with the actual retained run and its precise evidence boundary.
 
 ## Performance measurements
