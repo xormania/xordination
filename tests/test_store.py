@@ -407,6 +407,26 @@ sys.stdin.buffer.read(1)
             if private is not None:
                 private.close()
 
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks guard SQLite's WAL index")
+    def test_reopened_store_keeps_wal_index_in_use_for_other_processes(self):
+        # A restarted broker opens existing state. Its permission recheck must not
+        # release SQLite's WAL-index lock, or another process's reader concludes it
+        # is the first connection and resets the index under the broker's mapping.
+        self.store.close()
+        self.store = Store(self.path)
+        # Byte 128 of -shm is the unix VFS "connection in use" lock (UNIX_SHM_DMS).
+        probe = ("import fcntl, os, sys\n"
+                 "descriptor = os.open(sys.argv[1], os.O_RDWR)\n"
+                 "try:\n"
+                 "    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 128, 0)\n"
+                 "    print('first-connection')\n"
+                 "except OSError:\n"
+                 "    print('in-use')\n")
+        result = subprocess.run([sys.executable, "-c", probe, str(self.path) + "-shm"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.strip(), "in-use", result.stderr)
+        self.store.create_space("after reopen")
+
     @unittest.skipUnless(os.name == "posix", "POSIX durable directory entries")
     def test_failed_directory_sync_rejects_fresh_state_before_sqlite_acceptance(self):
         path = Path(self.directory.name) / "new-ancestor" / "new-state" / "broker.sqlite"
