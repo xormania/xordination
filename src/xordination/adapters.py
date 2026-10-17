@@ -84,6 +84,22 @@ def codex_capability(binary):
         return {"status": "unverified", "detail": type(error).__name__ + " during installed schema probe"}
 
 
+CLAUDE_CHANNEL_FLAG = "--dangerously-load-development-channels"
+
+
+def claude_accepts_channel_flag(executable):
+    """Some releases omit the channel flag from help. Probe the option parser with
+    no prompt input, so the CLI rejects the invocation before any session starts."""
+    try:
+        probe = subprocess.run([executable, CLAUDE_CHANNEL_FLAG, "server:xordination", "--print"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = probe.stdout + probe.stderr
+    # Only the explicit missing-input refusal shows the flag parsed; anything else stays unverified.
+    return "unknown option" not in output and "Input must be provided" in output
+
+
 def doctor(harness, binary=None):
     """Availability observations are not a live communication certification."""
     if harness not in {"codex", "grok", "claude"}:
@@ -101,11 +117,14 @@ def doctor(harness, binary=None):
         try:
             help_result = subprocess.run(argv, capture_output=True, text=True, timeout=15)
             supported = help_result.returncode == 0
+            basis = "installed CLI help; runtime handshake still required"
             if harness == "claude":
                 supported = supported and all(flag in help_result.stdout for flag in
-                    ("--session-id", "--mcp-config", "--dangerously-load-development-channels", "--debug-file"))
-            result["launch"] = {"status": "supported" if supported else "unverified",
-                                "basis": "installed CLI help; runtime handshake still required"}
+                    ("--session-id", "--mcp-config", "--debug-file"))
+                if supported and CLAUDE_CHANNEL_FLAG not in help_result.stdout:
+                    supported = claude_accepts_channel_flag(executable)
+                    basis = "installed CLI help; unlisted channel flag accepted by its option parser"
+            result["launch"] = {"status": "supported" if supported else "unverified", "basis": basis}
         except (OSError, subprocess.TimeoutExpired) as error:
             result["launch"] = {"status": "unverified", "detail": type(error).__name__}
     result["status"] = result["launch"]["status"]

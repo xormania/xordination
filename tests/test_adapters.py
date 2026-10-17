@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from xordination.adapters import (CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
-                                 claude_hook, doctor, run_adapter)
+                                 claude_hook, doctor, run_adapter, run_claude)
 from xordination.rpc import RPC, RPCError
 from native_fixtures import MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
@@ -511,6 +511,45 @@ class ProbeAndChannelTests(unittest.TestCase):
         observed = doctor("codex", binary="/missing/xordination-native-binary")
         self.assertEqual(observed["status"], "unavailable")
         self.assertEqual(observed["live_round_trip"], "unverified")
+
+    def fake_claude(self, folder, help_flags, accepts_channel):
+        # Owned executable mirroring the observed parser: unknown options fail before input checks.
+        path = Path(folder) / "claude"
+        path.write_text("#!" + sys.executable + "\n" + "import sys\n"
+            "args = sys.argv[1:]\n"
+            "if args == ['--version']: print('2.1.302 (Claude Code)'); raise SystemExit(0)\n"
+            "if args == ['--help']: print(" + repr(" ".join(help_flags)) + "); raise SystemExit(0)\n"
+            "if '--dangerously-load-development-channels' in args and not " + repr(accepts_channel) + ":\n"
+            "    print(\"error: unknown option '--dangerously-load-development-channels'\", file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "if '--print' in args and not sys.stdin.read():\n"
+            "    print('Error: Input must be provided either through stdin or as a prompt argument', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "raise SystemExit('fixture received an unexpected session request')\n")
+        path.chmod(0o700)
+        return str(path)
+
+    def test_claude_doctor_accepts_listed_or_parser_accepted_channel_flag(self):
+        listed = ("--session-id", "--mcp-config", "--debug-file", "--dangerously-load-development-channels")
+        with tempfile.TemporaryDirectory() as folder:
+            observed = doctor("claude", binary=self.fake_claude(folder, listed, accepts_channel=False))
+            self.assertEqual(observed["status"], "supported")
+            self.assertEqual(observed["launch"]["basis"], "installed CLI help; runtime handshake still required")
+        with tempfile.TemporaryDirectory() as folder:
+            observed = doctor("claude", binary=self.fake_claude(folder, listed[:3], accepts_channel=True))
+            self.assertEqual(observed["status"], "supported")
+            self.assertIn("unlisted channel flag accepted", observed["launch"]["basis"])
+            self.assertEqual(observed["live_round_trip"], "unverified")
+
+    def test_claude_doctor_rejected_channel_flag_remains_unverified(self):
+        with tempfile.TemporaryDirectory() as folder:
+            binary = self.fake_claude(folder, ("--session-id", "--mcp-config", "--debug-file"), accepts_channel=False)
+            observed = doctor("claude", binary=binary)
+            self.assertEqual(observed["status"], "unverified")
+            client = ClientFixture()
+            with self.assertRaisesRegex(CapabilityError, "unverified"):
+                run_claude(client, binary, folder)
+            self.assertEqual(client.calls, [])  # Refused before binding, so before any native launch.
 
     def test_claude_registration_waits_for_complete_fresh_line(self):
         with tempfile.TemporaryDirectory() as folder:
