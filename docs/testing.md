@@ -100,9 +100,11 @@ The dashboard window supervises the run:
 2. It opens one window per required participant and selects Claude's window, if any, for the operator's trust and development-channel prompts.
 3. It waits up to `--startup-timeout` for every required native binding and, for Claude, fresh channel registration.
 4. It captures bindings and dispatches tasks with `--phase-timeout`, then polls the read-only verifier for up to `--reply-timeout`.
-5. It retains one final immutable report even after a timeout or stop, then closes only its own windows (participants before the broker) and writes `summary.json`.
+5. It retains one final immutable report even after a timeout, stop or failure, then closes only its own windows (participants before the broker) and writes `summary.json`.
 
-Participant windows read their credentials from the run directory; tokens never appear on tmux command lines and are redacted from captured pane logs. A Claude participant's workspace receives an additive `.claude/settings.local.json` whose `PreToolUse` hook runs `observe-claude` with a timeout above twice the phase timeout; the production adapter keeps its own `SessionStart` hook. Codex and Grok use `live.py adapter`.
+A failed dispatch, such as idle exchanges that did not finish or a busy case that never reached native readiness, ends the run without waiting out `--reply-timeout`. `stop` also cancels a dispatch in progress; held native requests are released and the gate records `operator_stopped`. Closing the dashboard (SIGHUP), SIGTERM and Ctrl+C finalize as a stop. If the supervisor died without finalizing, for example after SIGKILL, `stop` finalizes the run itself.
+
+tmux starts windows with its server's environment, which may predate the shell that ran `start`. The launcher hands each window the caller's environment through a private, single-use file in the job directory, so PATH, harness homes and credentials match what preflight probed; the file is deleted when the window reads it or when the run finalizes. Participant windows read their credentials from the run directory; tokens never appear on tmux command lines and are redacted from captured pane logs, with wrapped lines joined first. A Claude participant's workspace receives an additive `.claude/settings.local.json` whose `PreToolUse` hook runs `observe-claude` with a timeout above twice the phase timeout; the production adapter keeps its own `SessionStart` hook. Codex and Grok use `live.py adapter`.
 
 ```sh
 python scripts/testing/live_tmux.py status JOB

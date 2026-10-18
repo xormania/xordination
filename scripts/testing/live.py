@@ -268,10 +268,16 @@ def gate_event(arm, **extra):
             "monotonic_ns": time.monotonic_ns(), **extra}
 
 
-def wait_until(condition, timeout):
+class Cancelled(Exception):
+    """The operator stopped dispatch; this is never recorded as a case result."""
+
+
+def wait_until(condition, timeout, cancelled=None):
     """Bounded polling waits on explicit state; elapsed time never establishes readiness."""
     deadline = time.monotonic() + timeout
     while True:
+        if cancelled is not None and cancelled():
+            raise Cancelled("Operator requested stop")
         result = condition()
         if result:
             return result
@@ -348,7 +354,7 @@ def arm_busy_gate(directory, frozen, case, endpoint, phase_timeout):
     return path, arm
 
 
-def busy_case(directory, frozen, case, client, send_task, phase_timeout):
+def busy_case(directory, frozen, case, client, send_task, phase_timeout, cancelled=None):
     path, arm = arm_busy_gate(directory, frozen, case, client.endpoint, phase_timeout)
     name = case["recipient"]
     binding = frozen["bindings"][name]
@@ -377,7 +383,7 @@ def busy_case(directory, frozen, case, client, send_task, phase_timeout):
             if len({event["call_id"] for event in matches}) > 1:
                 raise ValueError("Ambiguous native readiness for one held wait request")
             return matches[0] if matches else None
-        observation = wait_until(ready, phase_timeout)
+        observation = wait_until(ready, phase_timeout, cancelled)
         write_new(path / "native-ready.json", gate_event(arm, native_call_id=observation["call_id"],
                                                         native_sequence=observation["sequence"]))
         stage = "submission"
@@ -401,9 +407,12 @@ def busy_case(directory, frozen, case, client, send_task, phase_timeout):
                                    native_call_id=observation["call_id"])
                 write_new(path / "submitted.json", value)
                 return value
-        result = wait_until(submitted, phase_timeout)
+        result = wait_until(submitted, phase_timeout, cancelled)
         reason = "submitted"
         return result
+    except Cancelled:
+        write_new(path / "failed.json", gate_event(arm, stage=stage, reason="operator_stopped"))
+        raise  # The finally block still releases the held native request.
     except Exception as error:
         failure = gate_event(arm, stage=stage,
                              reason="native_" + stage + "_timeout" if isinstance(error, TimeoutError) else "busy_phase_failed")
@@ -420,7 +429,7 @@ def busy_case(directory, frozen, case, client, send_task, phase_timeout):
                 raise
 
 
-def send_tasks(directory, phase_timeout=30):
+def send_tasks(directory, phase_timeout=30, cancelled=None):
     """Trigger source-native work; these controller messages are never pair evidence."""
     from xordination.client import Client
     directory = Path(directory)
@@ -455,7 +464,7 @@ def send_tasks(directory, phase_timeout=30):
             def idle_complete():
                 report = verify(directory, retain=False)
                 return all(case["status"] == "pass" for case in report["cases"] if case["case_id"] in idle_cases)
-            wait_until(idle_complete, phase_timeout)
+            wait_until(idle_complete, phase_timeout, cancelled)
             write_new(directory / "idle-complete.json", {"run_id": frozen["run_id"], "case_ids": sorted(idle_cases),
                                                        "monotonic_ns": time.monotonic_ns()})
         except TimeoutError:
@@ -478,8 +487,10 @@ def send_tasks(directory, phase_timeout=30):
     busy_results = []
     for case in frozen["cases"]:
         if case["scenario"] == "busy":
+            if cancelled is not None and cancelled():
+                raise Cancelled("Operator requested stop")
             try:
-                busy_results.append(busy_case(directory, frozen, case, client, send_task, phase_timeout))
+                busy_results.append(busy_case(directory, frozen, case, client, send_task, phase_timeout, cancelled))
             except (OSError, ValueError, TimeoutError) as error:
                 busy_results.append({"case_id": case["case_id"], "status": "fail", "reason": type(error).__name__})
     return {"run_id": frozen["run_id"], "tasks_dispatched": messages,

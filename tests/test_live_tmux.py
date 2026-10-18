@@ -2,10 +2,15 @@
 import importlib.util
 import json
 from pathlib import Path
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from xordination.store import Store
 
@@ -27,7 +32,9 @@ import live
 from xordination.client import Client
 run = job / "run"
 record = json.loads((job / "session.json").read_text())
-client = Client(record["endpoint"], live.load(run / (name + ".connection.json"))["token"])
+token = live.load(run / (name + ".connection.json"))["token"]
+print("diagnostic token=" + token, flush=True)  # Must be redacted from the captured pane log.
+client = Client(record["endpoint"], token)
 native = "scripted-native-" + name
 client.call("bind", native_id=native, capabilities={"transport": "launcher-fixture"})
 calls = 0
@@ -56,7 +63,8 @@ while True:
     acknowledge(message)
     if isinstance(body.get("tasks"), list):
         for task in body["tasks"]:
-            send(task["arguments"])
+            if task["tool"] == "xordination_send":
+                send(task["arguments"])  # No native wait hold: busy readiness never arrives.
     elif "reply" in body and not message["reply_to"]:
         send({"to": message["from"], "to_generation": message["from_generation"], "body": body["reply"],
               "reply_to": message["id"], "key": "reply-" + message["id"]})
@@ -157,7 +165,10 @@ class LauncherTests(unittest.TestCase):
         tokens = [json.loads(path.read_text())["token"] for path in (job / "run").glob("*.connection.json")]
         for log in (job / "logs").glob("*-terminal.log"):
             self.assertFalse(any(token in log.read_text() for token in tokens))
-        self.assertIn("scripted native ready", (job / "logs" / "alpha-terminal.log").read_text())
+        alpha = (job / "logs" / "alpha-terminal.log").read_text()
+        self.assertIn("scripted native ready", alpha)
+        self.assertIn("diagnostic token=[redacted]", alpha)
+        self.assertEqual(list((job / "environment").iterdir()), [])
 
     def test_missing_native_readiness_stops_before_capture_or_dispatch(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
@@ -180,6 +191,102 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(record["state"], "stopped")
         self.assertFalse((job / "dispatch.json").exists())
         self.assertEqual(self.tmux.panes, {})
+
+    def busy_job(self, **timeouts):
+        path = self.folder / "config.json"
+        path.write_text(json.dumps({"participants": [{"name": "alpha", "harness": "codex"},
+                                                     {"name": "beta", "harness": "codex"}],
+                                    "scenarios": ["idle", "busy"]}))
+        record = launcher.prepare_job(path, self.folder / "job", doctor=supported, **timeouts)
+        self.tmux.create(record)
+        return Path(record["directory"])
+
+    def test_failed_dispatch_finalizes_without_waiting_for_replies(self):
+        job = self.busy_job(phase_timeout=1, startup_timeout=30, reply_timeout=120)
+        started = time.monotonic()
+        self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
+        self.assertLess(time.monotonic() - started, 60)  # Well inside the reply timeout.
+        self.assertEqual(json.loads((job / "dispatch.json").read_text())["status"], "fail")
+        record = json.loads((job / "session.json").read_text())
+        self.assertTrue(record["error"].startswith("Dispatch failed:"), record["error"])
+        self.assertNotEqual(record["state"], "awaiting_replies")
+        summary = json.loads((job / "summary.json").read_text())
+        self.assertEqual(summary["status"], "fail")
+        self.assertEqual(sum(case["scenario"] == "idle" for case in summary["failed"]), 0)  # Idle evidence kept.
+        self.assertEqual(self.tmux.panes, {})
+
+    def test_stop_during_dispatch_cancels_the_held_phase(self):
+        job = self.busy_job(phase_timeout=60, startup_timeout=30, reply_timeout=120)
+        def stop_once_armed():
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not list((job / "run" / "gates").glob("*/armed.json")):
+                time.sleep(.05)
+            (job / "stop.request").touch()
+        threading.Thread(target=stop_once_armed, daemon=True).start()
+        started = time.monotonic()
+        self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
+        self.assertLess(time.monotonic() - started, 45)  # Not the 60-second phase wait.
+        record = json.loads((job / "session.json").read_text())
+        self.assertEqual(record["state"], "stopped")
+        failed = [json.loads(path.read_text()) for path in (job / "run" / "gates").glob("*/failed.json")]
+        self.assertEqual([item["reason"] for item in failed], ["operator_stopped"])
+        self.assertTrue(all((path.parent / "released.json").exists()
+                            for path in (job / "run" / "gates").glob("*/armed.json")))
+        self.assertEqual(len(list((job / "run").glob("report-*.json"))), 1)
+        self.assertEqual(self.tmux.panes, {})
+
+    def test_termination_signal_finalizes_and_restores_handlers(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
+                       startup_timeout=60)
+        idle = lambda job, role: (launcher.pane_command(job, role) if role == "broker" else
+                                  [sys.executable, "-c", "import time; time.sleep(60)"])
+        before = signal.getsignal(signal.SIGTERM)
+        timer = threading.Timer(2, os.kill, (os.getpid(), signal.SIGTERM))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.assertEqual(launcher.supervise(job, self.tmux, command=idle, poll=.05), 1)
+        record = json.loads((job / "session.json").read_text())
+        self.assertEqual(record["state"], "stopped")
+        self.assertIn("SIGTERM", record["error"])
+        self.assertEqual(self.tmux.panes, {})
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_stop_finalizes_when_the_supervisor_already_died(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        record = json.loads((job / "session.json").read_text())
+        record["panes"]["alpha"] = self.tmux.launch(record, "alpha", [sys.executable, "-c", "import time; time.sleep(60)"])
+        record.update(state="waiting_for_native", supervisor_pid=dead.pid)
+        launcher.write_json(job / "session.json", record)
+        self.assertEqual(launcher.operate("stop", job, self.tmux), 0)
+        record = json.loads((job / "session.json").read_text())
+        self.assertEqual(record["state"], "stopped")
+        self.assertIn("finalized by stop", record["error"])
+        self.assertEqual(self.tmux.panes, {})
+        self.assertFalse((job / "stop.request").exists())
+
+    def test_caller_environment_reaches_windows_once_and_never_stays_on_disk(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
+        (job / "stop.request").touch()  # Stop right after the broker window is launched.
+        handed = {}
+        launch = self.tmux.launch
+        def capture_handover(record, name, argv):
+            handed[name] = json.loads((job / "environment" / (name + ".json")).read_text())
+            return launch(record, name, argv)
+        self.tmux.launch = capture_handover
+        with patch.dict(os.environ):
+            launcher.write_json(job / launcher.ENVIRONMENT, {**os.environ, "XORDINATION_CALLER_ONLY": "from-start"})
+            launcher.supervise(job, self.tmux, command=self.command, poll=.05)
+        self.assertEqual(handed["broker"]["XORDINATION_CALLER_ONLY"], "from-start")
+        self.assertFalse((job / launcher.ENVIRONMENT).exists())
+        self.assertEqual(list((job / "environment").iterdir()), [])
+        # A pane consumes its handover file and keeps its own tmux identity.
+        launcher.write_json(job / "environment" / "alpha.json", {"PATH": "/caller/bin", "TMUX": "stale"})
+        with patch.dict(os.environ, {"TMUX": "current"}):
+            environment = launcher.pane_environment(job, "alpha")
+        self.assertEqual((environment["PATH"], environment["TMUX"]), ("/caller/bin", "current"))
+        self.assertFalse((job / "environment" / "alpha.json").exists())
 
     def test_preflight_gap_refuses_before_preparing_or_launching(self):
         observed = lambda harness: ({"harness": harness, "status": "unavailable"} if harness == "grok"

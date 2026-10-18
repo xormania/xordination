@@ -15,6 +15,7 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -108,7 +109,8 @@ class Tmux:
                                               "#{session_name}", check=False) == record["session"]
 
     def capture(self, pane):
-        return self.call("capture-pane", "-p", "-S", "-", "-t", pane, check=False)
+        # -J joins wrapped lines so a token split across rows is still redacted.
+        return self.call("capture-pane", "-p", "-J", "-S", "-", "-t", pane, check=False)
 
     def kill(self, pane):
         self.call("kill-pane", "-t", pane)
@@ -216,7 +218,7 @@ def exec_pane(job, role):
     job = Path(job).resolve()
     record = read_json(job / "session.json")
     run = job / "run"
-    env = os.environ.copy()
+    env = pane_environment(job, role)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SOURCE), env.get("PYTHONPATH")]))
     env["XORDINATION_ENDPOINT"] = record["endpoint"]
     if role == "broker":
@@ -294,19 +296,121 @@ def render(summary):
     return "\n".join(lines) + "\n"
 
 
+ENVIRONMENT = "environment.json"
+TMUX_VARIABLES = ("TMUX", "TMUX_PANE")
+
+
+def pane_environment(job, role):
+    """The environment the operator ran start with, handed over once per pane.
+
+    tmux builds pane environments from its server, which may predate the
+    operator's PATH, harness homes or credentials. The supervisor writes a
+    private per-role snapshot just before launching each window; the pane
+    consumes and deletes it, so it never reaches a tmux command line.
+    """
+    path = Path(job) / "environment" / (role + ".json")
+    try:
+        caller = read_json(path)
+    except FileNotFoundError:
+        return os.environ.copy()
+    path.unlink()
+    caller.update({name: os.environ[name] for name in TMUX_VARIABLES if name in os.environ})
+    return caller
+
+
+def supervisor_alive(record):
+    """Probe only; a saved PID is never used to signal or kill a process."""
+    pid = record.get("supervisor_pid")
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def emit(text):
+    try:
+        print(text, flush=True)
+    except OSError:
+        pass  # A closed dashboard pty must not abort finalization.
+
+
+def finalize(job, record, tmux):
+    """Retain a report when bindings were frozen, close owned windows, write the summary."""
+    run = job / "run"
+    report = None
+    if (run / "frozen.json").exists():
+        try:
+            report = live.verify(run)  # Retained immutably beside earlier reports.
+        except Exception as error:
+            record["verify_error"] = type(error).__name__ + ": " + str(error)
+    secrets_seen = [live.load(path)["token"] for path in sorted(run.glob("*.connection.json"))]
+    (job / "logs").mkdir(mode=0o700, exist_ok=True)
+    record["cleanup"] = []
+    # Participants first, then the broker, so adapters settle against a live endpoint.
+    for name in sorted(record["panes"], key=lambda name: name == "broker"):
+        pane = record["panes"][name]
+        try:
+            if not tmux.pane_owned(record, pane):
+                record["cleanup"].append({"window": name, "status": "already-closed-or-unowned"})
+                continue
+            text = tmux.capture(pane)
+            for token in secrets_seen:
+                text = text.replace(token, "[redacted]")
+            path = job / "logs" / (name + "-terminal.log")
+            path.write_text(text)
+            os.chmod(path, 0o600)
+            tmux.kill(pane)
+            record["cleanup"].append({"window": name, "status": "closed"})
+        except Exception as error:
+            record["cleanup"].append({"window": name, "status": "error", "detail": str(error)})
+    for leftover in [job / ENVIRONMENT, *sorted((job / "environment").glob("*.json"))]:
+        leftover.unlink(missing_ok=True)  # Unread handovers must not keep the operator's environment on disk.
+    if any(item["status"] == "error" for item in record["cleanup"]):
+        record.setdefault("error", "One or more owned windows could not be closed; inspect cleanup records")
+    state = "stopped" if record.get("stopped") else "finished" if report and "error" not in record else "error"
+    record.update(state=state, finished=time.time())
+    write_json(job / "session.json", record)
+    summary = summarize(record, report)
+    write_json(job / "summary.json", summary)
+    emit("\n" + render(summary).rstrip("\n"))
+    emit("Run files: " + str(job) + "\nClose this dashboard: " + shlex.join(
+        [sys.executable, str(HERE), "close", str(job)]))
+    return report
+
+
 def supervise(job, tmux=None, command=pane_command, poll=.5):
     tmux = tmux or Tmux()
     job = Path(job).resolve()
     record = read_json(job / "session.json")
     settings = record["settings"]
     run = job / "run"
-    os.environ["XORDINATION_ENDPOINT"] = record["endpoint"]  # Read by live.send_tasks.
     stop_request = job / "stop.request"
+    snapshot = job / ENVIRONMENT
+    if snapshot.exists():
+        caller = read_json(snapshot)
+        snapshot.unlink()
+        caller.update({name: os.environ[name] for name in TMUX_VARIABLES if name in os.environ})
+        os.environ.clear()
+        os.environ.update(caller)
+    os.environ["XORDINATION_ENDPOINT"] = record["endpoint"]  # Read by live.send_tasks.
+    (job / "environment").mkdir(mode=0o700, exist_ok=True)
     report = None
 
     def save(**changes):
         record.update(changes)
         write_json(job / "session.json", record)
+
+    def interrupted(number, frame):
+        raise Stopped("Supervisor received " + signal.Signals(number).name)
+
+    # Closing the dashboard (SIGHUP), termination and Ctrl+C all finalize as a stop.
+    previous = {number: signal.signal(number, interrupted)
+                for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
 
     def wait(condition, timeout, failure, progress=None):
         deadline = time.monotonic() + timeout
@@ -320,86 +424,68 @@ def supervise(job, tmux=None, command=pane_command, poll=.5):
             if progress:
                 text = progress()
                 if text != shown:
-                    print(text, flush=True)
+                    emit(text)
                     shown = text
             if time.monotonic() >= deadline:
                 raise TimeoutError(failure)
             time.sleep(poll)
 
+    def launch(name):
+        write_json(job / "environment" / (name + ".json"), dict(os.environ))
+        record["panes"][name] = tmux.launch(record, name, command(job, name))
+        save()
+
     try:
         if not tmux.owned(record):
             raise ValueError("Supervisor is not in its registered tmux session")
         save(state="starting", supervisor_pid=os.getpid())
-        record["panes"]["broker"] = tmux.launch(record, "broker", command(job, "broker"))
-        save()
+        launch("broker")
         wait(lambda: broker_healthy(record["endpoint"]), 30, "Broker did not answer /health within 30 seconds")
         draft = live.checked_draft(run)
         harness = {p["name"]: p["harness"] for p in draft["config"]["participants"]}
         for name in required_names(draft["config"]):
-            record["panes"][name] = tmux.launch(record, name, command(job, name))
-            save()
+            launch(name)
         claude = [name for name in required_names(draft["config"]) if harness[name] == "claude"]
         if claude:
             tmux.select(record, record["panes"][claude[0]])  # Trust and channel prompts need the operator.
         save(state="waiting_for_native")
-        print("Waiting for native sessions. Approvals remain yours; Ctrl+B, then W selects a window.", flush=True)
+        emit("Waiting for native sessions. Approvals remain yours; Ctrl+B, then W selects a window.")
         wait(lambda: not missing_readiness(run), settings["startup_timeout"],
              "Native sessions were not ready within the startup timeout",
              progress=lambda: "Waiting for: " + ", ".join(missing_readiness(run)))
         live.capture(run)
         save(state="dispatching")
-        dispatch = live.send_tasks(run, settings["phase_timeout"])
+        dispatch = live.send_tasks(run, settings["phase_timeout"], cancelled=stop_request.exists)
         write_json(job / "dispatch.json", dispatch)
-        save(state="awaiting_replies")
+        if dispatch.get("status") == "fail":
+            # Cases that were never dispatched cannot pass; do not wait out the reply timeout.
+            detail = dispatch.get("failure") or [result for result in dispatch.get("busy_submissions", [])
+                                                 if result.get("status") == "fail"]
+            record["error"] = "Dispatch failed: " + json.dumps(detail, sort_keys=True)
+        else:
+            save(state="awaiting_replies")
 
-        def progress():
-            current = live.verify(run, retain=False)
-            return "Verified " + str(current["passed_cases"]) + "/" + str(current["required_cases"]) + " cases"
-        try:
-            wait(lambda: live.verify(run, retain=False)["status"] == "pass", settings["reply_timeout"],
-                 "Not every required case passed within the reply timeout", progress=progress)
-        except TimeoutError as error:
-            record["error"] = str(error)  # Partial cases stay in the retained report below.
-    except Stopped as error:
+            def progress():
+                current = live.verify(run, retain=False)
+                return "Verified " + str(current["passed_cases"]) + "/" + str(current["required_cases"]) + " cases"
+            try:
+                wait(lambda: live.verify(run, retain=False)["status"] == "pass", settings["reply_timeout"],
+                     "Not every required case passed within the reply timeout", progress=progress)
+            except TimeoutError as error:
+                record["error"] = str(error)  # Partial cases stay in the retained report below.
+    except (Stopped, live.Cancelled) as error:
         record["error"] = str(error)
         record["stopped"] = True
     except Exception as error:
         record["error"] = type(error).__name__ + ": " + str(error)
     finally:
-        if (run / "frozen.json").exists():
-            try:
-                report = live.verify(run)  # Retained immutably beside earlier reports.
-            except Exception as error:
-                record["verify_error"] = type(error).__name__ + ": " + str(error)
-        secrets_seen = [live.load(path)["token"] for path in sorted(run.glob("*.connection.json"))]
-        (job / "logs").mkdir(mode=0o700, exist_ok=True)
-        record["cleanup"] = []
-        # Participants first, then the broker, so adapters settle against a live endpoint.
-        for name in sorted(record["panes"], key=lambda name: name == "broker"):
-            pane = record["panes"][name]
-            try:
-                if not tmux.pane_owned(record, pane):
-                    record["cleanup"].append({"window": name, "status": "already-closed-or-unowned"})
-                    continue
-                text = tmux.capture(pane)
-                for token in secrets_seen:
-                    text = text.replace(token, "[redacted]")
-                path = job / "logs" / (name + "-terminal.log")
-                path.write_text(text)
-                os.chmod(path, 0o600)
-                tmux.kill(pane)
-                record["cleanup"].append({"window": name, "status": "closed"})
-            except Exception as error:
-                record["cleanup"].append({"window": name, "status": "error", "detail": str(error)})
-        if any(item["status"] == "error" for item in record["cleanup"]):
-            record.setdefault("error", "One or more owned windows could not be closed; inspect cleanup records")
-        state = "stopped" if record.get("stopped") else "finished" if report and "error" not in record else "error"
-        save(state=state, finished=time.time())
-        summary = summarize(record, report)
-        write_json(job / "summary.json", summary)
-        print("\n" + render(summary), end="", flush=True)
-        print("Run files: " + str(job) + "\nClose this dashboard: " + shlex.join(
-            [sys.executable, str(HERE), "close", str(job)]), flush=True)
+        for number in previous:
+            signal.signal(number, signal.SIG_IGN)  # A second signal must not interrupt finalization.
+        try:
+            report = finalize(job, record, tmux)
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
     return 0 if report and report["status"] == "pass" and "error" not in record else 1
 
 
@@ -412,6 +498,9 @@ def start(args, tmux=None):
     record = prepare_job(args.config, job, phase_timeout=args.phase_timeout,
                          startup_timeout=args.startup_timeout, reply_timeout=args.reply_timeout, port=args.port)
     job = Path(record["directory"])
+    # The supervisor and its windows run under the tmux server's environment;
+    # hand them this caller's instead (private file, consumed on first read).
+    write_json(job / ENVIRONMENT, dict(os.environ))
     try:
         pane = tmux.create(record)
         record.update(state="starting", dashboard=pane)
@@ -421,6 +510,7 @@ def start(args, tmux=None):
         record.update(state="error", error=str(error), finished=time.time())
         write_json(job / "session.json", record)
         tmux.close(record)
+        (job / ENVIRONMENT).unlink(missing_ok=True)
         raise
     print("Run: " + str(job), flush=True)
     print("Status: " + shlex.join([sys.executable, str(HERE), "status", str(job)]), flush=True)
@@ -459,6 +549,11 @@ def operate(action, job, tmux=None):
             return 0
         if not tmux.owned(record):
             raise ValueError("Managed session is absent; inspect session.json and the run directory")
+        if record.get("supervisor_pid") and not supervisor_alive(record):
+            # The supervisor died without finalizing (for example SIGKILL); finalize here.
+            record.update(error="Supervisor exited without finalizing; finalized by stop", stopped=True)
+            finalize(job, record, tmux)
+            return 0
         (job / "stop.request").touch(mode=0o600, exist_ok=True)
         print("Stop requested. The supervisor retains a report, closes its windows and writes summary.json.")
         return 0

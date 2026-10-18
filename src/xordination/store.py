@@ -176,9 +176,17 @@ class Store:
             except BaseException:
                 self._close_connection()
                 raise
+        try:
+            self._initialize(recover_claims)
+        except BaseException:
+            # Any later failure, such as a locked database, must release the
+            # retained descriptors as well as the connection.
+            self._close_connection()
+            raise
+
+    def _initialize(self, recover_claims):
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, self.SCHEMA_VERSION):
-            self._close_connection()
             _fail("schema_version", f"Database schema {version} is unsupported")
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);

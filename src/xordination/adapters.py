@@ -123,7 +123,8 @@ def doctor(harness, binary=None):
                     ("--session-id", "--mcp-config", "--debug-file"))
                 if supported and CLAUDE_CHANNEL_FLAG not in help_result.stdout:
                     supported = claude_accepts_channel_flag(executable)
-                    basis = "installed CLI help; unlisted channel flag accepted by its option parser"
+                    basis = ("installed CLI help; unlisted channel flag accepted by its option parser" if supported
+                             else "installed CLI help; unlisted channel flag not confirmed by its option parser")
             result["launch"] = {"status": "supported" if supported else "unverified", "basis": basis}
         except (OSError, subprocess.TimeoutExpired) as error:
             result["launch"] = {"status": "unverified", "detail": type(error).__name__}

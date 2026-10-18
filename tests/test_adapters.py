@@ -546,6 +546,8 @@ class ProbeAndChannelTests(unittest.TestCase):
             binary = self.fake_claude(folder, ("--session-id", "--mcp-config", "--debug-file"), accepts_channel=False)
             observed = doctor("claude", binary=binary)
             self.assertEqual(observed["status"], "unverified")
+            self.assertEqual(observed["launch"]["basis"],
+                             "installed CLI help; unlisted channel flag not confirmed by its option parser")
             client = ClientFixture()
             with self.assertRaisesRegex(CapabilityError, "unverified"):
                 run_claude(client, binary, folder)
