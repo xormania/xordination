@@ -9,17 +9,17 @@ import subprocess
 
 
 GROUPS = ("store", "adapters", "mcp", "server", "cli", "end_to_end", "ci_selection",
-          "behavior", "performance", "live_acceptance", "live_native_busy")
+          "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux")
 SOURCE_GROUPS = {
-    "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
-    "adapters.py": ("adapters", "cli", "behavior", "live_acceptance", "live_native_busy"),
-    "rpc.py": ("adapters", "behavior", "live_acceptance", "live_native_busy"),
+    "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
+    "adapters.py": ("adapters", "cli", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
+    "rpc.py": ("adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     # Native adapters consume TOOLS and INSTRUCTIONS through lazy imports.
-    "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"),
-    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
-    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy"),
+    "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
+    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
+    "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
-    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy"),
+    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }
@@ -27,7 +27,9 @@ TEST_GROUPS = {"tests/test_" + name + ".py": (name,) for name in GROUPS}
 TEST_GROUPS["tests/live_native_fixture.py"] = ("live_native_busy",)
 SCRIPT_GROUPS = {
     "scripts/testing/benchmark.py": ("performance",),
-    "scripts/testing/live.py": ("live_acceptance", "live_native_busy"),
+    # The managed launcher imports live.py and starts the broker through the public CLI.
+    "scripts/testing/live.py": ("live_acceptance", "live_native_busy", "live_tmux"),
+    "scripts/testing/live_tmux.py": ("live_tmux",),
 }
 BUILD_INPUTS = {"pyproject.toml", "MANIFEST.in"}
 IMAGE_PACKAGE_INPUTS = {"README.md", "LICENSE", "NOTICE", "Dockerfile"}

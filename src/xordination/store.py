@@ -94,10 +94,15 @@ def _private_state_parent(path):
             raise
 
 
-def _private_state_file(path, *, create=False):
-    """Tighten owned POSIX files; Windows deployments require private OS ACLs."""
+def _private_state_file(path, *, create=False, retain=False):
+    """Tighten owned POSIX files; Windows deployments require private OS ACLs.
+
+    With ``retain`` the checked descriptor is returned open. Closing any
+    descriptor for a file releases this process's POSIX locks on it, so files
+    SQLite has already locked must not be closed until its connection closes.
+    """
     if os.name != "posix":
-        return
+        return None
     flags = os.O_RDWR if create else os.O_RDONLY
     flags |= (getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) |
               getattr(os, "O_NONBLOCK", 0))
@@ -107,10 +112,11 @@ def _private_state_file(path, *, create=False):
         descriptor = os.open(path, flags, 0o600)
     except FileNotFoundError:
         if not create:
-            return
+            return None
         raise
     except OSError:
         _fail("unsafe_state", "State files must be privately accessible regular files owned by the current user")
+    keep = False
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
@@ -120,8 +126,11 @@ def _private_state_file(path, *, create=False):
         current = os.stat(path, follow_symlinks=False)
         if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
             _fail("unsafe_state", "State file identity changed during private initialization")
+        keep = retain
+        return descriptor if retain else None
     finally:
-        os.close(descriptor)
+        if not keep:
+            os.close(descriptor)
 
 
 class Store:
@@ -153,17 +162,31 @@ class Store:
         self._db.execute("PRAGMA synchronous=FULL")
         # SQLite inherits the main database's mode for newly created WAL/SHM.
         # Existing files are deliberately upgraded before opening, then checked
-        # again once SQLite has initialized its journal.
+        # again once SQLite has initialized its journal. SQLite now holds the
+        # WAL-index lock that tells other processes this database is in use;
+        # closing a checked descriptor would drop it, letting another process
+        # reset the WAL index under this mapping. Keep them until close().
+        self._retained = []
         if self.path != ":memory:":
             try:
-                _private_state_file(self.path + "-wal")
-                _private_state_file(self.path + "-shm")
+                for suffix in ("-wal", "-shm"):
+                    descriptor = _private_state_file(self.path + suffix, retain=True)
+                    if descriptor is not None:
+                        self._retained.append(descriptor)
             except BaseException:
-                self._db.close()
+                self._close_connection()
                 raise
+        try:
+            self._initialize(recover_claims)
+        except BaseException:
+            # Any later failure, such as a locked database, must release the
+            # retained descriptors as well as the connection.
+            self._close_connection()
+            raise
+
+    def _initialize(self, recover_claims):
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, self.SCHEMA_VERSION):
-            self._db.close()
             _fail("schema_version", f"Database schema {version} is unsupported")
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -222,9 +245,15 @@ class Store:
             self._cursor_secret = bytes.fromhex(self._db.execute("SELECT value FROM settings WHERE name='cursor_secret'").fetchone()[0])
             self._reconcile(restart=recover_claims)
 
+    def _close_connection(self):
+        # Close SQLite first: its locks must not outlive the descriptors that guard them.
+        self._db.close()
+        while self._retained:
+            os.close(self._retained.pop())
+
     def close(self):
         with self._lock:
-            self._db.close()
+            self._close_connection()
 
     def recover_claims(self):
         """The exclusively owned broker startup path, never a client reconnect."""

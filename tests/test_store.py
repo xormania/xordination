@@ -407,6 +407,44 @@ sys.stdin.buffer.read(1)
             if private is not None:
                 private.close()
 
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks guard SQLite's WAL index")
+    def test_reopened_store_keeps_wal_index_in_use_for_other_processes(self):
+        # A restarted broker opens existing state. Its permission recheck must not
+        # release SQLite's WAL-index lock, or another process's reader concludes it
+        # is the first connection and resets the index under the broker's mapping.
+        self.store.close()
+        self.store = Store(self.path)
+        # Byte 128 of -shm is the unix VFS "connection in use" lock (UNIX_SHM_DMS).
+        probe = ("import fcntl, os, sys\n"
+                 "descriptor = os.open(sys.argv[1], os.O_RDWR)\n"
+                 "try:\n"
+                 "    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 128, 0)\n"
+                 "    print('first-connection')\n"
+                 "except OSError:\n"
+                 "    print('in-use')\n")
+        result = subprocess.run([sys.executable, "-c", probe, str(self.path) + "-shm"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.strip(), "in-use", result.stderr)
+        self.store.create_space("after reopen")
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "Process descriptor listing")
+    def test_failed_reopen_releases_retained_wal_index_descriptors(self):
+        def open_state_files():
+            names = []
+            for entry in os.listdir("/proc/self/fd"):
+                try:
+                    names.append(os.readlink("/proc/self/fd/" + entry))
+                except OSError:
+                    pass
+            return sorted(name for name in names if name.startswith(str(self.path) + "-"))
+        before = open_state_files()
+        # A later initialization failure (for example a locked database) must not
+        # leak the -wal/-shm descriptors retained for SQLite's WAL-index lock.
+        with patch.object(Store, "_reconcile", side_effect=RuntimeError("initialization failed")):
+            with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+                Store(self.path)
+        self.assertEqual(open_state_files(), before)
+
     @unittest.skipUnless(os.name == "posix", "POSIX durable directory entries")
     def test_failed_directory_sync_rejects_fresh_state_before_sqlite_acceptance(self):
         path = Path(self.directory.name) / "new-ancestor" / "new-state" / "broker.sqlite"
