@@ -114,6 +114,27 @@ def parser():
     return p
 
 
+def serve(store, host, port, ready=None):
+    """Bind, announce the bound address, then serve until interrupted.
+
+    ``ready(host, port)`` runs after binding and before serving, so a caller
+    that binds port 0 learns the kernel-chosen port without a probe race.
+    """
+    from .server import BrokerServer
+    server = BrokerServer((host, port), store)
+    try:
+        host, port = server.server_address[:2]
+        if ready is not None:
+            ready(host, port)
+        print(json.dumps({"service": "xordination", "address": host, "port": port,
+                          "readiness": "service"}), flush=True)
+        server.serve_forever(poll_interval=.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
@@ -126,17 +147,7 @@ def main(argv=None):
                 elif args.command == "join":
                     issue_binding(store, args)
                 else:
-                    from .server import BrokerServer
-                    server = BrokerServer((args.host, args.port), store)
-                    try:
-                        host, port = server.server_address[:2]
-                        print(json.dumps({"service": "xordination", "address": host, "port": port,
-                                          "readiness": "service"}), flush=True)
-                        server.serve_forever(poll_interval=.2)
-                    except KeyboardInterrupt:
-                        pass
-                    finally:
-                        server.server_close()
+                    serve(store, args.host, args.port)
             finally:
                 store.close()
             return 0

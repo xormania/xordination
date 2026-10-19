@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from helpers import owned_broker
 from xordination.store import Store
 
 
@@ -79,6 +81,7 @@ class ProcessTmux:
         self.owner = None
         self.panes = {}
         self.selected = []
+        self.dashboard_alive = True
 
     def owned(self, record):
         return self.owner == record["owner"]
@@ -101,6 +104,11 @@ class ProcessTmux:
 
     def pane_owned(self, record, pane):
         return self.owned(record) and pane in self.panes
+
+    def pane_dead(self, record, pane):
+        if pane == "%dashboard":
+            return not (self.owned(record) and self.dashboard_alive)
+        return not self.pane_owned(record, pane) or self.panes[pane][0].poll() is not None
 
     def capture(self, pane):
         return (self.folder / (pane[1:] + ".out")).read_text()
@@ -158,6 +166,11 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual((summary["status"], summary["passed_cases"], summary["required_cases"]), ("pass", 2, 2))
         record = json.loads((job / "session.json").read_text())
         self.assertEqual(record["state"], "finished")
+        # No probe-then-bind gap: the broker bound port 0 and reported the result privately.
+        bound = json.loads((job / "broker.json").read_text())
+        self.assertGreater(bound["port"], 0)
+        self.assertEqual((record["port"], record["endpoint"]), (bound["port"], "http://127.0.0.1:" + str(bound["port"])))
+        self.assertEqual(oct((job / "broker.json").stat().st_mode & 0o777), "0o600")
         self.assertEqual([item["window"] for item in record["cleanup"]], ["alpha", "beta", "broker"])
         self.assertTrue(all(item["status"] == "closed" for item in record["cleanup"]))
         self.assertEqual(self.tmux.panes, {})
@@ -265,6 +278,58 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("finalized by stop", record["error"])
         self.assertEqual(self.tmux.panes, {})
         self.assertFalse((job / "stop.request").exists())
+
+    def test_occupied_port_is_refused_before_any_window_or_credential_use(self):
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen(1)
+            port = occupied.getsockname()[1]
+            record = launcher.prepare_job(self.config([{"name": "alpha", "harness": "codex"},
+                                                       {"name": "beta", "harness": "codex"}]),
+                                          self.folder / "job", doctor=supported, port=port)
+            self.tmux.create(record)
+            launched = []
+            self.tmux.launch = lambda record, name, argv: launched.append(name)
+            self.assertEqual(launcher.supervise(Path(record["directory"]), self.tmux, command=self.command), 1)
+        record = json.loads((Path(record["directory"]) / "session.json").read_text())
+        self.assertIn("already in use", record["error"])
+        self.assertEqual(launched, [])
+
+    def test_health_from_another_broker_is_not_this_runs_broker(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
+        other = launcher.prepare_job(self.config([{"name": "gamma", "harness": "codex"},
+                                                  {"name": "delta", "harness": "codex"}]),
+                                     self.folder / "other", doctor=supported)
+        with owned_broker(Path(other["directory"]) / "run" / "broker.sqlite3") as (_, _, endpoint):
+            self.assertTrue(launcher.broker_healthy(endpoint))
+            with self.assertRaisesRegex(ValueError, "not this run's broker"):
+                launcher.owned_broker(job / "run", endpoint)
+        with owned_broker(job / "run" / "broker.sqlite3") as (_, _, endpoint):
+            launcher.owned_broker(job / "run", endpoint)  # The run's own broker is accepted.
+
+    def test_stop_without_a_recorded_supervisor_uses_the_dashboard_state(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
+        record = json.loads((job / "session.json").read_text())
+        record.update(state="starting", dashboard="%dashboard")
+        launcher.write_json(job / "session.json", record)
+        self.assertEqual(launcher.operate("stop", job, self.tmux), 0)  # Live dashboard: request only.
+        self.assertTrue((job / "stop.request").exists())
+        self.assertNotIn("finished", json.loads((job / "session.json").read_text()))
+        self.tmux.dashboard_alive = False  # It died before recording a PID.
+        self.assertEqual(launcher.operate("stop", job, self.tmux), 0)
+        record = json.loads((job / "session.json").read_text())
+        self.assertEqual(record["state"], "stopped")
+        self.assertIn("finalized by stop", record["error"])
+        self.assertEqual(launcher.operate("close", job, self.tmux), 0)
+
+    def test_stop_finalizes_when_the_tmux_session_is_gone(self):
+        job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
+        record = json.loads((job / "session.json").read_text())
+        record.update(state="starting", dashboard="%dashboard")
+        launcher.write_json(job / "session.json", record)
+        self.tmux.close(record)
+        self.assertEqual(launcher.operate("stop", job, self.tmux), 0)
+        self.assertEqual(json.loads((job / "session.json").read_text())["state"], "stopped")
 
     def test_caller_environment_reaches_windows_once_and_never_stays_on_disk(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}])

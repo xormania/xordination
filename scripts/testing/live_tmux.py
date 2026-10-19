@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parents[2]
@@ -108,6 +108,12 @@ class Tmux:
         return self.owned(record) and self.call("display-message", "-p", "-t", pane,
                                               "#{session_name}", check=False) == record["session"]
 
+    def pane_dead(self, record, pane):
+        """A missing, foreign or exited (remain-on-exit) pane runs nothing."""
+        if not pane or not self.pane_owned(record, pane):
+            return True
+        return self.call("display-message", "-p", "-t", pane, "#{pane_dead}", check=False) == "1"
+
     def capture(self, pane):
         # -J joins wrapped lines so a token split across rows is still redacted.
         return self.call("capture-pane", "-p", "-J", "-S", "-", "-t", pane, check=False)
@@ -144,12 +150,6 @@ def claude_settings(job, name, phase_timeout):
                                       "hooks": [{"type": "command", "command": command, "timeout": timeout}]}]}}
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 def preflight(config, doctor):
     names = required_names(config)
     if RESERVED & set(names):
@@ -178,10 +178,10 @@ def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, repl
     job.mkdir(mode=0o700)  # Exclusive: a run directory is never reused.
     config = live.validate_config(live.load(config_path))
     owner = secrets.token_hex(16)
-    port = port or free_port()
+    port = port or 0  # 0: the broker binds a kernel-chosen port and reports it privately.
     record = {"schema_version": 1, "directory": str(job), "session": "xordination-" + owner[:12],
               "owner": owner, "state": "preflight", "created": time.time(), "panes": {},
-              "port": port, "endpoint": "http://127.0.0.1:" + str(port),
+              "port": port, "endpoint": None,
               "settings": {"phase_timeout": phase_timeout, "startup_timeout": startup_timeout,
                            "reply_timeout": reply_timeout}}
     write_json(job / "session.json", record)
@@ -220,24 +220,34 @@ def exec_pane(job, role):
     run = job / "run"
     env = pane_environment(job, role)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SOURCE), env.get("PYTHONPATH")]))
-    env["XORDINATION_ENDPOINT"] = record["endpoint"]
     if role == "broker":
-        argv = [sys.executable, "-m", "xordination", "serve", "--state", str(run / "broker.sqlite3"),
-                "--host", "127.0.0.1", "--port", str(record["port"])]
-        cwd = job
+        # Bind first, then report the bound port through a private job file: probing for a
+        # free port and binding it later would let another local process take it in between.
+        from xordination.cli import serve
+        from xordination.store import Store
+        os.environ.clear()
+        os.environ.update(env)
+        os.chdir(job)
+        store = Store(run / "broker.sqlite3")
+        try:
+            serve(store, "127.0.0.1", record["port"], lambda host, port: write_json(
+                job / "broker.json", {"host": host, "port": port, "pid": os.getpid()}))
+        finally:
+            store.close()
+        return
+    env["XORDINATION_ENDPOINT"] = record["endpoint"]
+    participant = next(p for p in live.checked_draft(run)["config"]["participants"] if p["name"] == role)
+    cwd = job / "workspaces" / role
+    if participant["harness"] == "claude":
+        env["XORDINATION_TOKEN"] = live.load(run / (role + ".connection.json"))["token"]
+        argv = [sys.executable, "-m", "xordination", "adapter", "claude", "--project", str(cwd),
+                "--endpoint", record["endpoint"], "--prompt", live.INITIAL_PROMPT]
+        for key in ("model", "reasoning"):
+            if participant.get(key):
+                argv += ["--" + key, participant[key]]
     else:
-        participant = next(p for p in live.checked_draft(run)["config"]["participants"] if p["name"] == role)
-        cwd = job / "workspaces" / role
-        if participant["harness"] == "claude":
-            env["XORDINATION_TOKEN"] = live.load(run / (role + ".connection.json"))["token"]
-            argv = [sys.executable, "-m", "xordination", "adapter", "claude", "--project", str(cwd),
-                    "--endpoint", record["endpoint"], "--prompt", live.INITIAL_PROMPT]
-            for key in ("model", "reasoning"):
-                if participant.get(key):
-                    argv += ["--" + key, participant[key]]
-        else:
-            argv = [sys.executable, str(HERE.parent / "live.py"), "adapter", "--run", str(run),
-                    "--participant", role, "--project", str(cwd)]
+        argv = [sys.executable, str(HERE.parent / "live.py"), "adapter", "--run", str(run),
+                "--participant", role, "--project", str(cwd)]
     os.chdir(cwd)
     os.execve(sys.executable, argv, env)
 
@@ -263,12 +273,32 @@ def missing_readiness(run):
     return missing
 
 
+def port_accepting(port):
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 def broker_healthy(endpoint):
     try:
-        with urlopen(endpoint + "/health", timeout=2) as response:
+        # Loopback health must not go through an operator's HTTP proxy.
+        with build_opener(ProxyHandler({})).open(endpoint + "/health", timeout=2) as response:
             return json.loads(response.read()).get("ok") is True
     except (OSError, ValueError):
         return False
+
+
+def owned_broker(run, endpoint):
+    """Any service can answer /health; only this run's broker authenticates its controller."""
+    from xordination.client import BrokerError, Client
+    draft = live.checked_draft(run)
+    try:
+        identity = Client(endpoint, live.load(run / "controller.connection.json")["token"]).call("identity")
+    except BrokerError as error:
+        raise ValueError("The broker at " + endpoint + " is not this run's broker: " + str(error)) from None
+    if (not isinstance(identity, dict) or identity.get("space") != draft["space"] or
+            identity.get("participant") != live.CONTROLLER or identity.get("active") is not True):
+        raise ValueError("The broker at " + endpoint + " is not this run's broker")
 
 
 def summarize(record, report):
@@ -397,7 +427,6 @@ def supervise(job, tmux=None, command=pane_command, poll=.5):
         caller.update({name: os.environ[name] for name in TMUX_VARIABLES if name in os.environ})
         os.environ.clear()
         os.environ.update(caller)
-    os.environ["XORDINATION_ENDPOINT"] = record["endpoint"]  # Read by live.send_tasks.
     (job / "environment").mkdir(mode=0o700, exist_ok=True)
     report = None
 
@@ -439,8 +468,14 @@ def supervise(job, tmux=None, command=pane_command, poll=.5):
         if not tmux.owned(record):
             raise ValueError("Supervisor is not in its registered tmux session")
         save(state="starting", supervisor_pid=os.getpid())
+        if record["port"] and port_accepting(record["port"]):
+            raise ValueError("Port " + str(record["port"]) + " is already in use; start again with another --port")
         launch("broker")
+        bound = wait(lambda: read_json(job / "broker.json", {}), 30, "Broker did not report its bound port within 30 seconds")
+        save(port=bound["port"], endpoint="http://127.0.0.1:" + str(bound["port"]))
+        os.environ["XORDINATION_ENDPOINT"] = record["endpoint"]  # Read by live.send_tasks.
         wait(lambda: broker_healthy(record["endpoint"]), 30, "Broker did not answer /health within 30 seconds")
+        owned_broker(run, record["endpoint"])  # Before any participant credential is used.
         draft = live.checked_draft(run)
         harness = {p["name"]: p["harness"] for p in draft["config"]["participants"]}
         for name in required_names(draft["config"]):
@@ -547,13 +582,18 @@ def operate(action, job, tmux=None):
         if record.get("finished"):
             print("Run already finished; use close to remove its dashboard.")
             return 0
-        if not tmux.owned(record):
-            raise ValueError("Managed session is absent; inspect session.json and the run directory")
-        if record.get("supervisor_pid") and not supervisor_alive(record):
-            # The supervisor died without finalizing (for example SIGKILL); finalize here.
+        # Without a recorded PID the supervisor may never have started; then only a live
+        # dashboard pane could still consume a stop request.
+        dead = (not supervisor_alive(record) if record.get("supervisor_pid")
+                else tmux.pane_dead(record, record.get("dashboard")))
+        if dead:
+            # The supervisor exited without finalizing (for example SIGKILL, a startup failure
+            # before it recorded its PID, or a lost tmux session); finalize here instead.
             record.update(error="Supervisor exited without finalizing; finalized by stop", stopped=True)
             finalize(job, record, tmux)
             return 0
+        if not tmux.owned(record):
+            raise ValueError("Managed session is absent while its supervisor still runs; inspect session.json")
         (job / "stop.request").touch(mode=0o600, exist_ok=True)
         print("Stop requested. The supervisor retains a report, closes its windows and writes summary.json.")
         return 0
@@ -635,6 +675,7 @@ def main(argv=None):
             return supervise(args.job)
         if args.command == "pane":
             exec_pane(args.job, args.role)
+            return 0
         if args.command == "status":
             return status(args.job)
         if args.command == "self-check":
