@@ -22,9 +22,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 # Runs record source_sha256 of this checkout's src/xordination; import that same code
-# in every entry point (adapter, stdio, hooks) whatever the caller's PYTHONPATH or cwd.
-if str(ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT / "src"))
+# in every entry point (adapter, stdio, hooks), ahead of any copy on the caller's PYTHONPATH or cwd.
+sys.path[:] = [str(ROOT / "src")] + [entry for entry in sys.path if entry != str(ROOT / "src")]
 MAX_ARTIFACT = 16 * 1024 * 1024
 HARNESS = {"codex", "claude", "grok"}
 CONTROLLER = "acceptance-controller"
