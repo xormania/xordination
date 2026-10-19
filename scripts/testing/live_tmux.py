@@ -132,8 +132,8 @@ class Tmux:
         return subprocess.call(["tmux", command, "-t", "=" + record["session"]])
 
 
-class Stopped(Exception):
-    pass
+class Stopped(live.Cancelled):
+    """An operator stop or signal; busy_case re-raises it as a cancellation, not a case failure."""
 
 
 def required_names(config):
@@ -490,7 +490,8 @@ def supervise(job, tmux=None, command=pane_command, poll=.5):
              progress=lambda: "Waiting for: " + ", ".join(missing_readiness(run)))
         live.capture(run)
         save(state="dispatching")
-        dispatch = live.send_tasks(run, settings["phase_timeout"], cancelled=stop_request.exists)
+        dispatch = live.send_tasks(run, settings["phase_timeout"], cancelled=stop_request.exists,
+                                   idle_timeout=settings["reply_timeout"])
         write_json(job / "dispatch.json", dispatch)
         if dispatch.get("status") == "fail":
             # Cases that were never dispatched cannot pass; do not wait out the reply timeout.
@@ -657,9 +658,12 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p.add_argument("--dir", help="Fresh job directory (default: XDG state xordination/live-runs/...)")
     p.add_argument("--port", type=int)
-    p.add_argument("--phase-timeout", type=float, default=30)
-    p.add_argument("--startup-timeout", type=float, default=600)
-    p.add_argument("--reply-timeout", type=float, default=300)
+    p.add_argument("--phase-timeout", type=float, default=30,
+                   help="Each held busy phase: readiness, submission and release (at most 300 s)")
+    p.add_argument("--startup-timeout", type=float, default=600,
+                   help="Native sessions binding, including trust and channel prompts")
+    p.add_argument("--reply-timeout", type=float, default=300,
+                   help="All idle round trips before busy priming, and replies after dispatch")
     p.add_argument("--detach", action="store_true")
     for command in ("supervise", "status", "attach", "stop", "close", "pane"):
         p = sub.add_parser(command)
