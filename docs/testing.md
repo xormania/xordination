@@ -32,7 +32,7 @@ Planted faults must fail the intended assertion after a passing control. Setup f
 
 ## Opt-in native acceptance
 
-The [live runner](../scripts/testing/live.py) prepares a private, fresh run directory, freezes participant generations/native identities before the cases, sends exact tasks through the broker, then verifies a read-only store snapshot against the frozen manifest and native tool observations. It never substitutes a protocol fixture for a required native observation.
+The [live runner](../scripts/testing/live.py) prepares a private, fresh run directory, freezes participant generations/native identities before the cases, sends exact tasks through the broker, then verifies a read-only store snapshot against the frozen manifest and native tool observations. It never substitutes a protocol fixture for a required native observation. Its entry points import the checkout's own `src/xordination`, the code its recorded `source_sha256` covers, whatever the caller's `PYTHONPATH` or working directory.
 
 Create a configuration file outside version control. This minimal example requires both directed pairs; `alpha` and `beta` are independent participant names:
 
