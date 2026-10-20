@@ -21,6 +21,9 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# Runs record source_sha256 of this checkout's src/xordination; import that same code
+# in every entry point (adapter, stdio, hooks), ahead of any copy on the caller's PYTHONPATH or cwd.
+sys.path[:] = [str(ROOT / "src")] + [entry for entry in sys.path if entry != str(ROOT / "src")]
 MAX_ARTIFACT = 16 * 1024 * 1024
 HARNESS = {"codex", "claude", "grok"}
 CONTROLLER = "acceptance-controller"
@@ -429,7 +432,7 @@ def busy_case(directory, frozen, case, client, send_task, phase_timeout, cancell
                 raise
 
 
-def send_tasks(directory, phase_timeout=30, cancelled=None):
+def send_tasks(directory, phase_timeout=30, cancelled=None, idle_timeout=None):
     """Trigger source-native work; these controller messages are never pair evidence."""
     from xordination.client import Client
     directory = Path(directory)
@@ -439,6 +442,9 @@ def send_tasks(directory, phase_timeout=30, cancelled=None):
     checked_draft(directory)
     if not isinstance(phase_timeout, (int, float)) or not math.isfinite(phase_timeout) or not 0 < phase_timeout <= 300:
         raise ValueError("Busy phase timeout must be finite, positive and at most 300 seconds")
+    if idle_timeout is not None and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, (int, float))
+                                     or not math.isfinite(idle_timeout) or idle_timeout <= 0):
+        raise ValueError("Idle timeout must be finite and positive")
     # Reconstruct required tasks from the frozen manifest rather than trusting edited tasks.json.
     tasks = {}
     for case in frozen["cases"]:
@@ -464,7 +470,9 @@ def send_tasks(directory, phase_timeout=30, cancelled=None):
             def idle_complete():
                 report = verify(directory, retain=False)
                 return all(case["status"] == "pass" for case in report["cases"] if case["case_id"] in idle_cases)
-            wait_until(idle_complete, phase_timeout, cancelled)
+            # Every idle round trip (model turns and native approvals included) must finish
+            # before busy priming; that is a whole-matrix budget, not one held phase.
+            wait_until(idle_complete, idle_timeout or phase_timeout, cancelled)
             write_new(directory / "idle-complete.json", {"run_id": frozen["run_id"], "case_ids": sorted(idle_cases),
                                                        "monotonic_ns": time.monotonic_ns()})
         except TimeoutError:
@@ -930,6 +938,8 @@ def main(argv=None):
             p.add_argument("--binary")
         if command == "send":
             p.add_argument("--phase-timeout", type=float, default=30)
+            p.add_argument("--idle-timeout", type=float,
+                           help="Budget for all idle round trips before busy priming (default: --phase-timeout)")
         if command == "stdio":
             p.add_argument("--endpoint", required=True)
             p.add_argument("--token-env", default="XORDINATION_TOKEN")
@@ -954,7 +964,7 @@ def main(argv=None):
         elif args.command == "verify":
             result = verify(args.run)
         elif args.command == "send":
-            result = send_tasks(args.run, args.phase_timeout)
+            result = send_tasks(args.run, args.phase_timeout, idle_timeout=args.idle_timeout)
         elif args.command == "adapter":
             launch_adapter(args.run, args.participant, args.project, args.binary)
             return 0

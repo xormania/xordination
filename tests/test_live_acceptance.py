@@ -80,6 +80,33 @@ class LiveAcceptanceTests(unittest.TestCase):
         self.store.ack(self.contexts[sender], reply["id"])
         return message
 
+    def assert_entry_point_imports_the_hashed_checkout(self, environment):
+        probe = ("import importlib.util, sys\n"
+                 "spec = importlib.util.spec_from_file_location('live_entry', sys.argv[1])\n"
+                 "module = importlib.util.module_from_spec(spec)\n"
+                 "spec.loader.exec_module(module)\n"
+                 "import xordination\n"
+                 "print(xordination.__file__)\n")
+        result = subprocess.run([sys.executable, "-c", probe, str(SCRIPT)], capture_output=True, text=True,
+                                cwd=tempfile.gettempdir(), env=environment, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()).resolve(),
+                         (SCRIPT.parents[2] / "src" / "xordination" / "__init__.py").resolve())
+
+    def test_entry_points_import_the_hashed_checkout_without_pythonpath(self):
+        # source_sha256 covers this checkout's src; a subprocess entry point started from another
+        # cwd, or with a relative or missing PYTHONPATH, must still import that same code.
+        self.assert_entry_point_imports_the_hashed_checkout(
+            {key: value for key, value in os.environ.items() if key != "PYTHONPATH"})
+
+    def test_entry_points_import_the_hashed_checkout_ahead_of_earlier_pythonpath_copies(self):
+        # Another xordination listed on PYTHONPATH before this checkout's src must not shadow it.
+        with tempfile.TemporaryDirectory() as other:
+            (Path(other) / "xordination").mkdir()
+            (Path(other) / "xordination" / "__init__.py").write_text("")
+            self.assert_entry_point_imports_the_hashed_checkout(
+                dict(os.environ, PYTHONPATH=os.pathsep.join([other, str(SCRIPT.parents[2] / "src")])))
+
     def test_complete_correlated_synthetic_capture_and_readonly_wal_snapshot(self):
         for case in self.frozen["cases"]:
             self.exercise(case)

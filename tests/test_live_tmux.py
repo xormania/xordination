@@ -26,9 +26,10 @@ spec.loader.exec_module(launcher)
 # Owned stand-in for a native session: binds, observes its own tool inputs through
 # the live observer, then acknowledges and replies through the public broker API.
 SCRIPTED_NATIVE = r'''
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
 root, job, name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+reply_delay = float(os.environ.get("XORDINATION_FIXTURE_REPLY_DELAY", "0"))  # Simulated model latency.
 sys.path[:0] = [str(root / "src"), str(root / "scripts" / "testing")]
 import live
 from xordination.client import Client
@@ -68,6 +69,7 @@ while True:
             if task["tool"] == "xordination_send":
                 send(task["arguments"])  # No native wait hold: busy readiness never arrives.
     elif "reply" in body and not message["reply_to"]:
+        time.sleep(reply_delay)
         send({"to": message["from"], "to_generation": message["from_generation"], "body": body["reply"],
               "reply_to": message["id"], "key": "reply-" + message["id"]})
 '''
@@ -247,6 +249,34 @@ class LauncherTests(unittest.TestCase):
                             for path in (job / "run" / "gates").glob("*/armed.json")))
         self.assertEqual(len(list((job / "run").glob("report-*.json"))), 1)
         self.assertEqual(self.tmux.panes, {})
+
+    def test_interrupt_during_busy_dispatch_is_an_operator_stop(self):
+        job = self.busy_job(phase_timeout=60, startup_timeout=30, reply_timeout=120)
+        def interrupt_once_armed():
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not list((job / "run" / "gates").glob("*/armed.json")):
+                time.sleep(.05)
+            os.kill(os.getpid(), signal.SIGINT)
+        threading.Thread(target=interrupt_once_armed, daemon=True).start()
+        started = time.monotonic()
+        self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
+        self.assertLess(time.monotonic() - started, 45)  # Not a further 60-second busy phase.
+        record = json.loads((job / "session.json").read_text())
+        self.assertEqual((record["state"], record.get("stopped")), ("stopped", True))
+        self.assertIn("SIGINT", record["error"])
+        failed = [json.loads(path.read_text())["reason"] for path in (job / "run" / "gates").glob("*/failed.json")]
+        self.assertEqual(failed, ["operator_stopped"])  # One armed gate; no further case was primed.
+        self.assertEqual(len(list((job / "run" / "gates").glob("*/armed.json"))), 1)
+        self.assertEqual(self.tmux.panes, {})
+
+    def test_idle_round_trips_use_the_reply_budget_not_the_busy_phase(self):
+        job = self.busy_job(phase_timeout=1, startup_timeout=30, reply_timeout=60)
+        with patch.dict(os.environ, {"XORDINATION_FIXTURE_REPLY_DELAY": "1.5"}):
+            self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
+        self.assertFalse((job / "run" / "idle-failed.json").exists())
+        self.assertTrue((job / "run" / "idle-complete.json").exists())
+        summary = json.loads((job / "summary.json").read_text())
+        self.assertEqual([case["scenario"] for case in summary["failed"]], ["busy", "busy"])  # Idle passed.
 
     def test_termination_signal_finalizes_and_restores_handlers(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
