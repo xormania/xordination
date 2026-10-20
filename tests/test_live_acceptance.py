@@ -374,10 +374,10 @@ class LiveAcceptanceTests(unittest.TestCase):
                     process = subprocess.Popen(command, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, cwd=SCRIPT.parents[2], env={**os.environ, "XORDINATION_TOKEN": tokens["bob"]})
                     frames = queue.Queue()
-                    def reader():
-                        for line in process.stdout:
+                    def reader(stream, frames):
+                        for line in stream:
                             frames.put(line)
-                    thread = threading.Thread(target=reader, daemon=True)
+                    thread = threading.Thread(target=reader, args=(process.stdout, frames), daemon=True)
                     thread.start()
                     try:
                         if harness == "grok":
@@ -399,7 +399,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                         process.stdin.flush()
                         if harness == "claude":
                             process.stdin.close()
-                        live.wait_until(lambda: (path / "ready.json").exists(), 3)
+                        live.wait_until(lambda: (path / "ready.json").exists(), 3)  # noqa: B023
                         self.assertIsNone(process.poll())
                         self.assertTrue(frames.empty(), "Held native request must not complete before release")
                         ready = live.load(path / "ready.json")

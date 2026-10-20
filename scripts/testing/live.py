@@ -851,7 +851,8 @@ def observed_adapter(directory, name, client, binary, project):
     participant = next((row for row in draft["config"]["participants"] if row["name"] == name), None)
     if not participant or participant["harness"] == "claude":
         raise ValueError("Choose a configured Codex/Grok participant; Claude uses its native PreToolUse hook")
-    recorder = lambda native, call, tool, args, origin: record_native(directory, name, native, call, tool, args, origin)
+    def recorder(native, call, tool, args, origin):
+        return record_native(directory, name, native, call, tool, args, origin)
     class ObservedCodex(CodexAdapter):
         async def request(self, method, params):
             if method == "item/tool/call" and tool_name(params.get("tool")):

@@ -32,6 +32,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint (Ruff, ShellCheck, actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install pinned lint tools
+        run: |
+          python - <<'PY'
+          import pathlib, subprocess, sys, tomllib
+          config = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          dependencies = config['project']['optional-dependencies']['lint']
+          subprocess.run([sys.executable, '-m', 'pip', 'install', *dependencies], check=True)
+          PY
+          ruff --version
+          shellcheck --version
+          actionlint --version
+      - name: Ruff
+        run: ruff check --output-format=github .
+      - name: ShellCheck tracked shell scripts
+        run: git ls-files -z -- '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
+      - name: actionlint with ShellCheck on workflow run steps
+        run: actionlint -shellcheck "$(command -v shellcheck)"
   contracts:
     name: Contracts and package (Python ${{ matrix.python }})
     runs-on: ubuntu-latest

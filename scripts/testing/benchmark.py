@@ -227,7 +227,7 @@ def trial(config, scenario, Client, owned_broker):
             steady_ns = time.monotonic_ns() - steady_start
             # Exclude final auditing from steady-state operation timings.
             for pair in pairs:
-                for client, unused_binding in pair:
+                for client, _binding in pair:
                     require(not client.call("inbox", unacknowledged=True)["messages"],
                             "Unacknowledged messages remain after the workload")
             retained = storage_bytes(path)
