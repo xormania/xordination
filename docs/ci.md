@@ -40,11 +40,17 @@ Timing comparisons are report-only; head workload correctness failures still fai
 
 The image check builds the broker, verifies UID 10001, bootstraps a named state volume, rejects an invalid token, sends an idempotent message, records an acknowledgement and reply, then replaces the container and checks retained state. Its port is bound to host loopback. Cleanup removes only its UUID-named container/volume, including on failure; it does not publish, authenticate to a registry, or prune global resources.
 
-The canonical job caches pip downloads using `pyproject.toml`, which declares the build and coverage dependencies. The benchmark adds no package dependencies or CI jobs. Installation still runs each time; the cache is not an installed environment. No external Docker cache or additional shards are configured. The earlier image step took 9–15 seconds and the suite about five seconds before fixture optimization; added cache setup or runner startup could cost more than they save. Measure hosted runs before adding infrastructure. Existing concurrency cancellation drops obsolete runs for the same workflow/ref, and matrix fail-fast remains disabled so all selected runtime results are visible.
+The canonical job caches pip downloads using `pyproject.toml`, which declares the build and coverage dependencies; the lint job installs its three pinned tools uncached so it cannot claim that cache key. The benchmark adds no package dependencies or CI jobs. Installation still runs each time; the cache is not an installed environment. No external Docker cache or additional shards are configured. The earlier image step took 9–15 seconds and the suite about five seconds before fixture optimization; added cache setup or runner startup could cost more than they save. Measure hosted runs before adding infrastructure. Existing concurrency cancellation drops obsolete runs for the same workflow/ref, and matrix fail-fast remains disabled so all selected runtime results are visible.
+
+The lint job runs on every trigger without selection; it needs no product import and takes seconds. Ruff checks Python with correctness rules only (`E4`, `E7`, `E9`, `F` and bugbear `B`, targeting Python 3.10, configured in `pyproject.toml`); it applies no style, import-order or formatting rules. ShellCheck checks every tracked `*.sh`/`*.bash` file, and actionlint validates the workflows and runs the same ShellCheck over each `run:` step. Shell embedded in the Dockerfile is not linted. The tools are pinned in the development-only `lint` extra, separate from the `ci` coverage extra; runtime dependencies stay empty. Suppress a finding inline with its rule code only when the reported pattern is intended, for example a lambda that runs within its own loop iteration.
 
 For a full local check:
 
 ```sh
+python -m pip install '.[lint]'
+ruff check .
+git ls-files -z -- '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
+actionlint -shellcheck "$(command -v shellcheck)"
 python scripts/ci/select_checks.py --event workflow_dispatch --selection-file /tmp/xordination-selection.json
 PYTHONPATH=src python scripts/ci/run_contracts.py --selection /tmp/xordination-selection.json
 python -m pip install '.[ci]'

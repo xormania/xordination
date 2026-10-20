@@ -188,8 +188,9 @@ class LauncherTests(unittest.TestCase):
     def test_missing_native_readiness_stops_before_capture_or_dispatch(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
                        startup_timeout=1)
-        idle = lambda job, role: (launcher.pane_command(job, role) if role == "broker" else
-                                  [sys.executable, "-c", "import time; time.sleep(60)"])
+        def idle(job, role):
+            return (launcher.pane_command(job, role) if role == "broker" else
+                    [sys.executable, "-c", "import time; time.sleep(60)"])
         self.assertEqual(launcher.supervise(job, self.tmux, command=idle, poll=.05), 1)
         self.assertFalse((job / "run" / "frozen.json").exists())
         self.assertFalse((job / "dispatch.json").exists())
@@ -281,8 +282,9 @@ class LauncherTests(unittest.TestCase):
     def test_termination_signal_finalizes_and_restores_handlers(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
                        startup_timeout=60)
-        idle = lambda job, role: (launcher.pane_command(job, role) if role == "broker" else
-                                  [sys.executable, "-c", "import time; time.sleep(60)"])
+        def idle(job, role):
+            return (launcher.pane_command(job, role) if role == "broker" else
+                    [sys.executable, "-c", "import time; time.sleep(60)"])
         before = signal.getsignal(signal.SIGTERM)
         timer = threading.Timer(2, os.kill, (os.getpid(), signal.SIGTERM))
         timer.start()
@@ -384,8 +386,9 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((job / "environment" / "alpha.json").exists())
 
     def test_preflight_gap_refuses_before_preparing_or_launching(self):
-        observed = lambda harness: ({"harness": harness, "status": "unavailable"} if harness == "grok"
-                                    else supported(harness))
+        def observed(harness):
+            return ({"harness": harness, "status": "unavailable"} if harness == "grok"
+                    else supported(harness))
         with self.assertRaisesRegex(ValueError, "grok: unavailable"):
             self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "grok"}], doctor=observed)
         job = self.folder / "job"

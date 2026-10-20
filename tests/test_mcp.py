@@ -162,7 +162,7 @@ class MCPTests(unittest.TestCase):
             self.server.receive({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": ident}})
         release.set()
         for ident in range(4):
-            self.assertEqual(-32800, self.output.await_packet(lambda p: p.get("id") == ident)["error"]["code"])
+            self.assertEqual(-32800, self.output.await_packet(lambda p: p.get("id") == ident)["error"]["code"])  # noqa: B023
 
     def test_wait_returns_recovery_cursor_without_repeating_stale_cursor(self):
         self.initialize()

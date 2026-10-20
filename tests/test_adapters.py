@@ -1,9 +1,7 @@
 """Native transport semantics, exercised with real owned mock subprocesses."""
 
 import asyncio
-import json
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import threading
@@ -285,7 +283,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
                     second_transport = next(name for name in self.client.recorded if name != first_transport)
                     self.assertEqual(recorded, [first_transport, second_transport])
                     await adapter.rpc.request("fixture/complete", {})
-                    await self.until(lambda: adapter.prompts_in_flight == 0)
+                    await self.until(lambda: adapter.prompts_in_flight == 0)  # noqa: B023
                 finally:
                     self.client.release()
                     await adapter.close()
@@ -486,8 +484,8 @@ class ProbeAndChannelTests(unittest.TestCase):
                         calls = []
                         class AuthenticatedClient:
                             def call(self, operation, **params):
-                                calls.append(operation)
-                                return getattr(store, operation)(context, **params)
+                                calls.append(operation)  # noqa: B023
+                                return getattr(store, operation)(context, **params)  # noqa: B023
                         with patch("xordination.client.Client", return_value=AuthenticatedClient()), \
                              patch("xordination.adapters._binary") as probe, \
                              patch("xordination.adapters.subprocess.Popen") as launch, \
