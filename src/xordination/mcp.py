@@ -177,7 +177,12 @@ class _Server:
             return
         ident = packet["id"]
         if method in ("initialize", "ping"):
-            self._respond(packet, threading.Event())
+            with self.state_lock:
+                in_flight = ident in self.requests
+            if in_flight:
+                self.error(ident, -32600, "Request ID is already in flight")
+            else:
+                self._respond(packet, threading.Event())
             return
         is_wait = method == "tools/call" and params.get("name") == "xordination_wait"
         slots = self.wait_slots if is_wait else self.call_slots
@@ -341,15 +346,18 @@ class _Server:
 def run_stdio(endpoint, token, channel=False):
     """Serve MCP on stdin/stdout. Diagnostics never enter protocol stdout."""
     server = _Server(Client(endpoint, token), sys.stdout, channel=channel)
+    # Read raw bytes where available so MAX_LINE bounds the encoded frame, not decoded characters.
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
     try:
         while not server.stop.is_set():
-            line = sys.stdin.readline(MAX_LINE + 1)
+            line = stream.readline(MAX_LINE + 1)
             if not line:
                 break
             if len(line) > MAX_LINE:
                 # Discard the rest of this frame without retaining unbounded input.
-                while line and not line.endswith("\n"):
-                    line = sys.stdin.readline(MAX_LINE + 1)
+                newline = b"\n" if isinstance(line, bytes) else "\n"
+                while line and not line.endswith(newline):
+                    line = stream.readline(MAX_LINE + 1)
                 server.error(None, -32700, "JSON-RPC frame exceeds size limit")
                 continue
             try:
