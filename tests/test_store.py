@@ -6,6 +6,7 @@ from contextlib import closing
 import json
 import os
 import queue
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -407,13 +408,7 @@ sys.stdin.buffer.read(1)
             if private is not None:
                 private.close()
 
-    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks guard SQLite's WAL index")
-    def test_reopened_store_keeps_wal_index_in_use_for_other_processes(self):
-        # A restarted broker opens existing state. Its permission recheck must not
-        # release SQLite's WAL-index lock, or another process's reader concludes it
-        # is the first connection and resets the index under the broker's mapping.
-        self.store.close()
-        self.store = Store(self.path)
+    def assertWalIndexInUse(self):
         # Byte 128 of -shm is the unix VFS "connection in use" lock (UNIX_SHM_DMS).
         probe = ("import fcntl, os, sys\n"
                  "descriptor = os.open(sys.argv[1], os.O_RDWR)\n"
@@ -425,7 +420,33 @@ sys.stdin.buffer.read(1)
         result = subprocess.run([sys.executable, "-c", probe, str(self.path) + "-shm"],
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.stdout.strip(), "in-use", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks guard SQLite's WAL index")
+    def test_reopened_store_keeps_wal_index_in_use_for_other_processes(self):
+        # A restarted broker opens existing state. Its permission recheck must not
+        # release SQLite's WAL-index lock, or another process's reader concludes it
+        # is the first connection and resets the index under the broker's mapping.
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertWalIndexInUse()
         self.store.create_space("after reopen")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX advisory locks guard SQLite's WAL index")
+    def test_second_store_in_process_cannot_release_first_stores_wal_index_lock(self):
+        # Closing any descriptor drops every POSIX lock this process holds on
+        # that file, so a second Store's checks and close must not touch them.
+        Store(self.path).close()
+        self.assertWalIndexInUse()
+        with patch.object(Store, "_reconcile", side_effect=RuntimeError("initialization failed")):
+            with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+                Store(self.path)
+        self.assertWalIndexInUse()
+        # The remaining Store keeps the shared lock after the first one closes.
+        second = Store(self.path)
+        self.store.close()
+        self.store = second
+        self.assertWalIndexInUse()
+        self.assertEqual(self.a["generation"], self.store.identity(self.a)["generation"])
 
     @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "Process descriptor listing")
     def test_failed_reopen_releases_retained_wal_index_descriptors(self):
@@ -436,14 +457,26 @@ sys.stdin.buffer.read(1)
                     names.append(os.readlink("/proc/self/fd/" + entry))
                 except OSError:
                     pass
-            return sorted(name for name in names if name.startswith(str(self.path) + "-"))
+            return sorted(name for name in names if name.startswith(str(self.path)))
+        self.store.close()
         before = open_state_files()
         # A later initialization failure (for example a locked database) must not
-        # leak the -wal/-shm descriptors retained for SQLite's WAL-index lock.
+        # leak the descriptors retained for SQLite's WAL-index lock.
         with patch.object(Store, "_reconcile", side_effect=RuntimeError("initialization failed")):
             with self.assertRaisesRegex(RuntimeError, "initialization failed"):
                 Store(self.path)
         self.assertEqual(open_state_files(), before)
+        self.store = Store(self.path)
+
+    def test_unknown_schema_version_is_refused_without_modification(self):
+        path = Path(self.directory.name) / "newer.sqlite"
+        with closing(sqlite3.connect(path)) as newer:
+            newer.executescript("CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');"
+                                f"PRAGMA user_version={Store.SCHEMA_VERSION + 1};")
+        original = path.read_bytes()
+        self.assertCode("schema_version", Store, path)
+        # Not even the journal mode may change: a rollback needs the exact file.
+        self.assertEqual(original, path.read_bytes())
 
     @unittest.skipUnless(os.name == "posix", "POSIX durable directory entries")
     def test_failed_directory_sync_rejects_fresh_state_before_sqlite_acceptance(self):
@@ -502,6 +535,41 @@ sys.stdin.buffer.read(1)
         identity = self.store.identity(self.b)
         self.assertTrue(identity["capabilities"]["channel_registered"])
         self.assertEqual("supported", identity["capabilities"]["native_idle_delivery"])
+
+    def test_limited_status_keeps_newest_entries_and_complete_uncertainty(self):
+        message = self.send()
+        first = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], first["attempt_id"], "uncertain")
+        self.store.retry(self.a, message["id"])
+        second = self.store.claim(self.b)
+        for outcome in ("submitted", "uncertain", "submitted"):
+            self.store.finish(self.b, message["id"], second["attempt_id"], outcome)
+        replies = [self.store.send(self.b, "a", f"reply {n}", f"reply-{n}", reply_to=message["id"])["id"]
+                   for n in range(3)]
+        self.store.ack(self.b, message["id"])
+        complete = self.store.status(self.a, message["id"])
+        self.assertNotIn("truncated", complete)
+        self.assertEqual([first["attempt_id"], second["attempt_id"]], [attempt["id"] for attempt in complete["attempts"]])
+        self.assertEqual(replies, [reply["id"] for reply in complete["replies"]])
+        limited = self.store.status(self.a, message["id"], limit=1)
+        self.assertTrue(limited["truncated"])
+        self.assertEqual({"attempts": 2, "receipts": 1, "replies": 3, "recoveries": 0}, limited["totals"])
+        self.assertEqual([second["attempt_id"]], [attempt["id"] for attempt in limited["attempts"]])
+        self.assertEqual(3, limited["attempts"][0]["evidence_total"])
+        self.assertEqual(complete["attempts"][1]["evidence"][-1:], limited["attempts"][0]["evidence"])
+        self.assertEqual([replies[-1]], [reply["id"] for reply in limited["replies"]])
+        self.assertEqual(complete["receipts"], limited["receipts"])
+        # The newest attempt was settled as submitted; the omitted history still
+        # carries uncertainty and must remain visible.
+        self.assertTrue(complete["uncertain"])
+        self.assertTrue(limited["uncertain"])
+        whole = self.store.status(self.a, message["id"], limit=self.store.MAX_PAGE_SIZE)
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(complete["replies"], whole["replies"])
+        self.assertEqual(complete["attempts"], [{key: value for key, value in attempt.items() if key != "evidence_total"}
+                                                for attempt in whole["attempts"]])
+        for invalid in (0, self.store.MAX_PAGE_SIZE + 1, True, "1"):
+            self.assertCode("limit_exceeded", self.store.status, self.a, message["id"], limit=invalid)
 
     def test_queue_backpressure_keeps_existing_acceptance_replay_available(self):
         self.store.MAX_PENDING = 2
