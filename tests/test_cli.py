@@ -14,7 +14,7 @@ from helpers import observe_fsync, owned_broker
 from xordination.adapters import _mcp_args
 from xordination.cli import main
 from xordination.store import Store
-from xordination.trace import Trace
+from xordination.trace import Trace, bundle
 
 
 class BootstrapSafety(unittest.TestCase):
@@ -154,7 +154,8 @@ class DiagnosticsBundle(unittest.TestCase):
             self.assertEqual([1, 2, 3, 4], [record["seq"] for record in records])
             self.assertEqual(7, records[1]["frame"]["id"])
             self.assertEqual("message-9", records[2]["frame"]["params"]["meta"]["message_id"])
-            self.assertEqual("XORDINATION_TOKEN", records[3]["frame"]["params"]["env"][0]["name"])
+            # params.env is no protocol path, so even its "name" key is redacted.
+            self.assertEqual("<redacted 17 chars>", records[3]["frame"]["params"]["env"][0]["name"])
             health = json.loads(members["health.json"])
             self.assertEqual(("available", True), (health["status"], health["health"]["ok"]))
             self.assertEqual("unverified", json.loads(members["doctor.json"])["harnesses"]["codex"]["status"])
@@ -173,6 +174,75 @@ class DiagnosticsBundle(unittest.TestCase):
             with zipfile.ZipFile(other) as archive:
                 health = json.loads(archive.read("health.json"))
             self.assertEqual(("unavailable", "connection_error"), (health["status"], health["error"]))
+
+    def test_correlation_keys_are_kept_only_at_protocol_paths(self):
+        secrets = ["sk-live-" + "%02d" % index + "d93f" for index in range(8)]
+        frames = [
+            # MCP send: the tool name and reply_to are protocol fields; metadata is caller content.
+            {"jsonrpc": "2.0", "id": "call-1", "method": "tools/call", "params": {
+                "name": "xordination_send", "arguments": {"to": "peer", "body": "b", "key": "k", "reply_to": "m-0",
+                                                          "metadata": {"id": secrets[0], "name": secrets[1],
+                                                                       "status": secrets[2]}}}},
+            # A broker result echoes the message, including its metadata.
+            {"jsonrpc": "2.0", "id": "call-1", "result": {"content": [{"type": "text", "text": "{}"}],
+                "structuredContent": {"id": "m-1", "message_id": "m-1", "reply_to": "m-0",
+                                      "metadata": {"id": secrets[3], "attempt_id": secrets[4]}}}},
+            # Native frames keep thread/turn/session identities, not nested payload ids.
+            {"jsonrpc": "2.0", "method": "item/completed", "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {"id": "item-1", "type": "agentMessage", "arguments": {"id": secrets[5]}}}},
+            {"jsonrpc": "2.0", "id": 3, "result": {"thread": {"id": "thread-1", "name": secrets[6]},
+                                                  "sessionId": "session-1", "_meta": {"callId": secrets[7]}}},
+        ]
+        expected = [
+            ("id",), ("method",), ("params", "name"), ("params", "arguments", "reply_to"),
+            ("result", "structuredContent", "id"), ("result", "structuredContent", "message_id"),
+            ("result", "content", 0, "type"), ("params", "threadId"), ("params", "turnId"),
+            ("params", "item", "id"), ("params", "item", "type"), ("result", "thread", "id"),
+            ("result", "sessionId"),
+        ]
+        def lookup(frames, path):
+            values = []
+            for frame in frames:
+                value = frame
+                for part in path:
+                    try:
+                        value = value[part]
+                    except (KeyError, IndexError, TypeError):
+                        break
+                else:
+                    values.append(value)
+            return values
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            path = folder / "paths.trace"
+            trace = Trace(path, "mcp-stdio")
+            for frame in frames:
+                trace.record("in", frame)
+            trace.close()
+            # A trace written before path matching held raw values; bundling must re-redact them.
+            with path.open("a") as stream:
+                for index, frame in enumerate(frames):
+                    stream.write(json.dumps({"format": "xordination-trace/1", "trace": "legacy", "seq": index + 1,
+                                             "stream": "mcp-stdio", "direction": "in", "event": "frame",
+                                             "monotonic_ns": 1, "time": 1.0, "frame": frame}) + "\n")
+            traced = path.read_text()
+            output = folder / "support.zip"
+            bundle(output, traces=[path])
+            with zipfile.ZipFile(output) as archive:
+                bundled = archive.read("traces/00-paths.trace").decode()
+        written = [json.loads(line)["frame"] for line in traced.splitlines() if '"legacy"' not in line
+                   and "frame" in json.loads(line)]
+        rebundled = [json.loads(line)["frame"] for line in bundled.splitlines() if "frame" in json.loads(line)]
+        for secret in secrets:
+            self.assertNotIn(secret, bundled)
+            self.assertNotIn(secret, json.dumps(written))
+        self.assertEqual(written + written, rebundled)
+        for key in expected:
+            self.assertEqual(lookup(frames, key), lookup(written, key), key)
+            self.assertTrue(lookup(written, key), key)
+        self.assertEqual("<redacted 14 chars>", written[0]["params"]["arguments"]["metadata"]["id"])
+        self.assertEqual("<redacted 14 chars>", written[1]["result"]["structuredContent"]["metadata"]["id"])
 
     def test_trace_stops_with_marker_at_size_limit(self):
         with tempfile.TemporaryDirectory() as folder:

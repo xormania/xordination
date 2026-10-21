@@ -26,13 +26,40 @@ FORMAT = "xordination-trace/1"
 BUNDLE_FORMAT = "xordination-diagnostics/1"
 MAX_TRACE_BYTES = 64 * 1024 * 1024
 MAX_BUNDLE_RECORDS = 10000
-# Only these keys keep string values: protocol envelopes and the identities
-# needed to correlate frames with broker messages, attempts and native turns.
-CORRELATION_KEYS = frozenset({
-    "jsonrpc", "id", "method", "requestId", "name", "tool", "type", "code", "status", "outcome",
-    "protocolVersion", "message_id", "attempt_id", "reply_to", "native_id",
-    "threadId", "turnId", "sessionId", "promptId", "callId", "itemId",
-})
+# Only strings at these structural paths keep their value: protocol envelopes
+# and the identities that correlate frames with broker messages, attempts and
+# native turns. A path is the tuple of object keys from the frame root, with
+# None (written "*" below) for any list item, so a literal "*" key cannot
+# stand in for one. Matching the whole path, not the last key, keeps an
+# "id" or "name" nested in message metadata, tool arguments or native payloads
+# redacted.
+def _paths(prefix, *suffixes):
+    return {prefix + tuple(None if part == "*" else part for part in suffix.split(".")) for suffix in suffixes}
+
+
+_BROKER_RESULT = (
+    "id", "message_id", "attempt_id", "reply_to", "status", "outcome", "error.code",
+    "message.id", "message.message_id", "message.reply_to",
+    "messages.*.id", "messages.*.message_id", "messages.*.reply_to",
+    "attempt.id", "attempt.attempt_id", "attempt.message_id", "attempt.status", "attempt.outcome",
+    "attempts.*.id", "attempts.*.attempt_id", "attempts.*.message_id", "attempts.*.status", "attempts.*.outcome",
+    "receipt.id", "receipt.message_id", "receipts.*.id", "receipts.*.message_id",
+)
+CORRELATION_PATHS = frozenset().union(
+    _paths((), "jsonrpc", "id", "method", "error.code"),
+    # MCP stdio: initialize, tools, cancellation, tool calls and results, channel notifications.
+    _paths(("params",), "protocolVersion", "clientInfo.name", "requestId", "name",
+           "arguments.message_id", "arguments.reply_to", "meta.message_id"),
+    _paths(("result",), "protocolVersion", "serverInfo.name", "tools.*.name", "content.*.type"),
+    _paths(("result", "structuredContent"), *_BROKER_RESULT),
+    # Codex app-server: threads, turns, items and dynamic tool calls.
+    _paths(("params",), "threadId", "turnId", "itemId", "callId", "tool", "turn.id", "turn.status",
+           "item.id", "item.type", "input.*.type", "dynamicTools.*.type", "dynamicTools.*.name"),
+    _paths(("result",), "thread.id", "turn.id", "turn.status", "contentItems.*.type"),
+    # Grok ACP: sessions, prompts and permission outcomes.
+    _paths(("params",), "sessionId", "promptId", "_meta.promptId", "prompt.*.type", "mcpServers.*.name"),
+    _paths(("result",), "sessionId", "authMethods.*.id", "outcome.outcome"),
+)
 MAX_KEPT = 256
 MAX_ITEMS = 64
 MAX_DEPTH = 12
@@ -47,22 +74,22 @@ def _scrub(text, secrets):
     return text
 
 
-def redact(value, secrets=(), *, key=None, depth=0):
+def redact(value, secrets=(), *, path=()):
     """Return a frame with correlation fields only; repeated redaction is stable."""
-    if depth > MAX_DEPTH:
+    if len(path) > MAX_DEPTH:
         return "<redacted depth>"
     if isinstance(value, dict):
-        return {_scrub(str(name), secrets)[:MAX_KEPT]: redact(item, secrets, key=name, depth=depth + 1)
+        return {_scrub(str(name), secrets)[:MAX_KEPT]: redact(item, secrets, path=path + (str(name),))
                 for name, item in value.items()}
     if isinstance(value, list):
-        items = [redact(item, secrets, key=key, depth=depth + 1) for item in value[:MAX_ITEMS]]
+        items = [redact(item, secrets, path=path + (None,)) for item in value[:MAX_ITEMS]]
         if len(value) > MAX_ITEMS:
             items.append(f"<{len(value) - MAX_ITEMS} more items>")
         return items
     if isinstance(value, str):
         if _PLACEHOLDER.fullmatch(value):
             return value
-        if key in CORRELATION_KEYS and len(value) <= MAX_KEPT:
+        if path in CORRELATION_PATHS and len(value) <= MAX_KEPT:
             return _scrub(value, secrets)
         return f"<redacted {len(value)} chars>"
     if isinstance(value, float) and not math.isfinite(value):
