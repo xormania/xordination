@@ -26,6 +26,7 @@ class SelectionTests(unittest.TestCase):
             (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
+            (["src/xordination/trace.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["tests/test_store.py"], {"store"}, True, False),
             (["docs/ci.md"], set(), True, False),
             (["AGENTS.md"], set(), True, False),

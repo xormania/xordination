@@ -100,6 +100,16 @@ Use `claude` or `grok` in place of `codex` for the other adapters. `--binary` se
 
 The adapter preserves the project's available tools and operator policy. Consumer roles and work-order policies are supplied through the public contract. Proof-only tools, fixture workloads, and fixed peers remain test controls.
 
+## Diagnostic traces and support bundles
+
+Tracing is off by default. `--trace PATH` on `stdio` or `adapter` appends one JSON line per protocol frame to a local file, created with mode `0600` and never followed through a symlink. Each record carries a per-process sequence assigned under the same lock that serializes the wire, plus wall-clock and monotonic timestamps, so the trace order is the actual frame order of that stream. Frames keep envelope and correlation fields (`id`, `method`, message, attempt, thread, turn and session identifiers); every other string, including message bodies, error text and native credentials, is replaced by its length, and the participant token is scrubbed wherever it appears. The Codex and Grok adapters trace their native RPC stream; Grok's spawned MCP frontend writes `PATH.mcp`, and Claude's MCP frontend writes `PATH`. A trace stops with a marker record at 64 MiB.
+
+```sh
+xordination diagnostics bundle --output support.zip --trace PATH --endpoint http://127.0.0.1:8765
+```
+
+The bundle is a new private zip that never overwrites an existing file. It holds a manifest (version, Python/platform identity and redaction status), `doctor` output without model calls, the broker's unauthenticated `/health` document when `--endpoint` is given, and the last 10,000 records of each trace. Trace records are rebuilt from known fields and redacted again; unrecognized lines are dropped and counted. The credential named by `--token-env` is scrubbed from every member. A bundle is not native communication evidence.
+
 ## Optional broker sidecar
 
 Build the local broker-only image. It contains no vendor CLIs or vendor credentials:

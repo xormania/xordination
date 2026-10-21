@@ -106,11 +106,23 @@ def parser():
             command.add_argument("operation", choices=("peers", "send", "inbox", "wait", "ack",
                                  "status", "retry", "claim", "finish", "recover", "stop"))
             command.add_argument("--params", default="{}", help="JSON operation parameters")
+        if name in ("stdio", "adapter"):
+            command.add_argument("--trace", help="Append a redacted protocol-frame trace to this file (created 0600)")
         command.add_argument("--endpoint", default="http://127.0.0.1:8765")
         command.add_argument("--token-env", default="XORDINATION_TOKEN")
     doctor = sub.add_parser("doctor", help="Observe installed harness capabilities without model calls")
     doctor.add_argument("--harness", choices=("codex", "claude", "grok"))
     doctor.add_argument("--binary")
+    diagnostics = sub.add_parser("diagnostics", help="Package redacted support diagnostics")
+    bundle = diagnostics.add_subparsers(dest="diagnostics", required=True).add_parser(
+        "bundle", help="Write redacted traces, doctor and health output to a new private archive")
+    bundle.add_argument("--output", required=True, help="New zip archive; refuse overwrite")
+    bundle.add_argument("--trace", action="append", default=[], help="Trace file to include (repeatable)")
+    bundle.add_argument("--harness", choices=("codex", "claude", "grok"))
+    bundle.add_argument("--binary")
+    bundle.add_argument("--endpoint", help="Broker endpoint whose unauthenticated health is included")
+    bundle.add_argument("--token-env", default="XORDINATION_TOKEN",
+                        help="Scrub this environment variable's credential from the bundle")
     return p
 
 
@@ -135,6 +147,28 @@ def serve(store, host, port, ready=None):
         server.server_close()
 
 
+def diagnostics_bundle(args):
+    """Bundle support evidence without credentials, message bodies or model calls."""
+    from .adapters import doctor
+    from .client import health
+    from .trace import bundle
+    names = [args.harness] if args.harness else ["codex", "claude", "grok"]
+    observed = {"harnesses": {name: doctor(name, binary=args.binary) for name in names},
+                "live_communication_verified": False}
+    service = None
+    if args.endpoint:
+        try:
+            service = {"endpoint": args.endpoint, "status": "available", "health": health(args.endpoint)}
+        except BrokerError as error:
+            # Network details can carry endpoints or proxy secrets; keep the code only.
+            service = {"endpoint": args.endpoint, "status": "unavailable", "error": error.code}
+    manifest = bundle(args.output, traces=args.trace, doctor=observed, health=service,
+                      secrets=[os.environ.get(args.token_env, "")])
+    write_json({"output": os.path.abspath(args.output), "traces": manifest["traces"],
+                "redaction": manifest["redaction"]})
+    return 0
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
@@ -157,15 +191,18 @@ def main(argv=None):
             write_json({"harnesses": {name: doctor(name, binary=args.binary) for name in names},
                         "live_communication_verified": False})
             return 0
+        if args.command == "diagnostics":
+            return diagnostics_bundle(args)
         token = token_from_env(args.token_env)
         if args.command == "stdio":
             from .mcp import run_stdio
-            return run_stdio(args.endpoint, token, channel=args.channel)
+            return run_stdio(args.endpoint, token, channel=args.channel, trace=args.trace)
         if args.command == "adapter":
             from .adapters import run_adapter
             return run_adapter(args.harness, args.endpoint, token, args.project,
                                binary=args.binary, model=args.model, reasoning=args.reasoning,
-                               prompt=args.prompt, mode=args.mode, native_id=args.native_id)
+                               prompt=args.prompt, mode=args.mode, native_id=args.native_id,
+                               trace=args.trace)
         if args.command == "claude-hook":
             from .adapters import claude_hook
             return claude_hook(args.endpoint, token)

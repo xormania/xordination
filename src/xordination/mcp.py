@@ -12,6 +12,7 @@ import threading
 import time
 
 from .client import BrokerError, Client
+from .trace import open_trace
 from . import __version__
 
 
@@ -121,9 +122,10 @@ def _request(packet):
 
 
 class _Server:
-    def __init__(self, client, output, *, channel=False, error_output=None):
+    def __init__(self, client, output, *, channel=False, error_output=None, trace=None):
         self.client = client
         self.output = output
+        self.trace = trace
         self.error_output = error_output or sys.stderr
         self.channel = channel
         self.output_lock = threading.Lock()
@@ -146,7 +148,12 @@ class _Server:
                 self.output.flush()
             except (OSError, ValueError):
                 self.stop.set()
+                if self.trace:
+                    self.trace.record("out", packet, event="write_failed")
                 raise
+            # Recorded under the output lock, so trace order is wire order.
+            if self.trace:
+                self.trace.record("out", packet)
 
     def error(self, ident, code, message):
         self.write({"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": message}})
@@ -338,9 +345,10 @@ class _Server:
             self.channel_thread.join(timeout=2)
 
 
-def run_stdio(endpoint, token, channel=False):
+def run_stdio(endpoint, token, channel=False, trace=None):
     """Serve MCP on stdin/stdout. Diagnostics never enter protocol stdout."""
-    server = _Server(Client(endpoint, token), sys.stdout, channel=channel)
+    trace = open_trace(trace, "mcp-stdio", secrets=(token,))
+    server = _Server(Client(endpoint, token), sys.stdout, channel=channel, trace=trace)
     try:
         while not server.stop.is_set():
             line = sys.stdin.readline(MAX_LINE + 1)
@@ -350,16 +358,24 @@ def run_stdio(endpoint, token, channel=False):
                 # Discard the rest of this frame without retaining unbounded input.
                 while line and not line.endswith("\n"):
                     line = sys.stdin.readline(MAX_LINE + 1)
+                if trace:
+                    trace.record("in", event="oversized_frame")
                 server.error(None, -32700, "JSON-RPC frame exceeds size limit")
                 continue
             try:
                 packet = json.loads(line, parse_constant=_json_reject_constant)
             except (ValueError, RecursionError):
+                if trace:
+                    trace.record("in", event="unparsable_frame")
                 server.error(None, -32700, "Parse error")
                 continue
+            if trace:
+                trace.record("in", packet)
             server.receive(packet)
     except (BrokenPipeError, OSError):
         return 1
     finally:
         server.close()
+        if trace:
+            trace.close()
     return 0

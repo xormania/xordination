@@ -175,8 +175,10 @@ async def _terminal_line(prompt):
 
 
 class NativeAdapter:
-    def __init__(self, client, binary, project, *, model=None, reasoning=None, prompt=None, poll_interval=.2):
+    def __init__(self, client, binary, project, *, model=None, reasoning=None, prompt=None, poll_interval=.2,
+                 trace=None):
         self.client, self.binary = client, binary
+        self.trace = trace
         self.project = str(Path(project).resolve())
         if not Path(self.project).is_dir():
             raise ValueError("Project directory does not exist: " + self.project)
@@ -224,7 +226,7 @@ class NativeAdapter:
         process = await asyncio.create_subprocess_exec(*argv, cwd=self.project, env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024)
-        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True)
+        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True, trace=self.trace)
         async def stderr():
             while data := await process.stderr.readline():
                 sys.stderr.write(data.decode(errors="replace"))
@@ -291,6 +293,8 @@ class NativeAdapter:
             await self.call("stop")
         except Exception:
             pass  # A superseded credential cannot stop its replacement.
+        if self.trace:
+            self.trace.close()
 
     async def _failed_delivery(self, message, error, transport):
         outcome = "failed" if isinstance(error, RPCError) and error.code in {-32601, -32602} else "uncertain"
@@ -451,7 +455,7 @@ class GrokAdapter(NativeAdapter):
             await self.rpc.request("authenticate", {"methodId": chosen, "_meta": {"headless": True}})
         result = await self.rpc.request("session/new", {"cwd": self.project, "mcpServers": [{
             "name": "xordination", "command": sys.executable,
-            "args": _mcp_args(self.client.endpoint),
+            "args": _mcp_args(self.client.endpoint, trace=self.trace and self.trace.path + ".mcp"),
             "env": [{"name": "XORDINATION_TOKEN", "value": self.client.token}]}]})
         self.session = result["sessionId"]
         await self.bind(transport="grok/acp", identity_source="session/new.response", live_delivery="native_rpc",
@@ -611,10 +615,13 @@ class GrokAdapter(NativeAdapter):
             await asyncio.sleep(0)
 
 
-def _mcp_args(endpoint, channel=False):
+def _mcp_args(endpoint, channel=False, trace=None):
     args = ["-m", "xordination", "stdio", "--endpoint", endpoint, "--token-env", "XORDINATION_TOKEN"]
     if channel:
         args.append("--channel")
+    if trace:
+        # A separate file per process keeps each trace sequence one wire order.
+        args += ["--trace", os.path.abspath(trace)]
     return args
 
 
@@ -667,7 +674,7 @@ def claude_hook(endpoint, token, *, packet=None):
     return 0
 
 
-def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=None):
+def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=None, trace=None):
     from .mcp import INSTRUCTIONS
     session = str(uuid.uuid4())
     observation = doctor("claude", binary)
@@ -686,7 +693,7 @@ def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=No
         settings = folder / "hooks.json"
         debug_log = folder / "native-debug.log"
         config.write_text(json.dumps({"mcpServers": {"xordination": {"command": sys.executable,
-            "args": _mcp_args(client.endpoint, channel=True), "env": {"XORDINATION_TOKEN": client.token}}}}))
+            "args": _mcp_args(client.endpoint, channel=True, trace=trace), "env": {"XORDINATION_TOKEN": client.token}}}}))
         config.chmod(0o600)
         hook = shlex.join([sys.executable, "-m", "xordination", "claude-hook", "--endpoint", client.endpoint,
                           "--token-env", "XORDINATION_TOKEN"])
@@ -739,7 +746,7 @@ def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=No
 
 
 def run_adapter(harness, endpoint, token, project, *, binary=None, model=None, reasoning=None,
-                prompt=None, mode="launch", native_id=None):
+                prompt=None, mode="launch", native_id=None, trace=None):
     """Launch one persistent native session; no unverified attachment fallback."""
     if harness not in {"codex", "grok", "claude"}:
         raise ValueError("Unknown harness: " + str(harness))
@@ -755,8 +762,12 @@ def run_adapter(harness, endpoint, token, project, *, binary=None, model=None, r
     # executable. A mismatch cannot mutate or retire the existing binding.
     executable = _binary(harness, binary)
     if harness == "claude":
-        return run_claude(client, executable, project, model=model, reasoning=reasoning, prompt=prompt)
+        # Claude's only Xordination protocol stream is its MCP stdio frontend.
+        return run_claude(client, executable, project, model=model, reasoning=reasoning, prompt=prompt,
+                          trace=trace)
+    from .trace import open_trace
     adapter = (CodexAdapter if harness == "codex" else GrokAdapter)(client, executable, project,
-                   model=model, reasoning=reasoning, prompt=prompt)
+                   model=model, reasoning=reasoning, prompt=prompt,
+                   trace=open_trace(trace, harness + "-native-rpc", secrets=(token,)))
     asyncio.run(adapter.run())
     return 0

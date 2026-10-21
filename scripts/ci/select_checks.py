@@ -20,6 +20,8 @@ SOURCE_GROUPS = {
     "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
+    # Traces are written by the MCP frontend and native RPC and bundled by the CLI.
+    "trace.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }

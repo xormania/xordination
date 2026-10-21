@@ -1,4 +1,5 @@
 """Authenticated broker client; local credentials never traverse ambient proxies."""
+from http.client import HTTPException
 import ipaddress
 import json
 from urllib.parse import urlsplit
@@ -19,23 +20,43 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _opener(endpoint):
+    parsed = urlsplit(endpoint)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("Endpoint must be an HTTP(S) URL without credentials, query or fragment")
+    local = parsed.hostname.lower() == "localhost"
+    try:
+        local = local or ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        pass
+    return build_opener(ProxyHandler({}), NoRedirect()) if local else build_opener(NoRedirect())
+
+
+def health(endpoint, timeout=5):
+    """Read the unauthenticated service health document; no credential is sent."""
+    opener = _opener(endpoint)
+    try:
+        with opener.open(endpoint.rstrip("/") + "/health", timeout=timeout) as response:
+            result = json.load(response)
+    except (URLError, TimeoutError, OSError, HTTPException):
+        raise BrokerError("connection_error", "Broker health is unavailable") from None
+    except ValueError:
+        result = None
+    if not isinstance(result, dict):
+        raise BrokerError("invalid_response", "Broker returned an invalid response")
+    return result
+
+
 class Client:
     def __init__(self, endpoint, token, timeout=40):
-        parsed = urlsplit(endpoint)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username or parsed.password or parsed.query or parsed.fragment):
-            raise ValueError("Endpoint must be an HTTP(S) URL without credentials, query or fragment")
+        opener = _opener(endpoint)
         if not isinstance(token, str) or not token:
             raise ValueError("A participant token is required")
         self.endpoint = endpoint.rstrip("/")
         self.token = token
         self.timeout = timeout
-        local = parsed.hostname.lower() == "localhost"
-        try:
-            local = local or ipaddress.ip_address(parsed.hostname).is_loopback
-        except ValueError:
-            pass
-        self.opener = build_opener(ProxyHandler({}), NoRedirect()) if local else build_opener(NoRedirect())
+        self.opener = opener
 
     def call(self, operation, **params):
         payload = json.dumps({"operation": operation, "params": params},
