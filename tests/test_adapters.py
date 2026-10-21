@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from xordination.adapters import (CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
                                  claude_hook, doctor, run_adapter, run_claude)
-from xordination.rpc import RPC, RPCError
+from xordination.rpc import MARKER, RPC, RPCError
 from native_fixtures import FAMILY_NATIVE, MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
 
@@ -504,6 +504,23 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.close()
                 await self.until_released(lock)
                 self.assertIsNone(adapter.rpc.group)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "member scan reads /proc")
+    async def test_reaped_leader_never_signals_a_reused_group_id(self):
+        leader = await asyncio.create_subprocess_exec(sys.executable, "-c", "pass", start_new_session=True,
+                                                      stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        await leader.wait()
+        # A foreign group now holds the ID the reaped leader had; stand in by pointing the RPC at it.
+        foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True, env={**os.environ, MARKER: "foreign"})
+        self.addCleanup(foreign.wait)
+        self.addCleanup(foreign.kill)
+        rpc = RPC(leader, lambda *args: None, lambda *args: None, jsonrpc=False, family="family-a")
+        rpc.group = foreign.pid
+        rpc.stop_grace = .2
+        await rpc.close()
+        self.assertIsNone(foreign.poll())
+        self.assertIsNone(rpc.group)
 
     @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
     async def test_native_crash_leaves_no_detached_descendants_after_adapter_cleanup(self):

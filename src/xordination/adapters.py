@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import subprocess
@@ -20,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-from .rpc import FAMILY, RPC, RPCError
+from .rpc import FAMILY, MARKER, RPC, RPCError
 
 
 class CapabilityError(ValueError):
@@ -222,10 +223,12 @@ class NativeAdapter:
         task.add_done_callback(self.tasks.discard)
 
     async def spawn(self, argv, *, jsonrpc=True, env=None):
+        marker = secrets.token_hex(16)
+        env = {**(os.environ if env is None else env), MARKER: marker}
         process = await asyncio.create_subprocess_exec(*argv, cwd=self.project, env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024, **FAMILY)
-        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True, family=True)
+        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True, family=marker)
         async def stderr():
             while data := await process.stderr.readline():
                 sys.stderr.write(data.decode(errors="replace"))
