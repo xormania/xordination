@@ -8,8 +8,9 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from xordination.adapters import (CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
+from xordination.adapters import (BrokerReconnect, CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
                                  claude_hook, doctor, run_adapter, run_claude)
+from xordination.client import BrokerError, Client
 from xordination.rpc import RPC, RPCError
 from native_fixtures import MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
@@ -452,6 +453,153 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(msg["attempt_id"], adapter.pending_attempts)
         self.assertFalse(any(op == "retry" for op, _ in self.client.calls))
 
+    def broker_client(self, *, commit, before_retry=None):
+        """The real store reached like the HTTP client: errors become BrokerError.
+
+        The first finish loses its connection, after committing when ``commit``
+        is set (only the response was lost). ``before_retry`` runs before the
+        retried finish reaches the store.
+        """
+        from xordination.store import StoreError
+        store, context = self.store, self.recipient_context
+        class Lossy(ClientFixture):
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                finishes = sum(op == "finish" for op, _ in self.calls)
+                if operation == "finish" and finishes == 1:
+                    if commit:
+                        store.finish(context, **params)
+                    raise BrokerError("connection_error", "Broker connection lost: RemoteDisconnected")
+                if operation == "finish" and finishes == 2 and before_retry:
+                    before_retry()
+                try:
+                    return getattr(store, operation)(context, **params)
+                except StoreError as error:
+                    raise BrokerError(error.code, str(error)) from None
+        return Lossy()
+
+    async def lossy_delivery(self, key, **options):
+        self.store_client()
+        msg = self.stored_message(key)
+        self.client = self.broker_client(**options)
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        adapter.reconnect = BrokerReconnect(window=2, initial=.01)
+        await self.process(MOCK_CODEX, adapter)
+        adapter.session = "thread-one"
+        adapter.pending_attempts[msg["attempt_id"]] = msg
+        return adapter, msg
+
+    async def test_lost_finish_response_settles_once_from_durable_attempt(self):
+        adapter, msg = await self.lossy_delivery("lost-response", commit=True)
+        await asyncio.wait_for(adapter.deliver(msg), 3)
+        self.assertNotIn(msg["attempt_id"], adapter.pending_attempts)
+        status = self.store.status(self.recipient_context, msg["id"])
+        self.assertEqual(status["state"], "submitted")
+        self.assertEqual([attempt["state"] for attempt in status["attempts"]], ["submitted"])
+        # The retried evidence is retained as late, never as a second submission.
+        self.assertEqual([event["late"] for event in status["attempts"][0]["evidence"]], [False, True])
+        self.assertFalse(any(op in {"retry", "claim"} for op, _ in self.client.calls))
+
+    async def test_reconnected_finish_of_replaced_generation_stays_fenced(self):
+        replace = lambda: self.store.join("project", "recipient", harness="grok", replace=True)  # noqa: E731
+        adapter, msg = await self.lossy_delivery("replaced-during-outage", commit=False, before_retry=replace)
+        with self.assertRaises(BrokerError) as raised:
+            await asyncio.wait_for(adapter.deliver(msg), 3)
+        self.assertEqual(raised.exception.code, "stale_attempt")
+        self.assertIn(msg["attempt_id"], adapter.pending_attempts)
+        attempt = self.store.status(self.sender_context, msg["id"])["attempts"][0]
+        self.assertEqual(attempt["state"], "uncertain")
+        # Replacement settled the claim; the old generation's evidence is late.
+        self.assertEqual([(event["outcome"], event["late"]) for event in attempt["evidence"]],
+                         [("uncertain", False), ("submitted", True), ("uncertain", True)])
+
+    async def test_broker_reconnect_is_bounded_and_never_retries_broker_answers(self):
+        class Unreachable(ClientFixture):
+            code = "connection_error"
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                raise BrokerError(self.code, "unavailable fixture")
+        self.client = Unreachable()
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        adapter.reconnect = BrokerReconnect(window=.3, initial=.02, maximum=.05)
+        started = asyncio.get_running_loop().time()
+        with self.assertRaises(BrokerError) as raised:
+            await adapter.call("claim")
+        self.assertEqual(raised.exception.code, "connection_error")
+        self.assertGreaterEqual(asyncio.get_running_loop().time() - started, .25)
+        self.assertGreater(len(self.client.calls), 2)
+        for code in ("stale_generation", "unauthorized", "forbidden"):
+            with self.subTest(code=code):
+                self.client.calls.clear()
+                self.client.code = code
+                adapter.reconnect = BrokerReconnect(window=5, initial=.02)
+                with self.assertRaises(BrokerError):
+                    await adapter.call("claim")
+                self.assertEqual(len(self.client.calls), 1)
+
+    async def test_managed_codex_session_survives_broker_restart_and_keeps_fencing(self):
+        from xordination.server import BrokerServer
+        from xordination.store import Store
+        path = Path(self.temporary.name) / "restart.sqlite"
+        brokers = []
+        def start(port=0):
+            store = Store(str(path))
+            server = BrokerServer(("127.0.0.1", port), store)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02}, daemon=True)
+            thread.start()
+            brokers.append((store, server, thread))
+            return store, server.server_port
+        def stop():
+            store, server, thread = brokers.pop()
+            server.stopping.set()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+            store.close()
+        store, port = start()
+        try:
+            store.create_space("project")
+            sender = store.join("project", "sender")
+            recipient = store.join("project", "recipient", harness="codex")
+            sender_context = {"_token": sender["token"]}
+            recipient_context = {"_token": recipient["token"]}
+            adapter = self.adapter = CodexAdapter(Client("http://127.0.0.1:" + str(port), recipient["token"]),
+                                                  sys.executable, self.temporary.name, poll_interval=.02)
+            adapter.reconnect = BrokerReconnect(window=10, initial=.02, maximum=.1)
+            async def spawn(argv, **kwargs):
+                await self.process(MOCK_CODEX, adapter)
+            adapter.spawn = spawn
+            with patch("xordination.adapters.codex_capability", return_value={"status": "supported"}):
+                runner = asyncio.create_task(adapter.run())
+                first = store.send(sender_context, "recipient", "Before restart", "before")
+                await self.until(lambda: store.status(recipient_context, first["id"])["state"] == "submitted")
+            process = adapter.rpc.process
+            stop()
+            await asyncio.sleep(.3)  # Many claim polls fail while the broker is down.
+            self.assertFalse(runner.done())
+            self.assertIsNotNone(adapter.reconnect.since)
+            self.assertIsNone(process.returncode)
+            store, _ = start(port)
+            second = store.send(sender_context, "recipient", "After restart", "after")
+            await self.until(lambda: store.status(recipient_context, second["id"])["state"] == "submitted")
+            self.assertIs(adapter.rpc.process, process)
+            self.assertIsNone(adapter.reconnect.since)
+            for queued in (first, second):
+                attempts = store.status(recipient_context, queued["id"])["attempts"]
+                self.assertEqual([(row["state"], row["native_id"]) for row in attempts],
+                                 [("submitted", "thread-one")])  # Delivered once; no replay.
+            # Restart preserved the binding generation; replacement still fences it.
+            replacement = store.join("project", "recipient", harness="codex", replace=True)
+            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 3))[0]
+            self.assertIsInstance(result, BrokerError)
+            self.assertEqual(result.code, "stale_generation")
+            self.assertIsNotNone(process.returncode)
+            third = store.send(sender_context, "recipient", "For the replacement", "third")
+            self.assertEqual(store.status({"_token": replacement["token"]}, third["id"])["attempts"], [])
+        finally:
+            while brokers:
+                stop()
+
     async def test_nonowned_transport_cleanup_never_kills_foreign_process(self):
         async def reject(method, params):
             raise ValueError(method)
@@ -562,6 +710,54 @@ class ProbeAndChannelTests(unittest.TestCase):
             with path.open("a") as stream:
                 stream.write("\n")
             self.assertTrue(observer.poll())
+
+    def test_claude_supervisor_survives_broker_outage(self):
+        class Outage(ClientFixture):
+            """Two lost identity polls and a lost registration bind, then an explicit stop."""
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                registrations = sum(op == "bind" and row["capabilities"].get("channel_registered") is True
+                                    for op, row in self.calls)
+                if operation == "identity":
+                    if sum(op == "identity" for op, _ in self.calls) <= 2:
+                        raise BrokerError("connection_error", "Broker connection lost: ConnectionRefusedError")
+                    return {"stopped": True} if registrations >= 2 or len(self.calls) > 200 else {"active": True}
+                if operation == "bind" and registrations == 1:
+                    raise BrokerError("unavailable", "Broker operation unavailable")
+                return {}
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder) / "claude"
+            binary.write_text("#!" + sys.executable + "\nimport sys, time\n"
+                "log = sys.argv[sys.argv.index('--debug-file') + 1]\n"
+                "open(log, 'w').write('x [DEBUG] MCP server \"xordination\": Channel notifications registered\\n')\n"
+                "time.sleep(30)\n")
+            binary.chmod(0o700)
+            client = Outage()
+            with patch("xordination.adapters.doctor", return_value={"status": "supported"}):
+                self.assertEqual(run_claude(client, str(binary), folder), 0)
+        registrations = [params for op, params in client.calls
+                         if op == "bind" and params["capabilities"].get("channel_registered")]
+        self.assertEqual(len(registrations), 2)  # Lost once, then recorded after reconnect.
+        self.assertEqual(client.calls[-1][0], "stop")
+
+    def test_client_reports_dropped_broker_connection_as_connection_error(self):
+        import socket
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        def drop():
+            connection, _ = listener.accept()
+            connection.recv(65536)
+            connection.close()  # Request accepted, response never sent.
+        thread = threading.Thread(target=drop, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(BrokerError) as raised:
+                Client("http://127.0.0.1:" + str(listener.getsockname()[1]), "token", timeout=5).call("claim")
+            self.assertEqual(raised.exception.code, "connection_error")
+        finally:
+            thread.join(timeout=5)
+            listener.close()
 
     def test_claude_hook_reports_observed_identity_without_tool_decision(self):
         client = ClientFixture()

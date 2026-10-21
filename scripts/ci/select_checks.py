@@ -16,7 +16,8 @@ SOURCE_GROUPS = {
     "rpc.py": ("adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     # Native adapters consume TOOLS and INSTRUCTIONS through lazy imports.
     "mcp.py": ("adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
-    "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
+    # Adapter reconnect contracts restart a real broker under a running adapter.
+    "server.py": ("adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
