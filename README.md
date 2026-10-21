@@ -99,12 +99,12 @@ The initial limits are fixed in source; `xordination serve` and `xordination std
 | Broker connections | 64 open connections; a socket read or write that stalls for 40 seconds closes the connection | Further connections are closed before their headers are read, without a response |
 | Broker operations | 64 concurrent `/rpc` requests; this equals the connection bound, so the connection limit normally applies first | HTTP 503 `backpressure` |
 | Broker waits | 16 concurrent `wait` operations across all clients | HTTP 503 `backpressure`; other operations still run |
-| Client HTTP timeout | 40 seconds per broker request | `connection_error` |
-| MCP stdio frame | 1 MiB per JSON-RPC line | JSON-RPC `-32700`; the next frame is read normally |
+| Client HTTP timeout | 40 seconds of socket inactivity (connect or each read); not a whole-request deadline, so a peer that keeps sending bytes can hold a request longer | `connection_error` |
+| MCP stdio frame | 1 MiB of encoded bytes per JSON-RPC line | JSON-RPC `-32700`; the next frame is read normally |
 | MCP tool calls per frontend | 16 in flight (8 worker threads), excluding waits | JSON-RPC `-32000` "Too many concurrent requests" |
 | MCP waits per frontend | 4 in flight (4 dedicated threads) | JSON-RPC `-32000`; send, ack and other calls keep their own budget |
 
-Each frontend holds its own MCP budgets; the broker budgets are shared by every client of one broker. A frontend wait polls the broker in steps of at most 0.5 seconds, so it holds a broker wait slot only briefly. The frontend rejects arguments outside its tool schema (for example a page `limit` above 100 or a wait above 30 seconds) with JSON-RPC `-32602` before calling the broker. A broker rejection, including `backpressure` and `queue_full`, reaches the model as a tool result with `isError: true` and the broker's error code. `initialize` and `ping` bypass the call budget, and a request ID that is already in flight is rejected with `-32600`. Backpressure means the operation was not performed: retry after a delay, repeating a `send` with the same idempotency key and intent.
+Each frontend holds its own MCP budgets; the broker budgets are shared by every client of one broker. A frontend wait polls the broker in steps of at most 0.5 seconds, so it holds a broker wait slot only briefly. The frontend rejects arguments outside its tool schema (for example a page `limit` above 100 or a wait above 30 seconds) with JSON-RPC `-32602` before calling the broker. A broker rejection, including `backpressure` and `queue_full`, reaches the model as a tool result with `isError: true` and the broker's error code. `initialize` and `ping` bypass the call budget but not the in-flight check: a request ID that is already in flight is rejected with `-32600` for every method. Backpressure means the operation was not performed: retry after a delay, repeating a `send` with the same idempotency key and intent.
 
 ## Native adapters
 
