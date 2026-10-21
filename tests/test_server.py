@@ -1,4 +1,5 @@
 import concurrent.futures
+import io
 import json
 import socket
 import tempfile
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 from helpers import owned_broker
 from xordination.client import Client, BrokerError
+from xordination.mcp import _Server
 from xordination.server import BrokerServer, Handler
 
 
@@ -203,6 +205,26 @@ class BrokerIntegration(unittest.TestCase):
         with self.assertRaises(BrokerError) as caught:
             self.one.call("space_view", space="project")
         self.assertEqual("invalid_request", caught.exception.code)
+
+    def test_cancelled_body_is_withheld_from_http_and_mcp_inbox_and_wait(self):
+        withdrawn = self.one.call("send", to="two", body="withdrawn secret", key="withdrawn")
+        self.one.call("cancel", message_id=withdrawn["id"])
+        server = _Server(self.two, io.StringIO(), error_output=io.StringIO())
+        self.addCleanup(server.close)
+        cancel = threading.Event()
+        server.dispatch("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                       "clientInfo": {"name": "test", "version": "1"}}, cancel)
+        results = [self.two.call("inbox"), self.two.call("wait", timeout=0)]
+        results += [server.dispatch("tools/call", {"name": "xordination_" + name, "arguments": arguments}, cancel)["structuredContent"]
+                    for name, arguments in (("inbox", {}), ("wait", {"timeout": 0}))]
+        for result in results:
+            self.assertEqual([], result["messages"])
+            self.assertEqual(withdrawn["sequence"], result["position"])
+            self.assertNotIn("withdrawn secret", json.dumps(result))
+        later = self.one.call("send", to="two", body="later", key="later")
+        waited = server.dispatch("tools/call", {"name": "xordination_wait",
+                                                "arguments": {"cursor": results[-1]["cursor"], "timeout": 1}}, cancel)
+        self.assertEqual([later["id"]], [m["id"] for m in waited["structuredContent"]["messages"]])
 
     def test_second_broker_cannot_recover_first_brokers_claim(self):
         sent = self.one.call("send", to="two", body="work", key="lease")

@@ -565,6 +565,37 @@ sys.stdin.buffer.read(1)
         self.store.cancel(self.a, first["id"])
         self.assertTrue(self.send("second")["accepted"])
 
+    def test_cancelled_messages_leave_recipient_inbox_and_the_cursor_passes_them(self):
+        withdrawn = self.store.send(self.a, "b", "withdrawn secret", "withdrawn")
+        kept = self.send("kept")
+        self.store.cancel(self.a, withdrawn["id"])
+        page = self.store.inbox(self.b)
+        self.assertEqual([kept["id"]], [m["id"] for m in page["messages"]])
+        self.assertNotIn("withdrawn secret", json.dumps(page))
+        self.assertEqual([kept["id"]], [m["id"] for m in self.store.inbox(self.b, unacknowledged=True)["messages"]])
+        trailing = self.send("trailing")
+        self.store.cancel(self.a, trailing["id"])
+        empty = self.store.inbox(self.b, cursor=page["cursor"])
+        self.assertEqual(([], False), (empty["messages"], empty["has_more"]))
+        self.assertEqual(trailing["sequence"], empty["position"])
+        later = self.send("later")
+        self.assertEqual([later["id"]], [m["id"] for m in self.store.inbox(self.b, cursor=empty["cursor"])["messages"]])
+        # A full page stops at its last visible row; cancelled rows beyond it
+        # are skipped on the next page rather than lost or returned.
+        first = self.store.inbox(self.b, limit=1)
+        self.assertEqual(([kept["id"]], True), ([m["id"] for m in first["messages"]], first["has_more"]))
+        self.assertEqual([later["id"]], [m["id"] for m in self.store.inbox(self.b, cursor=first["cursor"], limit=1)["messages"]])
+
+    def test_cancellation_keeps_submission_risk_unless_failure_was_retry_safe(self):
+        for retry_safe, expected in ((None, True), (False, True), (True, False)):
+            with self.subTest(retry_safe=retry_safe):
+                message = self.send(f"failed-{retry_safe}")
+                attempt = self.store.claim(self.b)
+                self.store.finish(self.b, message["id"], attempt["attempt_id"], "failed", retry_safe=retry_safe)
+                cancelled = self.store.cancel(self.a, message["id"])
+                self.assertEqual(expected, cancelled["cancellation"]["may_have_been_submitted"])
+                self.assertEqual(expected, self.store.status(self.a, message["id"])["cancellation"]["may_have_been_submitted"])
+
     def test_definite_failure_records_whether_retry_is_safe(self):
         message = self.send()
         unknown = self.store.claim(self.b)

@@ -512,12 +512,20 @@ class Store:
                 # Native insertion alone is not the recipient's acknowledgement.
                 query += " AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id AND r.kind IN (?,?))"
                 arguments += self.ACK_KINDS
-            rows = self._db.execute(query + " ORDER BY sequence LIMIT ?", (*arguments, limit + 1)).fetchall()
+            # Cancellation stops delivery, so a cancelled body never reaches
+            # the recipient through inbox or wait. The state is terminal.
+            rows = self._db.execute(query + " AND m.state!='cancelled' ORDER BY sequence LIMIT ?", (*arguments, limit + 1)).fetchall()
             page = rows[:limit]
+            has_more = len(rows) > limit
             position = page[-1]["sequence"] if page else sequence
+            if not has_more:
+                # Advance past trailing cancelled rows so the cursor reflects
+                # everything already disposed of.
+                skipped = self._db.execute("SELECT MAX(sequence) FROM (" + query + " AND m.state='cancelled')", arguments).fetchone()[0]
+                position = max(position, skipped or 0)
             following = self._cursor(principal, position)
             return {"messages": [self._message(row) for row in page], "cursor": following, "next_cursor": following,
-                    "resume_cursor": following, "has_more": len(rows) > limit, "resync_required": resync,
+                    "resume_cursor": following, "has_more": has_more, "resync_required": resync,
                     "visibility_epoch": principal["visibility_epoch"], "position": position}
 
     @staticmethod
@@ -618,7 +626,10 @@ class Store:
         row = self._db.execute("SELECT * FROM cancellations WHERE message_id=?", (message_id,)).fetchone()
         if row is None:
             return None
-        submitted = self._db.execute("SELECT 1 FROM attempts WHERE message_id=? AND state IN ('submitted','uncertain')", (message_id,)).fetchone()
+        # Only a failure affirmatively reported retry-safe proves nothing
+        # reached the native session; unknown or unsafe failures may have.
+        submitted = self._db.execute("""SELECT 1 FROM attempts WHERE message_id=? AND (state IN ('submitted','uncertain')
+            OR (state='failed' AND (retry_safe IS NULL OR retry_safe=0)))""", (message_id,)).fetchone()
         return {"participant": row["participant"], "generation": row["generation"], "previous_state": row["previous_state"],
                 "reason": row["reason"], "cancelled_at": row["observed"],
                 # Cancellation cannot retract content a native session may already hold.
