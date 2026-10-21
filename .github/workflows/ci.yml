@@ -56,6 +56,8 @@ jobs:
           actionlint --version
       - name: Ruff
         run: ruff check --output-format=github .
+      - name: Ruff security rules are enforced
+        run: python scripts/ci/lint_checks.py
       - name: ShellCheck tracked shell scripts
         run: git ls-files -z -- '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
       - name: actionlint with ShellCheck on workflow run steps

@@ -27,6 +27,16 @@ spec.loader.exec_module(live)
 
 
 class LiveNativeBusyTests(unittest.IsolatedAsyncioTestCase):
+    async def replies_submitted(self, run, replies):
+        while True:
+            with live.readonly(run / "broker.sqlite3") as connection:
+                submitted = {row["body"] for row in connection.execute(
+                    "SELECT DISTINCT messages.body FROM messages JOIN attempts ON attempts.message_id=messages.id "
+                    "WHERE attempts.state='submitted'")}
+            if set(replies) <= submitted:
+                return
+            await asyncio.sleep(.02)
+
     async def exercise_busy(self, *, recipient_mode="gate", phase_timeout=10, scenarios=("busy",), mutate_wait_boundary=False):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -85,6 +95,8 @@ class LiveNativeBusyTests(unittest.IsolatedAsyncioTestCase):
                             dispatch = {"error": {"type": type(error).__name__, "code": getattr(error, "code", None)}}
                     if recipient_mode == "gate":
                         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in completed.values())), 10)
+                        # The fixture acks a reply before its adapter records the submitted attempt.
+                        await asyncio.wait_for(self.replies_submitted(run, completed), 10)
                     report = live.verify(run)
                     case = next(case for case in frozen["cases"] if case["scenario"] == "busy")
                     gate = run / "gates" / case["case_id"]
