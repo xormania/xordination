@@ -128,7 +128,8 @@ class ProcessTmux:
 
 
 def supported(harness):
-    return {"harness": harness, "status": "supported", "version": {"value": "fixture " + harness + " 1.0"}}
+    return {"harness": harness, "status": "supported", "binary": "/opt/" + harness + "/bin/" + harness,
+            "version": {"value": "fixture " + harness + " 1.0"}}
 
 
 class LauncherTests(unittest.TestCase):
@@ -159,6 +160,8 @@ class LauncherTests(unittest.TestCase):
                        startup_timeout=30, reply_timeout=30)
         config = json.loads((job / "config.json").read_text())
         self.assertEqual(config["participants"][0]["version"], "fixture codex 1.0")
+        # The probed executable is recorded so readiness can match evidence to it later.
+        self.assertEqual(config["participants"][0]["binary"], "/opt/codex/bin/codex")
         processes = []
         launch = self.tmux.launch
         self.tmux.launch = lambda record, name, argv: processes.append(name) or launch(record, name, argv)

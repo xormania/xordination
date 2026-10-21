@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import sys
 
@@ -122,6 +123,28 @@ def service_level(endpoint=None, token=None):
     return result
 
 
+def _digest(value):
+    """The live verifier's canonical JSON digest."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+RUNNER = "scripts/testing/live.py"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def source_sha256(package, runner_sha256):
+    """`live.py`'s source fingerprint: its own bytes' digest plus every module of the package.
+
+    The verifier records this for its checkout's src/xordination; readiness recomputes it
+    from the imported package, taking the runner digest from the report.
+    """
+    files = {RUNNER: runner_sha256}
+    for path in sorted(Path(package).glob("*.py")):
+        files["src/xordination/" + path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return _digest(files)
+
+
 def _invalid(path):
     return ValueError("Evidence " + str(path) + " is not a complete operator_native verification report")
 
@@ -163,31 +186,84 @@ def load_evidence(path):
                   and (report["status"] == "pass") == bool(pairs and passed == len(pairs) and not report["errors"]))
     if not consistent:
         raise _invalid(path)
+    # The verifier hashed its validated configuration; its cases enumerate scenarios x pairs in order.
+    scenarios = list(dict.fromkeys(pair["scenario"] for pair in pairs))
+    config = {"participants": report["configured_participants"], "scenarios": scenarios,
+              "pairs": [[pair["sender"], pair["recipient"]] for pair in pairs
+                        if scenarios and pair["scenario"] == scenarios[0]]}
+    used = {pair[side] for pair in pairs for side in ("sender", "recipient")}
     return {"path": str(path.resolve()), "sha256": hashlib.sha256(data).hexdigest(),
             "run_id": report["run_id"], "source_sha256": report.get("source_sha256"),
+            "runner_sha256": report.get("runner_sha256"), "config_sha256": report.get("config_sha256"),
+            "config_consistent": report.get("config_sha256") == _digest(config),
+            "participants": [{key: participant.get(key) for key in ("name", "harness", "version", "binary")}
+                             for participant in report["configured_participants"] if participant["name"] in used],
             "status": report["status"], "pairs": pairs}
+
+
+def evidence_scope(evidence, probes, package=None):
+    """Whether a report describes this runtime; anything unmatched or uncheckable is listed.
+
+    A report certifies nothing unless its source fingerprint equals the imported package's,
+    its configuration digest is consistent, and each exercised participant's recorded
+    executable and version equal the current `doctor` observation for its harness.
+    """
+    package = package or Path(__file__).resolve().parent
+    gaps = []
+    runner, recorded = evidence.get("runner_sha256"), evidence.get("source_sha256")
+    if not (isinstance(runner, str) and _HEX64.fullmatch(runner) and isinstance(recorded, str)):
+        gaps.append("source_fingerprint_unverifiable")
+    elif source_sha256(package, runner) != recorded:
+        gaps.append("source_mismatch")
+    if not evidence.get("config_consistent"):
+        gaps.append("config_mismatch")
+    for participant in evidence["participants"]:
+        name, probe = participant["name"], probes.get(participant["harness"])
+        if probe is None:
+            gaps.append(name + ": harness_not_probed")
+            continue
+        binary, observed = participant.get("binary"), probe.get("binary")
+        if not isinstance(binary, str) or not binary:
+            gaps.append(name + ": binary_unrecorded")
+        elif not isinstance(observed, str) or os.path.realpath(binary) != os.path.realpath(observed):
+            gaps.append(name + ": binary_mismatch")
+        version, current = participant.get("version"), probe.get("version") or {}
+        if not isinstance(version, str) or not version:
+            gaps.append(name + ": version_unrecorded")
+        elif current.get("returncode") != 0 or current.get("value") != version:
+            gaps.append(name + ": version_mismatch")
+    return {"status": "unverified" if gaps else "current", "gaps": gaps}
 
 
 def communication_level(reports):
     if not reports:
         return {"status": "unverified", "reports": [],
                 "detail": "No verified live evidence supplied; readiness never starts native sessions"}
-    return {"status": "passed" if all(report["status"] == "pass" for report in reports) else "failed",
-            "reports": reports,
-            "basis": "Supplied operator_native verification reports, structurally checked, not re-verified"}
+    current = [report for report in reports if report["scope"]["status"] == "current"]
+    if any(report["status"] == "fail" for report in current):
+        status = "failed"
+    elif len(current) == len(reports):
+        status = "passed"
+    else:
+        status = "unverified"
+    result = {"status": status, "reports": reports,
+              "basis": "Supplied operator_native verification reports, structurally checked, not re-verified; "
+                       "only reports fingerprinted to this package and these harness executables count"}
+    if status == "unverified":
+        result["detail"] = "Evidence does not match, or cannot be matched to, the current runtime"
+    return result
 
 
-def adapter_level(harnesses, reports, binary=None):
+def adapter_level(harnesses, reports, probes):
     if not harnesses:
         return {"status": "unverified", "harnesses": {},
                 "detail": "No harness selected; installed capabilities were not probed"}
-    from .adapters import doctor
     # A passing exchange required observed native submissions to both participants' sessions.
-    observed = {pair[side + "_harness"] for report in reports for pair in report["pairs"]
-                if pair["status"] == "pass" for side in ("sender", "recipient")}
+    observed = {pair[side + "_harness"] for report in reports if report["scope"]["status"] == "current"
+                for pair in report["pairs"] if pair["status"] == "pass" for side in ("sender", "recipient")}
     results = {}
     for name in harnesses:
-        capability = doctor(name, binary=binary)
+        capability = probes[name]
         checks = {"installed_capability": {"supported": "passed", "unverified": "unverified"}
                   .get(capability["status"], "failed"),
                   "session_identity": "passed" if name in observed else "unverified"}
@@ -198,8 +274,16 @@ def adapter_level(harnesses, reports, binary=None):
 
 def report(*, state=None, endpoint=None, token=None, harnesses=(), binary=None, evidence=()):
     reports = [load_evidence(path) for path in evidence]
+    harnesses = list(dict.fromkeys(harnesses))
+    probes = {}
+    if harnesses:
+        from .adapters import doctor
+        probes = {name: doctor(name, binary=binary) for name in harnesses}
+    for item in reports:
+        # Only selected, probed harnesses can be matched; nothing native is probed implicitly.
+        item["scope"] = evidence_scope(item, probes)
     levels = {"package": package_level(state), "service": service_level(endpoint, token),
-              "adapter": adapter_level(list(dict.fromkeys(harnesses)), reports, binary),
+              "adapter": adapter_level(harnesses, reports, probes),
               "communication": communication_level(reports)}
     return {"levels": levels, "passed": [name for name, level in levels.items() if level["status"] == "passed"],
             "native_sessions_started": False,

@@ -31,7 +31,7 @@ class SelectionTests(unittest.TestCase):
             (["AGENTS.md"], set(), True, False),
             (["README.md"], set(), True, True),
             ([".dockerignore"], set(), True, True),
-            (["src/xordination/readiness.py"], {"cli", "end_to_end", "live_acceptance"}, True, True),
+            (["src/xordination/readiness.py"], {"cli", "end_to_end", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["MANIFEST.in"], set(selector.GROUPS), True, False),
             (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["tests/test_behavior.py"], {"behavior"}, True, False),

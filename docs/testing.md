@@ -46,7 +46,7 @@ Create a configuration file outside version control. This minimal example requir
 }
 ```
 
-Record actual operator-observed executable versions in each participant's optional `version` field. Optional `model` and `reasoning` fields record requested settings; they do not replace native configuration or establish independently observed effective settings. Missing identity information remains unknown. `xordination doctor --harness codex` and the equivalent harness probe inspect installed binaries without invoking a model.
+Record actual operator-observed executable versions in each participant's optional `version` field, and the absolute executable path in `binary`; the managed launcher fills both from its `doctor` preflight, and `live.py adapter` and the launcher's panes run exactly that executable. Reports carry `runner_sha256` beside `source_sha256` so `xordination readiness` can match them to an installed package. Optional `model` and `reasoning` fields record requested settings; they do not replace native configuration or establish independently observed effective settings. Missing identity information remains unknown. `xordination doctor --harness codex` and the equivalent harness probe inspect installed binaries without invoking a model.
 
 ```sh
 PYTHONPATH=src python scripts/testing/live.py prepare \

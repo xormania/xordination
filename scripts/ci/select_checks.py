@@ -22,7 +22,8 @@ SOURCE_GROUPS = {
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     # Lazily imported by CLI dispatch; end_to_end runs it in a separate client process.
     # It consumes the live.py verifier report; live_acceptance feeds a retained one through it.
-    "readiness.py": ("cli", "end_to_end", "live_acceptance"),
+    # live.py lazily imports its source fingerprint from here, so every live group depends on it.
+    "readiness.py": ("cli", "end_to_end", "live_acceptance", "live_native_busy", "live_tmux"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }

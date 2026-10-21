@@ -192,9 +192,13 @@ def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, repl
         write_json(job / "session.json", record)
         raise ValueError(record["error"] + "; inspect " + str(job / "preflight.json"))
     for participant in config["participants"]:
-        observed = found["harnesses"].get(participant["harness"], {}).get("version", {}).get("value")
+        probe = found["harnesses"].get(participant["harness"], {})
+        observed = probe.get("version", {}).get("value")
         if "version" not in participant and observed:
             participant["version"] = observed[:500]  # Observed --version output, still an operator observation.
+        # Record the probed executable; panes launch exactly it, and readiness matches it later.
+        if "binary" not in participant and isinstance(probe.get("binary"), str) and os.path.isabs(probe["binary"]):
+            participant["binary"] = probe["binary"]
     write_json(job / "config.json", config)
     live.prepare(config, job / "run")
     for participant in config["participants"]:
@@ -245,7 +249,10 @@ def exec_pane(job, role):
         for key in ("model", "reasoning"):
             if participant.get(key):
                 argv += ["--" + key, participant[key]]
+        if participant.get("binary"):
+            argv += ["--binary", participant["binary"]]
     else:
+        # live.py adapter launches the participant's recorded executable itself.
         argv = [sys.executable, str(HERE.parent / "live.py"), "adapter", "--run", str(run),
                 "--participant", role, "--project", str(cwd)]
     os.chdir(cwd)

@@ -81,10 +81,15 @@ def read_capture(path, limit):
         return stream.read(limit + 1)
 
 
+def runner_hash():
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def source_hash():
-    paths = [Path(__file__)] + sorted((ROOT / "src" / "xordination").glob("*.py"))
-    return digest({str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                   for path in paths})
+    # Shared with `xordination readiness`, which recomputes it from the installed package
+    # and the report's runner_sha256 to reject evidence from other source.
+    from xordination.readiness import source_sha256
+    return source_sha256(ROOT / "src" / "xordination", runner_hash())
 
 
 def validate_config(config):
@@ -95,8 +100,13 @@ def validate_config(config):
         raise ValueError("Choose two to eight independent native participants")
     names = []
     for participant in participants:
-        if set(participant) - {"name", "harness", "version", "model", "reasoning"}:
+        if set(participant) - {"name", "harness", "version", "binary", "model", "reasoning"}:
             raise ValueError("Unknown participant configuration input")
+        # The executable that ran, so retained evidence can be matched to a later doctor probe.
+        if "binary" in participant and (not isinstance(participant["binary"], str)
+                                        or not os.path.isabs(participant["binary"])
+                                        or len(participant["binary"]) > 4096):
+            raise ValueError("Participant binary must be an absolute executable path")
         name = participant.get("name", "")
         if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name)
                 or name == CONTROLLER or name in names or participant.get("harness") not in HARNESS):
@@ -129,7 +139,7 @@ def prepare(config, output):
     run_id, run_nonce = uuid.uuid4().hex, uuid.uuid4().hex
     draft = {"schema_version": 1, "evidence_mode": "operator_native", "run_id": run_id,
              "run_nonce": run_nonce, "config": config, "config_sha256": digest(config),
-             "source_sha256": source_hash(), "created_at": time.time(), "generations": {},
+             "source_sha256": source_hash(), "runner_sha256": runner_hash(), "created_at": time.time(), "generations": {},
              "space": "acceptance-" + run_id, "cases": []}
     store = Store(output / "broker.sqlite3")
     try:
@@ -799,6 +809,7 @@ def verify(directory, retain=True):
                           "phases": phases, "failures": failures})
     report = {"schema_version": 1, "run_id": frozen["run_id"], "evidence_mode": "operator_native",
               "config_sha256": frozen["config_sha256"], "source_sha256": frozen["source_sha256"],
+              "runner_sha256": frozen.get("runner_sha256"),
               "status": "pass" if cases and not errors and all(case["status"] == "pass" for case in cases) else "fail",
               "required_cases": len(cases), "passed_cases": sum(case["status"] == "pass" for case in cases),
               "cases": cases, "errors": sorted(set(errors)), "native_artifacts": artifacts,
@@ -902,10 +913,13 @@ def launch_adapter(directory, name, project, binary=None):
     from xordination.client import Client
     directory = Path(directory)
     participant = next(row for row in checked_draft(directory)["config"]["participants"] if row["name"] == name)
+    # A recorded executable is the one the evidence names; never run a different one under it.
+    if participant.get("binary") and binary and binary != participant["binary"]:
+        raise ValueError("--binary differs from the participant's recorded executable")
     connection = load(directory / (name + ".connection.json"))
     endpoint = os.environ.get("XORDINATION_ENDPOINT", "http://127.0.0.1:8765")
     adapter = observed_adapter(directory, name, Client(endpoint, connection["token"]),
-                               _binary(participant["harness"], binary), project)
+                               _binary(participant["harness"], participant.get("binary") or binary), project)
     asyncio.run(adapter.run())
 
 

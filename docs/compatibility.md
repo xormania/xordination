@@ -38,7 +38,7 @@ For three supported harness types, use one parameterized scenario for the six cr
 
 A report returns each level separately. Communication readiness does not establish application-work completion or useful model reasoning.
 
-`xordination readiness` produces this report without starting native sessions; see the [README](../README.md#readiness-report). Its adapter level combines the installed `doctor` capability with native session identity observed in supplied passing evidence. Its communication level is `unverified` unless a retained operator-native verification report is supplied.
+`xordination readiness` produces this report without starting native sessions; see the [README](../README.md#readiness-report). Its adapter level combines the installed `doctor` capability with native session identity observed in supplied passing evidence. Its communication level is `unverified` unless a retained operator-native verification report is supplied whose source, configuration and participant executable/version fingerprints match the current package and `doctor` observations.
 
 ## Protocol and lifecycle limits
 

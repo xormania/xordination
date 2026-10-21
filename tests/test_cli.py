@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.metadata
 import io
 import json
@@ -108,17 +109,44 @@ class BootstrapSafety(unittest.TestCase):
                 store.close()
 
 
-def evidence_report(status="pass", cases=(("alice", "bob", "pass"),), **overrides):
+PARTICIPANTS = [{"name": "alice", "harness": "codex"}, {"name": "bob", "harness": "claude"},
+                {"name": "carol", "harness": "grok"}]
+RUNNER_SHA256 = "a" * 64
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def source_sha256(runner):
+    """live.py's fingerprint of its own bytes and this package's modules, keyed by checkout path."""
+    files = {"scripts/testing/live.py": runner}
+    for path in sorted(Path(xordination.__file__).parent.glob("*.py")):
+        files["src/xordination/" + path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest(files)
+
+
+def probe(harness, binary=None, status="supported"):
+    """A doctor observation of the installed executable that fingerprinted reports name."""
+    return {"harness": harness, "status": status, "binary": binary or "/opt/" + harness + "/bin/" + harness,
+            "version": {"value": harness + " 1.0", "returncode": 0}}
+
+
+def evidence_report(status="pass", cases=(("alice", "bob", "pass"),), participants=PARTICIPANTS, **overrides):
+    """A report fingerprinted the way live.py does, to this package and to `probe` executables."""
     cases = [{"case_id": str(index), "sender": sender, "recipient": recipient, "scenario": "idle",
               "status": case_status, "phases": {}, "failures": []}
              for index, (sender, recipient, case_status) in enumerate(cases)]
+    participants = [{**row, "version": row["harness"] + " 1.0", "binary": probe(row["harness"])["binary"]}
+                    for row in participants]
+    config = {"participants": participants, "pairs": [[case["sender"], case["recipient"]] for case in cases],
+              "scenarios": ["idle"] if cases else []}
     report = {"schema_version": 1, "run_id": "run", "evidence_mode": "operator_native",
-              "config_sha256": "c", "source_sha256": "s", "status": status,
+              "config_sha256": digest(config), "source_sha256": source_sha256(RUNNER_SHA256),
+              "runner_sha256": RUNNER_SHA256, "status": status,
               "required_cases": len(cases), "passed_cases": sum(case["status"] == "pass" for case in cases),
               "cases": cases, "errors": [], "native_artifacts": [],
-              "configured_participants": [{"name": "alice", "harness": "codex"},
-                                          {"name": "bob", "harness": "claude"},
-                                          {"name": "carol", "harness": "grok"}]}
+              "configured_participants": participants}
     report.update(overrides)
     return report
 
@@ -240,9 +268,7 @@ class ReadinessReport(unittest.TestCase):
             self.assertEqual(result["levels"]["service"]["error"], "connection_error")
 
     def test_communication_and_session_identity_come_only_from_verified_evidence(self):
-        observed = {"codex": {"harness": "codex", "status": "supported"},
-                    "claude": {"harness": "claude", "status": "supported"},
-                    "grok": {"harness": "grok", "status": "unavailable"}}
+        observed = {"codex": probe("codex"), "claude": probe("claude"), "grok": probe("grok", status="unavailable")}
         doctor = patch("xordination.adapters.doctor", side_effect=lambda name, binary=None: observed[name])
         with tempfile.TemporaryDirectory() as folder, doctor:
             _, result = self.readiness("--harness", "codex", "--harness", "claude", "--harness", "grok")
@@ -263,7 +289,8 @@ class ReadinessReport(unittest.TestCase):
             # Neighboring verified pairs remain visible; the failed run fails the level.
             failing = self.write(folder, "fail.json", evidence_report(
                 "fail", (("alice", "bob", "pass"), ("bob", "carol", "fail"))))
-            _, result = self.readiness("--harness", "grok", "--evidence", passing, "--evidence", failing)
+            _, result = self.readiness("--harness", "codex", "--harness", "claude", "--harness", "grok",
+                                       "--evidence", passing, "--evidence", failing)
             self.assertEqual(result["levels"]["communication"]["status"], "failed")
             self.assertEqual([pair["status"] for pair in result["levels"]["communication"]["reports"][1]["pairs"]],
                              ["pass", "fail"])
@@ -287,6 +314,58 @@ class ReadinessReport(unittest.TestCase):
             self.assertEqual(code, 2)
             code, error = self.readiness("--harness", "codex", "--harness", "grok", "--binary", "/bin/true")
             self.assertEqual((code, "--binary" in error), (2, True))
+
+    def test_stale_or_unfingerprinted_evidence_cannot_certify_the_current_runtime(self):
+        observed = {"codex": probe("codex"), "claude": probe("claude"), "grok": probe("grok")}
+        def doctor(name, binary=None):
+            return {**observed[name], "binary": binary} if binary else observed[name]
+        codex_pair = (("alice", "dave", "pass"),)
+        codex_only = [{"name": "alice", "harness": "codex"}, {"name": "dave", "harness": "codex"}]
+        stale = {
+            # Recorded by a run of other Xordination source than the imported package.
+            "stale source": (evidence_report(source_sha256=source_sha256("b" * 64)), (), "source_mismatch"),
+            # A report retained before runner_sha256 existed cannot be matched at all.
+            "missing source fingerprint": (evidence_report(runner_sha256=None), (), "source_fingerprint_unverifiable"),
+            "config digest of another configuration": (evidence_report(config_sha256="c" * 64), (), "config_mismatch"),
+            # An old Codex run cannot certify a newly selected executable.
+            "different binary": (evidence_report(cases=codex_pair, participants=codex_only),
+                                 ("--binary", "/usr/local/bin/codex-next"), "alice: binary_mismatch"),
+            "missing binary": (evidence_report(configured_participants=[
+                {key: value for key, value in row.items() if key != "binary"}
+                for row in evidence_report()["configured_participants"]]), (), "alice: binary_unrecorded"),
+            "different version": (evidence_report(configured_participants=[
+                {**row, "version": row["harness"] + " 0.9"}
+                for row in evidence_report()["configured_participants"]]), (), "bob: version_mismatch"),
+        }
+        with tempfile.TemporaryDirectory() as folder, \
+                patch("xordination.adapters.doctor", side_effect=doctor):
+            for label, (value, extra, gap) in stale.items():
+                with self.subTest(label):
+                    path = self.write(folder, "stale.json", value)
+                    harnesses = ("--harness", "codex") if extra else ("--harness", "codex", "--harness", "claude")
+                    _, result = self.readiness(*harnesses, *extra, "--evidence", path)
+                    communication = result["levels"]["communication"]
+                    self.assertEqual(communication["status"], "unverified")
+                    self.assertIn(gap, communication["reports"][0]["scope"]["gaps"])
+                    self.assertNotIn("communication", result["passed"])
+                    self.assertEqual(result["levels"]["adapter"]["harnesses"]["codex"]["checks"]["session_identity"],
+                                     "unverified")
+            # The same evidence passes against the executable it names, and with every harness probed.
+            path = self.write(folder, "current.json", evidence_report(cases=codex_pair, participants=codex_only))
+            _, result = self.readiness("--harness", "codex", "--binary", "/opt/codex/bin/codex", "--evidence", path)
+            self.assertEqual(result["levels"]["communication"]["status"], "passed")
+            path = self.write(folder, "current.json", evidence_report())
+            _, result = self.readiness("--harness", "codex", "--evidence", path)
+            self.assertEqual(result["levels"]["communication"]["status"], "unverified")
+            self.assertIn("bob: harness_not_probed", result["levels"]["communication"]["reports"][0]["scope"]["gaps"])
+            # A stale report beside a current one never lets the level pass.
+            stale_path = self.write(folder, "stale.json", stale["stale source"][0])
+            _, result = self.readiness("--harness", "codex", "--harness", "claude", "--evidence", path,
+                                       "--evidence", stale_path)
+            self.assertEqual(result["levels"]["communication"]["status"], "unverified")
+            self.assertEqual(result["levels"]["adapter"]["harnesses"]["codex"]["checks"]["session_identity"],
+                             "passed")
+
 
 
 if __name__ == "__main__":
