@@ -178,16 +178,21 @@ class Store:
                 # We precreated the database, so persist its entry ourselves before
                 # delegating transaction durability to SQLite's FULL WAL syncs.
                 _sync_directory(Path(self.path).parent)
+            # Refuse unknown state before anything, including the journal mode,
+            # can rewrite it. There is no migration path yet. The probe is
+            # read-only: closing the last read-write connection would checkpoint
+            # a crashed newer broker's WAL into the main file and delete the
+            # sidecars. It still reads through the WAL, so uncheckpointed schema
+            # changes are seen (immutable=1 would miss them), and it keeps normal
+            # locking against a live writer (so not nolock=1).
+            self._check_schema(Path(self.path).as_uri() + "?mode=ro")
         self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
         try:
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA busy_timeout=10000")
-            # Refuse unknown state before anything, including the journal mode,
-            # can rewrite it. There is no migration path yet.
-            version = self._db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, self.SCHEMA_VERSION):
-                _fail("schema_version", f"Database schema {version} is unsupported")
+            # Also the only check for :memory:, and it catches a change since the probe.
+            self._check_version(self._db)
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             # SQLite inherits the main database's mode for newly created WAL/SHM.
@@ -211,6 +216,18 @@ class Store:
             # retained descriptors as well as the connection.
             self._close_connection()
             raise
+
+    def _check_schema(self, uri):
+        probe = sqlite3.connect(uri, timeout=10, isolation_level=None, uri=True)
+        try:
+            self._check_version(probe)
+        finally:
+            probe.close()
+
+    def _check_version(self, db):
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, self.SCHEMA_VERSION):
+            _fail("schema_version", f"Database schema {version} is unsupported")
 
     def _retain(self):
         # Only the first opener opens descriptors; later ones never close any.

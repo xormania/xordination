@@ -478,6 +478,28 @@ sys.stdin.buffer.read(1)
         # Not even the journal mode may change: a rollback needs the exact file.
         self.assertEqual(original, path.read_bytes())
 
+    def test_unknown_schema_with_uncheckpointed_wal_is_refused_without_checkpoint(self):
+        path = Path(self.directory.name) / "crashed-newer.sqlite"
+        # A newer broker crashed with its schema and data still only in the WAL.
+        subprocess.run([sys.executable, "-c", (
+            "import os, sqlite3, sys\n"
+            "db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+            "db.execute('PRAGMA journal_mode=WAL')\n"
+            "db.execute('PRAGMA wal_autocheckpoint=0')\n"
+            "db.executescript(\"CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');"
+            f"PRAGMA user_version={Store.SCHEMA_VERSION + 1};\")\n"
+            "os._exit(0)\n"), str(path)], check=True)
+        files = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+        self.assertTrue(all(file.exists() for file in files))
+        self.assertGreater(files[1].stat().st_size, 0)
+        before = [file.read_bytes() for file in files[:2]] + [files[2].stat().st_size]
+        self.assertCode("schema_version", Store, path)
+        # Refusal must not checkpoint the WAL into the main file or delete either sidecar.
+        self.assertTrue(all(file.exists() for file in files))
+        self.assertEqual([file.read_bytes() for file in files[:2]] + [files[2].stat().st_size], before)
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as newer:
+            self.assertEqual(newer.execute("SELECT value FROM future").fetchall(), [("kept",)])
+
     @unittest.skipUnless(os.name == "posix", "POSIX durable directory entries")
     def test_failed_directory_sync_rejects_fresh_state_before_sqlite_acceptance(self):
         path = Path(self.directory.name) / "new-ancestor" / "new-state" / "broker.sqlite"
