@@ -19,7 +19,8 @@ SOURCE_GROUPS = {
     "server.py": ("server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
-    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
+    # The benchmark runs a separate broker process through cli.serve.
+    "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }

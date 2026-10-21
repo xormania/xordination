@@ -51,7 +51,7 @@ AC-15 wire/event ordering needs dedicated correlated evidence where concurrency 
 - Establish a retained-state migration/rollback policy and test any schema migration before instructing users to upgrade an existing store.
 - Publish the native capability matrix and distinguish package, service, adapter, and communication readiness.
 - Complete a two-client message/reply smoke in each published deployment profile; exercise replacement and restart without silently replaying ambiguity.
-- Measure broker acceptance latency, queue burst behavior, bounded waits, memory/CPU use, and recovery separately from model response latency before setting budgets.
+- Measure broker acceptance latency, queue burst behavior, bounded waits, memory/CPU use, and recovery separately from model response latency before setting budgets. The [benchmark driver](testing.md#performance-measurements) reports these for a loopback broker process; budgets still need repeated-run variance and deployment-profile measurements.
 - Create Xorder resource entries only with verified bytes, exact identities, and matching config/context revisions. Preserve existing pins unless an operator intentionally updates them.
 
 ## Open evidence and owner decisions
