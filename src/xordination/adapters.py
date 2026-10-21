@@ -13,13 +13,14 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 
-from .rpc import RPC, RPCError
+from .rpc import FAMILY, RPC, RPCError
 
 
 class CapabilityError(ValueError):
@@ -223,8 +224,8 @@ class NativeAdapter:
     async def spawn(self, argv, *, jsonrpc=True, env=None):
         process = await asyncio.create_subprocess_exec(*argv, cwd=self.project, env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024)
-        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True)
+            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024, **FAMILY)
+        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True, family=True)
         async def stderr():
             while data := await process.stderr.readline():
                 sys.stderr.write(data.decode(errors="replace"))
@@ -724,7 +725,8 @@ def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=No
             return process.poll() if process.poll() is not None else 0
         finally:
             # Only this Popen is owned. No PID discovery, terminal sweeping or
-            # process-group termination of independently launched harnesses.
+            # process-group termination of independently launched harnesses;
+            # the interactive native stays in the terminal's foreground group.
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -758,5 +760,34 @@ def run_adapter(harness, endpoint, token, project, *, binary=None, model=None, r
         return run_claude(client, executable, project, model=model, reasoning=reasoning, prompt=prompt)
     adapter = (CodexAdapter if harness == "codex" else GrokAdapter)(client, executable, project,
                    model=model, reasoning=reasoning, prompt=prompt)
-    asyncio.run(adapter.run())
+    return asyncio.run(supervise(adapter))
+
+
+async def supervise(adapter):
+    """Run an adapter so hangup or termination still stops its native family.
+
+    The native's own session no longer receives the terminal's signals, so the
+    adapter turns them into one cancellation that runs its normal cleanup.
+    """
+    loop, task, received = asyncio.get_running_loop(), asyncio.current_task(), []
+    def stop(number):
+        if not received:
+            received.append(number)
+            task.cancel()
+    installed = []
+    for number in (getattr(signal, "SIGHUP", None), signal.SIGTERM):
+        try:
+            loop.add_signal_handler(number, stop, number)
+            installed.append(number)
+        except (NotImplementedError, RuntimeError, TypeError, ValueError):
+            pass  # Non-POSIX or non-main-thread loops keep default handling.
+    try:
+        await adapter.run()
+    except asyncio.CancelledError:
+        if not received:
+            raise
+        return 128 + int(received[0])
+    finally:
+        for number in installed:
+            loop.remove_signal_handler(number)
     return 0

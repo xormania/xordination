@@ -75,3 +75,31 @@ for line in sys.stdin:
         write({"id":row["id"],"result":{"turn":{"id":"finished-turn"}}})
 '''
 
+
+
+# A native whose detached grandchild holds an exclusive lock on argv[1] until
+# it exits; "stubborn" makes the grandchild ignore SIGTERM.
+FAMILY_NATIVE = r'''
+import json,os,subprocess,sys
+HOLDER="""
+import fcntl,os,signal,sys,time
+if sys.argv[2]=="stubborn":
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+lock=open(sys.argv[1],"a")
+fcntl.flock(lock,fcntl.LOCK_EX)
+print("held",flush=True)
+os.close(1)
+time.sleep(60)
+"""
+LAUNCHER="import subprocess,sys; subprocess.Popen([sys.executable,'-c',*sys.argv[1:]])"
+launcher=subprocess.Popen([sys.executable,"-c",LAUNCHER,HOLDER,*sys.argv[1:3]],
+                          stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+held=launcher.stdout.readline().decode().strip()
+launcher.stdout.close()
+launcher.wait()
+for line in sys.stdin:
+    row=json.loads(line)
+    if row.get("method")=="fixture/crash":
+        sys.exit(5)
+    print(json.dumps({"id":row["id"],"result":{"held":held}}),flush=True)
+'''
