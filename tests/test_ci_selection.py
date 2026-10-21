@@ -30,7 +30,8 @@ class SelectionTests(unittest.TestCase):
             (["docs/ci.md"], set(), True, False),
             (["AGENTS.md"], set(), True, False),
             (["README.md"], set(), True, True),
-            ([".dockerignore"], set(), False, True),
+            ([".dockerignore"], set(), True, True),
+            (["src/xordination/readiness.py"], {"cli", "end_to_end"}, True, True),
             (["MANIFEST.in"], set(selector.GROUPS), True, False),
             (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["tests/test_behavior.py"], {"behavior"}, True, False),
@@ -49,6 +50,8 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(result["package"], package)
                 self.assertEqual(result["image"], image)
                 self.assertEqual(result["benchmark"], "performance" in groups)
+                # The image smoke installs the package artifact for its cross-profile client.
+                self.assertTrue(result["package"] or not result["image"])
 
     def test_unknown_shared_and_ci_inputs_require_full(self):
         for path in ("unknown.txt", "tests/helpers.py", "tests/test_security.py", "src/xordination/new.py",

@@ -20,6 +20,8 @@ SOURCE_GROUPS = {
     "client.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     # Public dispatch and subprocess entry points are explicit dependency edges.
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
+    # Lazily imported by CLI dispatch; end_to_end runs it in a separate client process.
+    "readiness.py": ("cli", "end_to_end"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }
@@ -74,7 +76,8 @@ def classify_paths(paths):
             package = image = True
             reasons.append("Package/image input: " + path)
         elif path == ".dockerignore":
-            image = True
+            # The image smoke's cross-profile client installs the package artifact.
+            package = image = True
             reasons.append("Image context input: " + path)
         elif (path.startswith("docs/") and path.endswith(".md")) or path == "AGENTS.md":
             package = True

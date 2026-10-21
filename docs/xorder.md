@@ -67,7 +67,7 @@ Do not change global proxy settings to work around a local endpoint. A local bro
 | Adapter | Observed native identity and required installed capabilities or explicit gaps |
 | Communication | Fresh challenge reaches the intended native generation and yields a correlated receipt/reply |
 
-The last two may require paid/authenticated sessions. Run them through an authorized live verification workflow or when the operator requests live readiness. Offline install checks must not silently authenticate or launch models.
+`xordination readiness` reports these four levels separately from the installed package, the broker endpoint, selected harness probes and any supplied verification reports. It does not launch native sessions. The last two may require paid/authenticated sessions. Run them through an authorized live verification workflow or when the operator requests live readiness. Offline install checks must not silently authenticate or launch models.
 
 The complete native compatibility matrix belongs to Xordination's release evidence. An Xorder change needs only verification for the affected selected resource/profile, not a rebuild of every unrelated image or a repeat of every live pair.
 

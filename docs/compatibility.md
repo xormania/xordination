@@ -38,6 +38,8 @@ For three supported harness types, use one parameterized scenario for the six cr
 
 A report returns each level separately. Communication readiness does not establish application-work completion or useful model reasoning.
 
+`xordination readiness` produces this report without starting native sessions; see the [README](../README.md#readiness-report). Its adapter level combines the installed `doctor` capability with native session identity observed in supplied passing evidence. Its communication level is `unverified` unless a retained operator-native verification report is supplied.
+
 ## Protocol and lifecycle limits
 
 The initial stdio frontend negotiates **2025-06-18** and **2025-11-25**. The first is the revision used by the inspected PoC. Other protocol revision support requires explicit negotiation/conformance work; application-level space/participant/generation/attempt correctness must survive MCP reconnects and upgrades.
