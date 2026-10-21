@@ -18,6 +18,28 @@ from xordination.store import StoreError
 from native_fixtures import MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
 
+def crash_after_reading(script, methods, receipts):
+    """Wrap a native fixture so it records, then dies on, the first frame naming one of methods.
+
+    The frame has been written by the adapter and read by the native before the
+    transport is lost, so the outcome is genuinely ambiguous.
+    """
+    return """
+import json,os,sys
+class _CrashAfterReading:
+    def __init__(self, stream):
+        self.stream = stream
+    def __iter__(self):
+        for line in self.stream:
+            if json.loads(line).get("method") in %r:
+                with open(%r, "a") as receipts:
+                    receipts.write(line)
+                os._exit(5)
+            yield line
+sys.stdin = _CrashAfterReading(sys.stdin)
+""" % (tuple(methods), str(receipts)) + script
+
+
 class ClientFixture:
     endpoint = "http://127.0.0.1:8765"
     token = "fixture-token"
@@ -799,6 +821,9 @@ class AdapterConformance:
         self.assertFalse(any(operation == "retry" for operation, _ in self.client.calls))
         return status
 
+    def assert_native_read_delivery(self):
+        """Harnesses with a native process prove the lost delivery frame was read before the loss."""
+
     async def test_startup_failure_never_reports_readiness(self):
         queued = self.send("before-startup")
         outcome = await self.launch_failing_native()
@@ -819,6 +844,7 @@ class AdapterConformance:
         status = self.assert_not_replayed(queued, {"uncertain"})
         self.assertTrue(status["unresolved_uncertainty"])
         self.assertEqual(status["attempts"][0]["state"], "uncertain")
+        self.assert_native_read_delivery()
 
     async def test_stale_finish_is_not_replayed(self):
         queued = self.send("stale")
@@ -876,11 +902,19 @@ class NativeRPCConformance(AdapterConformance):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.runner = None
+        self.native_receipts = Path(self.temporary.name) / "native-receipts.jsonl"
+
+    def assert_native_read_delivery(self):
+        # The native itself read exactly the one delivery frame before its transport was lost.
+        frames = self.native_receipts.read_text().splitlines() if self.native_receipts.exists() else []
+        self.assertEqual([json.loads(frame)["method"] for frame in frames], self.submissions)
 
     async def launch(self):
         adapter = self.adapter = self.adapter_class(self.client, sys.executable, self.temporary.name,
                                                     poll_interval=.01)
         script = self.native_script or self.script
+        if self.break_on_submit:
+            script = crash_after_reading(script, self.submission_methods, self.native_receipts)
         async def spawn(argv, **kwargs):
             process = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", script,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -894,8 +928,6 @@ class NativeRPCConformance(AdapterConformance):
                     self.submissions.append(method)
                     if self.refuse_on_submit:
                         raise RPCError({"code": -32601, "message": "Native delivery method is not supported"})
-                    if self.break_on_submit:
-                        await adapter.rpc.notify("fixture/crash")  # The native exits as the submission is written.
                 return await native(method, params, **options)
             adapter.rpc.request = request
         adapter.spawn = spawn
