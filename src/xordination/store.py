@@ -335,10 +335,13 @@ class Store:
         return result
 
     def _retire(self, generation):
+        self._db.execute("UPDATE bindings SET active=0,stopped=COALESCE(stopped,?) WHERE generation=?", (time.time(), generation))
+        self._unsettle_claims(generation, "binding_retired")
+
+    def _unsettle_claims(self, generation, reason):
         now = time.time()
-        self._db.execute("UPDATE bindings SET active=0,stopped=COALESCE(stopped,?) WHERE generation=?", (now, generation))
         for attempt in self._db.execute("SELECT * FROM attempts WHERE generation=? AND state='claimed'", (generation,)).fetchall():
-            detail = _json({"reason": "binding_retired"})
+            detail = _json({"reason": reason})
             self._db.execute("UPDATE attempts SET state='uncertain',finished=?,detail=? WHERE id=?", (now, detail, attempt["id"]))
             self._db.execute("INSERT INTO attempt_evidence(attempt_id,generation,outcome,detail,observed,late) VALUES (?,?, 'uncertain',?,?,0)", (attempt["id"], generation, detail, now))
             self._db.execute("UPDATE messages SET state='uncertain' WHERE id=? AND current_attempt=? AND state='claimed'", (attempt["message_id"], attempt["id"]))
@@ -579,6 +582,8 @@ class Store:
         with self._transaction():
             principal = self._context(ctx)
             self._reconcile()
+            if principal["native_identity_source"] == "conflict":
+                _fail("replacement_required", "The native session changed; delivery is fenced until explicit participant replacement")
             message = self._db.execute("""SELECT m.* FROM messages m WHERE space=? AND recipient=? AND delivery_generation=?
                 AND state='queued' AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id)
                 ORDER BY sequence LIMIT 1""", (principal["space"], principal["participant"], principal["generation"])).fetchone()
@@ -610,7 +615,8 @@ class Store:
                 ("submitted", "uncertain"), ("uncertain", "submitted"))
             stale = (not principal["active"] or principal["generation"] != principal["current_generation"] or
                      message["delivery_generation"] != principal["generation"] or message["current_attempt"] != attempt_id or
-                     attempt["native_id"] != principal["native_id"] or not eligible_transition or
+                     attempt["native_id"] != principal["native_id"] or principal["native_identity_source"] == "conflict" or
+                     not eligible_transition or
                      message["state"] not in ("claimed", "submitted", "uncertain"))
             self._db.execute("INSERT INTO attempt_evidence(attempt_id,generation,outcome,detail,observed,late) VALUES (?,?,?,?,?,?)", (attempt_id, principal["generation"], outcome, detail_json, time.time(), int(stale)))
             if not stale:
@@ -625,20 +631,38 @@ class Store:
         _identifier(native_id, "native_id")
         if capabilities is not None and not isinstance(capabilities, dict):
             _fail("invalid_argument", "capabilities must be an object")
+        changed = False
         with self._transaction():
             principal = self._context(ctx)
             merged_capabilities = json.loads(principal["capabilities"])
-            if capabilities is not None:
-                merged_capabilities.update(capabilities)
-            capability_json = _json(merged_capabilities, label="capabilities")
             if principal["native_id"] is not None and principal["native_id"] != native_id:
-                _fail("replacement_required", "Changing native session identity requires explicit participant replacement")
-            # Setting an identity while an unbound submission is in flight would
-            # invalidate its captured identity. Require the caller to settle it.
-            if principal["native_id"] is None and self._db.execute("SELECT 1 FROM attempts WHERE generation=? AND state='claimed'", (principal["generation"],)).fetchone():
-                _fail("binding_busy", "Settle in-flight attempts before establishing native identity")
-            self._db.execute("UPDATE bindings SET native_id=?,native_identity_source='adapter_reported',capabilities=COALESCE(?,capabilities) WHERE generation=?", (native_id, capability_json, principal["generation"]))
-            return self._public_binding(self._db.execute("SELECT * FROM bindings WHERE generation=?", (principal["generation"],)).fetchone())
+                # The harness reports a different native conversation (for example
+                # Claude /clear) behind the same live transport. Claims from here on
+                # could reach it under the old identity, so fence delivery durably
+                # and visibly before refusing. Only explicit replacement clears it.
+                merged_capabilities["native_identity_conflict"] = {
+                    "observed_native_id": native_id, "observed_at": time.time(),
+                    "identity_source": (capabilities or {}).get("identity_source")}
+                self._db.execute("UPDATE bindings SET native_identity_source='conflict',capabilities=? WHERE generation=?",
+                                 (_json(merged_capabilities, label="capabilities"), principal["generation"]))
+                self._unsettle_claims(principal["generation"], "native_identity_changed")
+                changed = True
+            else:
+                if capabilities is not None:
+                    merged_capabilities.update(capabilities)
+                capability_json = _json(merged_capabilities, label="capabilities")
+                # Setting an identity while an unbound submission is in flight would
+                # invalidate its captured identity. Require the caller to settle it.
+                if principal["native_id"] is None and self._db.execute("SELECT 1 FROM attempts WHERE generation=? AND state='claimed'", (principal["generation"],)).fetchone():
+                    _fail("binding_busy", "Settle in-flight attempts before establishing native identity")
+                # A fenced binding stays fenced even if the original identity is reported again.
+                self._db.execute("""UPDATE bindings SET native_id=?,capabilities=?,native_identity_source=CASE
+                    WHEN native_identity_source='conflict' THEN 'conflict' ELSE 'adapter_reported' END WHERE generation=?""",
+                                 (native_id, capability_json, principal["generation"]))
+                result = self._public_binding(self._db.execute("SELECT * FROM bindings WHERE generation=?", (principal["generation"],)).fetchone())
+        if changed:
+            _fail("replacement_required", "The native session changed; delivery is fenced until explicit participant replacement")
+        return result
 
     def stop(self, ctx):
         with self._transaction():

@@ -503,6 +503,32 @@ sys.stdin.buffer.read(1)
         self.assertTrue(identity["capabilities"]["channel_registered"])
         self.assertEqual("supported", identity["capabilities"]["native_idle_delivery"])
 
+    def test_changed_native_session_fences_delivery_without_replacement(self):
+        claimed_message = self.send("claimed")
+        queued = self.send("queued")
+        attempt = self.store.claim(self.b)["attempt_id"]
+        self.assertCode("replacement_required", self.store.bind, self.b, "cleared-session",
+                        {"identity_source": "claude/SessionStart"})
+        # The fence and its in-flight uncertainty were committed despite the refusal.
+        identity = self.store.identity(self.b)
+        self.assertEqual(("session-b", "conflict", True), (identity["native_id"], identity["native_identity_source"], identity["active"]))
+        self.assertEqual({"observed_native_id": "cleared-session", "identity_source": "claude/SessionStart"},
+                         {key: value for key, value in identity["capabilities"]["native_identity_conflict"].items() if key != "observed_at"})
+        status = self.store.status(self.a, claimed_message["id"])
+        self.assertEqual(("uncertain", {"reason": "native_identity_changed"}), (status["state"], status["attempts"][0]["detail"]))
+        self.assertCode("stale_attempt", self.store.finish, self.b, claimed_message["id"], attempt, "submitted")
+        self.assertEqual("uncertain", self.store.status(self.a, claimed_message["id"])["state"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        self.store.retry(self.a, claimed_message["id"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        # Reporting the original identity again does not lift the fence.
+        self.assertEqual("conflict", self.store.bind(self.b, "session-b", {"channel_registered": True})["native_identity_source"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        self.assertEqual("queued", self.store.status(self.a, queued["id"])["state"])
+        replacement = self.store.authenticate(self.store.join("project", "b", harness="claude", replace=True)["token"])
+        self.assertEqual("unobserved", replacement["native_identity_source"])
+        self.assertIsNone(self.store.claim(replacement)["message"])
+
     def test_queue_backpressure_keeps_existing_acceptance_replay_available(self):
         self.store.MAX_PENDING = 2
         first = self.send("first")
