@@ -124,13 +124,20 @@ def evidence_report(status="pass", cases=(("alice", "bob", "pass"),), **override
 
 
 class FakeDistribution:
-    """An installation whose files are the imported package itself."""
+    """An installation whose files are the imported package itself plus a recorded console script."""
     version = xordination.__version__
 
-    def __init__(self, entry_value="xordination.cli:main"):
+    def __init__(self, entry_value="xordination.cli:main", script=None, recorded=True):
         self.entry_points = [importlib.metadata.EntryPoint("xordination", entry_value, "console_scripts")]
+        self.script = script
+        # RECORD lists console scripts relative to site-packages, e.g. ../../../bin/xordination.
+        self.files = ([importlib.metadata.PackagePath("xordination/__init__.py")]
+                      + ([importlib.metadata.PackagePath("../../../bin/xordination")] if script else [])
+                      if recorded else None)
 
     def locate_file(self, name):
+        if str(name).endswith("bin/xordination"):
+            return self.script
         return Path(xordination.__file__).resolve().parent.parent / name
 
 
@@ -162,14 +169,22 @@ class ReadinessReport(unittest.TestCase):
             self.assertFalse(state.exists())
 
     def test_package_level_requires_the_imported_module_to_be_the_installed_distribution(self):
-        which = patch("shutil.which", return_value="/opt/bin/xordination")
-        with tempfile.TemporaryDirectory() as folder, which:
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "env" / "bin" / "xordination"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\n")
+            installed = Path(folder) / "installed" / "bin" / "xordination"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("#!/bin/sh\n")
+            which = patch("shutil.which", return_value=str(script))
+            which.start()
+            self.addCleanup(which.stop)
             state = str(Path(folder) / "state.sqlite3")
-            with patch("importlib.metadata.distribution", return_value=FakeDistribution()):
+            with patch("importlib.metadata.distribution", return_value=FakeDistribution(script=script)):
                 _, result = self.readiness("--state", state)
                 package = result["levels"]["package"]
                 self.assertEqual(package["status"], "passed")
-                self.assertEqual(package["entry_point"], "/opt/bin/xordination")
+                self.assertEqual(package["entry_point"], str(script))
                 self.assertEqual(result["passed"], ["package"])
                 _, result = self.readiness("--state", str(Path(folder) / "missing" / "state.sqlite3"))
                 self.assertEqual(result["levels"]["package"]["checks"]["state_location"], "failed")
@@ -177,12 +192,25 @@ class ReadinessReport(unittest.TestCase):
                 self.assertEqual(result["levels"]["package"]["status"], "unverified")
             cases = {
                 "checkout without an installation": dict(side_effect=importlib.metadata.PackageNotFoundError),
-                "wrong entry point": dict(return_value=FakeDistribution("other:main")),
+                "wrong entry point": dict(return_value=FakeDistribution("other:main", script=script)),
+                # PATH finds another environment's executable while the import satisfies the declaration.
+                "foreign PATH command": dict(return_value=FakeDistribution(script=installed)),
+                "no console script recorded": dict(return_value=FakeDistribution()),
             }
             for label, options in cases.items():
                 with self.subTest(label), patch("importlib.metadata.distribution", **options):
                     _, result = self.readiness("--state", state)
                     self.assertEqual(result["levels"]["package"]["status"], "failed")
+                    self.assertNotIn("package", result["passed"])
+            with patch("importlib.metadata.distribution", return_value=FakeDistribution(script=installed)):
+                _, result = self.readiness("--state", state)
+            self.assertEqual(result["levels"]["package"]["checks"]["console_entry_point"], "failed")
+            self.assertIn("not this distribution's console script", result["levels"]["package"]["detail"])
+            # Without an installed-file record the PATH command cannot be attributed either way.
+            with patch("importlib.metadata.distribution", return_value=FakeDistribution(recorded=False)):
+                _, result = self.readiness("--state", state)
+            self.assertEqual(result["levels"]["package"]["checks"]["console_entry_point"], "unverified")
+            self.assertEqual(result["levels"]["package"]["status"], "unverified")
 
     def test_service_level_needs_an_authenticated_operation_not_only_a_listening_port(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -110,7 +110,7 @@ xordination readiness --state .xordination/broker.sqlite3 --endpoint http://127.
 
 | Level | Passes when | Otherwise |
 | --- | --- | --- |
-| `package` | The imported module is the installed distribution at the running version, the `xordination` console entry point is declared and on `PATH`, and the `--state` location is usable. The store is never created or opened | `unverified` without `--state`; `failed` for a checkout or a mismatched installation |
+| `package` | The imported module is the installed distribution at the running version, the `xordination` console entry point is declared and the command found on `PATH` is the console script that distribution recorded installing, and the `--state` location is usable. The store is never created or opened | `unverified` without `--state` or when the distribution records no installed files; `failed` for a checkout, a mismatched installation or another environment's `xordination` earlier on `PATH` |
 | `service` | Broker health and an authenticated read-only `identity` operation succeed | `unverified` with health alone (no token); `failed` when unreachable or rejected |
 | `adapter` | Each `--harness` has installed capability (`doctor`) and an observed native session identity from supplied passing evidence | `unverified` with no `--harness` or capability only; `failed` when unavailable or unsupported |
 | `communication` | Every `--evidence` report from `scripts/testing/live.py verify` passed | `unverified` without evidence; `failed` when a report failed |

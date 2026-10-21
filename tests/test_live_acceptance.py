@@ -1,6 +1,8 @@
 """Adversarial verifier tests use synthetic native events, never vendor sessions."""
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import queue
@@ -14,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from helpers import owned_broker
+from xordination.cli import main
 from xordination.client import Client
 from xordination.store import Store
 
@@ -122,6 +125,44 @@ class LiveAcceptanceTests(unittest.TestCase):
                 connection.execute("UPDATE messages SET body='mutation'")
         token = live.load(self.directory / "alice.connection.json")["token"]
         self.assertNotIn(token, json.dumps(report))
+
+    def readiness(self, *args):
+        observed = {name: {"harness": name, "status": "supported"} for name in ("codex", "claude", "grok")}
+        stdout = io.StringIO()
+        with patch("xordination.adapters.doctor", side_effect=lambda name, binary=None: observed[name]), \
+                patch.dict(os.environ, {"XORDINATION_TOKEN": ""}), contextlib.redirect_stdout(stdout):
+            self.assertEqual(main(["readiness", *args]), 0)
+        return json.loads(stdout.getvalue())["levels"]
+
+    def retained_verification(self):
+        before = set(self.directory.glob("report-*.json"))
+        report = live.verify(self.directory)
+        (path,) = set(self.directory.glob("report-*.json")) - before
+        return report, str(path)
+
+    def test_retained_verifier_reports_are_readiness_evidence(self):
+        # Producer -> consumer: the report live.py retains is what `xordination readiness` accepts.
+        failed, failed_path = self.retained_verification()
+        self.assertEqual(failed["status"], "fail")
+        for case in self.frozen["cases"]:
+            self.exercise(case)
+        passed, passed_path = self.retained_verification()
+        self.assertEqual(passed["status"], "pass")
+        levels = self.readiness("--harness", "codex", "--harness", "grok", "--evidence", passed_path)
+        communication = levels["communication"]
+        self.assertEqual(communication["status"], "passed")
+        (evidence,) = communication["reports"]
+        self.assertEqual((evidence["run_id"], evidence["source_sha256"]), (passed["run_id"], passed["source_sha256"]))
+        self.assertEqual(evidence["sha256"], hashlib.sha256(Path(passed_path).read_bytes()).hexdigest())
+        self.assertEqual({(pair["sender_harness"], pair["recipient_harness"], pair["status"])
+                          for pair in evidence["pairs"]}, {("codex", "grok", "pass"), ("grok", "codex", "pass")})
+        for name in ("codex", "grok"):
+            self.assertEqual(levels["adapter"]["harnesses"][name]["checks"]["session_identity"], "passed", name)
+        self.assertEqual(levels["adapter"]["status"], "passed")
+        levels = self.readiness("--harness", "codex", "--evidence", failed_path, "--evidence", passed_path)
+        self.assertEqual(levels["communication"]["status"], "failed")
+        self.assertEqual([pair["status"] for pair in levels["communication"]["reports"][0]["pairs"]],
+                         ["fail", "fail"])
 
     def test_broker_ack_and_reply_without_native_observation_cannot_pass(self):
         for case in self.frozen["cases"]:

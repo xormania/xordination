@@ -31,7 +31,7 @@ class SelectionTests(unittest.TestCase):
             (["AGENTS.md"], set(), True, False),
             (["README.md"], set(), True, True),
             ([".dockerignore"], set(), True, True),
-            (["src/xordination/readiness.py"], {"cli", "end_to_end"}, True, True),
+            (["src/xordination/readiness.py"], {"cli", "end_to_end", "live_acceptance"}, True, True),
             (["MANIFEST.in"], set(selector.GROUPS), True, False),
             (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["tests/test_behavior.py"], {"behavior"}, True, False),
@@ -52,6 +52,15 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(result["benchmark"], "performance" in groups)
                 # The image smoke installs the package artifact for its cross-profile client.
                 self.assertTrue(result["package"] or not result["image"])
+
+    def test_live_report_producer_and_readiness_consumer_select_their_integration_case(self):
+        # live.py writes the verifier report that `xordination readiness` parses; a schema
+        # change on either side must run the case that feeds one through the other.
+        producer = set(selector.classify_paths(["scripts/testing/live.py"])["groups"])
+        consumer = set(selector.classify_paths(["src/xordination/readiness.py"])["groups"])
+        self.assertIn("live_acceptance", producer & consumer)
+        self.assertIn("def test_retained_verifier_reports_are_readiness_evidence",
+                      (ROOT / "tests" / "test_live_acceptance.py").read_text())
 
     def test_unknown_shared_and_ci_inputs_require_full(self):
         for path in ("unknown.txt", "tests/helpers.py", "tests/test_security.py", "src/xordination/new.py",

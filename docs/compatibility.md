@@ -31,7 +31,7 @@ For three supported harness types, use one parameterized scenario for the six cr
 
 | Level | Passing evidence | Insufficient evidence |
 | --- | --- | --- |
-| Package | Installed correct version, console entry point, writable durable-state location | Checkout exists |
+| Package | Installed correct version, console entry point on `PATH` attributable to that installation, writable durable-state location | Checkout exists |
 | Service | Shared broker state and authenticated participant operation work | Listening port alone |
 | Adapter | Required installed native methods and session identity observations succeed | Executable/version label alone |
 | Communication | Intended native session handles a fresh exchange with correlated receipt/reply evidence | Queue insertion, MCP handshake, or channel registration alone |

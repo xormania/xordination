@@ -27,6 +27,25 @@ def summarize(checks):
     return "passed" if values == {"passed"} else "unverified"
 
 
+def _installed_by(distribution, command):
+    """Whether the PATH command is a script recorded in this distribution's installed files.
+
+    Another environment's or an unrelated `xordination` earlier on PATH would run
+    different code; None means the distribution keeps no file record to check.
+    """
+    files = distribution.files
+    if files is None:
+        return None
+    for item in files:
+        if item.name.lower() in ("xordination", "xordination.exe"):
+            try:
+                if os.path.samefile(distribution.locate_file(item), command):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def package_level(state=None):
     module = Path(__file__).resolve().with_name("__init__.py")
     result = {"version": __version__, "module": str(module.parent),
@@ -46,8 +65,17 @@ def package_level(state=None):
         checks["installed_identity"] = "passed" if distribution.version == __version__ else "failed"
         declared = any(point.group == "console_scripts" and point.name == "xordination"
                        and point.value == "xordination.cli:main" for point in distribution.entry_points)
-        result["entry_point"] = shutil.which("xordination")
-        checks["console_entry_point"] = "passed" if declared and result["entry_point"] else "failed"
+        command = result["entry_point"] = shutil.which("xordination")
+        owned = command and _installed_by(distribution, command)
+        if not declared or not command or owned is False:
+            checks["console_entry_point"] = "failed"
+            if command and owned is False:
+                result["detail"] = "The xordination command on PATH is not this distribution's console script"
+        elif owned is None:
+            checks["console_entry_point"] = "unverified"
+            result["detail"] = "The distribution records no installed files; the PATH command is unattributed"
+        else:
+            checks["console_entry_point"] = "passed"
     if state is None:
         checks["state_location"] = "unverified"
     else:
