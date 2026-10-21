@@ -6,6 +6,7 @@ from contextlib import closing
 import json
 import os
 import queue
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -511,6 +512,170 @@ sys.stdin.buffer.read(1)
         self.assertEqual(first["id"], self.send("first")["id"])
         self.store.ack(self.b, first["id"])
         self.assertTrue(self.send("third")["accepted"])
+
+    def test_sender_cancel_is_terminal_and_retains_uncertain_attempt_history(self):
+        message = self.send()
+        attempt = self.store.claim(self.b)
+        self.assertCode("in_flight", self.store.cancel, self.a, message["id"])
+        self.store.finish(self.b, message["id"], attempt["attempt_id"], "uncertain", {"reason": "write response lost"})
+        self.assertCode("forbidden", self.store.cancel, self.b, message["id"])
+        cancelled = self.store.cancel(self.a, message["id"], reason="superseded")
+        self.assertEqual("cancelled", cancelled["state"])
+        self.assertFalse(cancelled["idempotent_replay"])
+        self.assertEqual({"participant": "a", "generation": self.a["generation"], "previous_state": "uncertain",
+                          "reason": "superseded", "may_have_been_submitted": True},
+                         {k: v for k, v in cancelled["cancellation"].items() if k != "cancelled_at"})
+        self.assertTrue(self.store.cancel(self.a, message["id"])["idempotent_replay"])
+        self.store.close()
+        self.store = Store(self.path)
+        self.store.recover_claims()
+        status = self.store.status(self.a, message["id"])
+        self.assertEqual("cancelled", status["state"])
+        self.assertEqual("superseded", status["cancellation"]["reason"])
+        self.assertEqual([attempt["attempt_id"]], [row["id"] for row in status["attempts"]])
+        self.assertEqual("uncertain", status["attempts"][0]["state"])
+        self.assertCode("cancelled", self.store.retry, self.a, message["id"])
+        self.assertIsNone(self.store.claim(self.b)["message"])
+        replacement = self.store.authenticate(self.store.join("project", "b", replace=True)["token"])
+        self.assertCode("cancelled", self.store.recover, replacement, message["id"])
+
+    def test_cancel_refuses_received_submitted_and_expired_delivery(self):
+        queued = self.send("queued")
+        self.assertEqual("queued", self.store.cancel(self.a, queued["id"])["cancellation"]["previous_state"])
+        self.assertFalse(self.store.status(self.a, queued["id"])["cancellation"]["may_have_been_submitted"])
+        self.assertIsNone(self.store.claim(self.b)["message"])
+        received = self.send("received")
+        self.store.ack(self.b, received["id"])
+        self.assertCode("already_received", self.store.cancel, self.a, received["id"])
+        submitted = self.send("submitted")
+        attempt = self.store.claim(self.b)
+        self.store.finish(self.b, submitted["id"], attempt["attempt_id"], "submitted")
+        self.assertCode("already_submitted", self.store.cancel, self.a, submitted["id"])
+        expired = self.send("expired", expires_in=10)
+        with patch("xordination.store.time.time", return_value=time.time() + 11):
+            self.assertCode("expired", self.store.cancel, self.a, expired["id"])
+        self.assertCode("invalid_argument", self.store.cancel, self.a, submitted["id"], reason="")
+        for message in (received, submitted, expired):
+            self.assertIsNone(self.store.status(self.a, message["id"])["cancellation"])
+
+    def test_cancelled_messages_release_recipient_pending_capacity(self):
+        self.store.MAX_PENDING = 1
+        first = self.send("first")
+        self.assertCode("queue_full", self.send, "second")
+        self.store.cancel(self.a, first["id"])
+        self.assertTrue(self.send("second")["accepted"])
+
+    def test_definite_failure_records_whether_retry_is_safe(self):
+        message = self.send()
+        unknown = self.store.claim(self.b)
+        self.assertCode("invalid_argument", self.store.finish, self.b, message["id"], unknown["attempt_id"], "submitted", retry_safe=True)
+        self.assertCode("invalid_argument", self.store.finish, self.b, message["id"], unknown["attempt_id"], "failed", retry_safe="yes")
+        self.store.finish(self.b, message["id"], unknown["attempt_id"], "failed")
+        self.store.retry(self.a, message["id"])
+        safe = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], safe["attempt_id"], "failed", {"reason": "native_rejected"}, retry_safe=True)
+        self.store.retry(self.a, message["id"])
+        unsafe = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], unsafe["attempt_id"], "failed", retry_safe=False)
+        attempts = self.store.status(self.a, message["id"])["attempts"]
+        self.assertEqual([None, True, False], [attempt["retry_safe"] for attempt in attempts])
+
+    def test_schema_one_store_gains_retry_safety_without_changing_history(self):
+        message = self.send()
+        attempt = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], attempt["attempt_id"], "failed")
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as legacy:
+            legacy.execute("ALTER TABLE attempts DROP COLUMN retry_safe")
+            legacy.execute("DROP TABLE cancellations")
+            legacy.commit()
+        self.store = Store(self.path)
+        status = self.store.status(self.a, message["id"])
+        self.assertEqual(("failed", None), (status["attempts"][0]["state"], status["attempts"][0]["retry_safe"]))
+        self.assertIsNone(status["cancellation"])
+        self.assertEqual("cancelled", self.store.cancel(self.a, message["id"])["state"])
+
+    def test_receipts_distinguish_client_ack_native_insertion_and_native_ack(self):
+        message = self.send()
+        attempt = self.store.claim(self.b)
+        self.store.finish(self.b, message["id"], attempt["attempt_id"], "uncertain", {"reason": "response lost"})
+        self.assertCode("invalid_argument", self.store.observe, self.b, message["id"], attempt["attempt_id"], "client_ack", {"x": 1})
+        self.assertCode("invalid_argument", self.store.observe, self.b, message["id"], attempt["attempt_id"], "native_insertion", {})
+        self.assertCode("forbidden", self.store.observe, self.a, message["id"], attempt["attempt_id"], "native_insertion", {"x": 1})
+        inserted = self.store.observe(self.b, message["id"], attempt["attempt_id"], "native_insertion",
+                                      {"native_event": "user_message_item", "turn": "turn-1"})["receipt"]
+        self.assertEqual(("native_insertion", attempt["attempt_id"], "session-b"),
+                         (inserted["kind"], inserted["attempt_id"], inserted["native_id"]))
+        status = self.store.status(self.a, message["id"])
+        # A weaker observation never becomes an acknowledgement, and the
+        # earlier transport uncertainty is retained beside the new evidence.
+        self.assertEqual((True, False), (status["received"], status["acknowledged"]))
+        self.assertEqual(["native_insertion"], status["receipt_kinds"])
+        self.assertEqual("uncertain", status["attempts"][0]["state"])
+        self.assertTrue(status["uncertain"])
+        self.assertFalse(status["unresolved_uncertainty"])
+        self.assertEqual([message["id"]], [m["id"] for m in self.store.inbox(self.b, unacknowledged=True)["messages"]])
+        self.assertCode("already_received", self.store.retry, self.a, message["id"])
+        self.assertCode("already_received", self.store.cancel, self.a, message["id"])
+        self.store.observe(self.b, message["id"], attempt["attempt_id"], "native_ack", {"native_event": "agent_tool_call"})
+        acknowledged = self.store.ack(self.b, message["id"], attempt_id=attempt["attempt_id"])["receipt"]
+        self.assertEqual(("client_ack", attempt["attempt_id"]), (acknowledged["kind"], acknowledged["attempt_id"]))
+        status = self.store.status(self.a, message["id"])
+        self.assertTrue(status["acknowledged"])
+        self.assertEqual(["client_ack", "native_ack", "native_insertion"], status["receipt_kinds"])
+        self.assertEqual([], self.store.inbox(self.b, unacknowledged=True)["messages"])
+
+    def test_native_receipts_require_the_recipient_attempts_native_identity(self):
+        unbound = self.store.authenticate(self.store.join("project", "c")["token"])
+        message = self.store.send(self.a, "c", "question", "unbound")
+        attempt = self.store.claim(unbound)
+        self.assertCode("native_identity_required", self.store.observe, unbound, message["id"], attempt["attempt_id"],
+                        "native_insertion", {"native_event": "claimed"})
+        self.store.finish(unbound, message["id"], attempt["attempt_id"], "failed", retry_safe=True)
+        bound = self.store.authenticate(self.store.join("project", "c", replace=True, native_id="session-c")["token"])
+        self.assertTrue(self.store.recover(bound, message["id"])["recovered"])
+        # The recovered generation cannot attribute evidence to the old attempt.
+        self.assertCode("forbidden", self.store.ack, bound, message["id"], attempt_id=attempt["attempt_id"])
+        self.assertCode("forbidden", self.store.observe, bound, message["id"], attempt["attempt_id"],
+                        "native_insertion", {"native_event": "late"})
+        other = self.send("other")
+        foreign = self.store.claim(self.b)
+        self.assertCode("forbidden", self.store.ack, self.b, other["id"], attempt_id=attempt["attempt_id"])
+        self.store.finish(self.b, other["id"], foreign["attempt_id"], "failed")
+        self.assertCode("attempt_failed", self.store.observe, self.b, other["id"], foreign["attempt_id"],
+                        "native_insertion", {"native_event": "late"})
+        self.assertEqual([], self.store.status(self.a, other["id"])["receipts"])
+
+    def test_operator_space_view_counts_pending_uncertain_and_waiting_states(self):
+        queued = self.send("queued")
+        uncertain = self.send("uncertain")
+        received = self.send("received")
+        cancelled = self.send("cancelled")
+        self.store.cancel(self.a, cancelled["id"])
+        self.store.ack(self.b, received["id"])
+        first = self.store.claim(self.b)
+        self.assertEqual(queued["id"], first["message"]["id"])
+        self.store.finish(self.b, queued["id"], first["attempt_id"], "submitted")
+        second = self.store.claim(self.b)
+        self.store.finish(self.b, uncertain["id"], second["attempt_id"], "uncertain")
+        retained = self.store.send(self.b, "a", "for the old generation", "old")
+        self.store.join("project", "a", replace=True, native_id="thread-new")
+        view = self.store.space_view("project")
+        self.assertFalse(view["native_communication_verified"])
+        a, b = view["participants"]
+        self.assertEqual(["a", "b"], [a["participant"], b["participant"]])
+        self.assertEqual({self.a["generation"]: False, a["generation"]: True},
+                         {g["generation"]: g["active"] for g in a["generations"]})
+        self.assertEqual({"queued": 1}, a["states"])
+        self.assertEqual(1, a["waiting"]["recovery"])
+        self.assertEqual({"submitted": 1, "uncertain": 1, "queued": 1, "cancelled": 1}, b["states"])
+        self.assertEqual((2, 1), (b["pending"], b["uncertain"]))
+        self.assertEqual({"delivery": 0, "in_flight": 0, "receipt": 1, "explicit_retry": 1, "recovery": 0}, b["waiting"])
+        self.assertEqual((3, 1), (view["pending"], view["uncertain"]))
+        self.assertEqual({"delivery": 0, "in_flight": 0, "receipt": 1, "explicit_retry": 1, "recovery": 1}, view["waiting"])
+        self.assertNotIn(retained["body"], json.dumps(view))
+        self.assertNotIn("token", json.dumps(view))
+        self.assertCode("unknown_space", self.store.space_view, "missing")
 
 
 if __name__ == "__main__":

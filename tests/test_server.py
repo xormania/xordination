@@ -182,6 +182,28 @@ class BrokerIntegration(unittest.TestCase):
             redirect.server_close()
             thread.join(timeout=2)
 
+    def test_cancel_and_native_receipt_operations_are_authenticated_broker_calls(self):
+        cancelled = self.one.call("send", to="two", body="no longer needed", key="cancel-1")
+        with self.assertRaises(BrokerError) as caught:
+            self.two.call("cancel", message_id=cancelled["id"])
+        self.assertEqual("forbidden", caught.exception.code)
+        self.assertEqual("cancelled", self.one.call("cancel", message_id=cancelled["id"], reason="superseded")["state"])
+        self.assertEqual("superseded", self.one.call("status", message_id=cancelled["id"])["cancellation"]["reason"])
+        observed = self.one.call("send", to="two", body="observe me", key="observe-1")
+        self.two.call("bind", native_id="native-two")
+        attempt = self.two.call("claim")
+        self.assertEqual(observed["id"], attempt["message"]["id"])
+        self.two.call("finish", message_id=observed["id"], attempt_id=attempt["attempt_id"], outcome="submitted")
+        receipt = self.two.call("observe", message_id=observed["id"], attempt_id=attempt["attempt_id"],
+                                kind="native_insertion", evidence={"native_event": "user_message"})["receipt"]
+        self.assertEqual(attempt["attempt_id"], receipt["attempt_id"])
+        status = self.one.call("status", message_id=observed["id"])
+        self.assertEqual((True, False), (status["received"], status["acknowledged"]))
+        # The operator summary is local only; participant credentials cannot reach it.
+        with self.assertRaises(BrokerError) as caught:
+            self.one.call("space_view", space="project")
+        self.assertEqual("invalid_request", caught.exception.code)
+
     def test_second_broker_cannot_recover_first_brokers_claim(self):
         sent = self.one.call("send", to="two", body="work", key="lease")
         self.two.call("claim")

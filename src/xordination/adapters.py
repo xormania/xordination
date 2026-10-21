@@ -236,12 +236,13 @@ class NativeAdapter:
         if actual is not None and self.session is not None and actual != self.session:
             raise ValueError("Native session identity changed; replacement requires a new broker generation")
 
-    async def finish(self, message, outcome, transport, **details):
+    async def finish(self, message, outcome, transport, retry_safe=None, **details):
         attempt_id = message["attempt_id"]
         # Remove only after durable finish returns. A network failure leaves a
         # recoverable claim, never an implicit second native submission.
-        await self.call("finish", message_id=message["id"], attempt_id=attempt_id,
-                        outcome=outcome, detail={"native_id": self.session, "transport": transport, **details})
+        settle = {} if retry_safe is None else {"retry_safe": retry_safe}
+        await self.call("finish", message_id=message["id"], attempt_id=attempt_id, outcome=outcome,
+                        detail={"native_id": self.session, "transport": transport, **details}, **settle)
         self.pending_attempts.pop(attempt_id, None)
 
     async def refresh_delivery_state(self):
@@ -294,7 +295,10 @@ class NativeAdapter:
 
     async def _failed_delivery(self, message, error, transport):
         outcome = "failed" if isinstance(error, RPCError) and error.code in {-32601, -32602} else "uncertain"
-        await self.finish(message, outcome, transport, error=str(error)[:500],
+        # The native interface rejected the request before acting on it, so a
+        # later explicit retry cannot duplicate this attempt's content.
+        await self.finish(message, outcome, transport, retry_safe=True if outcome == "failed" else None,
+                          error=str(error)[:500],
                           evidence="native rejection" if outcome == "failed" else "transport completion unknown")
         # Capability failures never silently fall back to a new conversation.
         raise error

@@ -89,6 +89,9 @@ def parser():
     join.add_argument("--harness", choices=("external", "codex", "claude", "grok"), default="external")
     join.add_argument("--replace", action="store_true")
     join.add_argument("--output", help="Create a private connection descriptor; refuse overwrite")
+    view = sub.add_parser("view", help="Summarize a space's participants, generations and pending delivery")
+    view.add_argument("--state", required=True)
+    view.add_argument("--space", required=True)
     for name in ("stdio", "adapter", "call", "claude-hook"):
         command = sub.add_parser(name)
         if name == "adapter":
@@ -104,7 +107,8 @@ def parser():
             command.add_argument("--channel", action="store_true")
         elif name == "call":
             command.add_argument("operation", choices=("peers", "send", "inbox", "wait", "ack",
-                                 "status", "retry", "claim", "finish", "recover", "stop"))
+                                 "status", "retry", "cancel", "claim", "finish", "observe",
+                                 "recover", "stop"))
             command.add_argument("--params", default="{}", help="JSON operation parameters")
         command.add_argument("--endpoint", default="http://127.0.0.1:8765")
         command.add_argument("--token-env", default="XORDINATION_TOKEN")
@@ -138,11 +142,15 @@ def serve(store, host, port, ready=None):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if args.command in {"serve", "space", "join"}:
+        if args.command in {"serve", "space", "join", "view"}:
             from .store import Store
+            if args.command == "view" and not Path(args.state).expanduser().is_file():
+                raise ValueError("No broker state exists at " + args.state)
             store = Store(args.state)
             try:
-                if args.command == "space":
+                if args.command == "view":
+                    write_json(store.space_view(args.space))
+                elif args.command == "space":
                     write_json(store.create_space(args.space))
                 elif args.command == "join":
                     issue_binding(store, args)

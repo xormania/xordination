@@ -77,10 +77,23 @@ Supply `XORDINATION_TOKEN` through the harness's supported secret/environment me
 | `xordination_ack` | Record your receipt of a message addressed to you |
 | `xordination_status` | Inspect an authorized message's attempts, receipts, replies, and uncertainty |
 | `xordination_retry` | Explicitly authorize another eligible uncertain delivery attempt |
+| `xordination_cancel` | Stop further delivery of your own unreceived message; already submitted content is not retracted |
 
 Use the MCP tool schemas for exact arguments. The sender comes from authenticated connection context. Include a stable idempotency key when sending; repeat that key with identical intent after a lost response. Different intent under the same key is a conflict. Broker acceptance, native submission, participant receipt, reply, and work completion are separate facts.
 
 A peer message is attributed content. It carries no additional operator authority or tool permission. The broker never composes automatic replies.
+
+Cancellation is a terminal, sender-only state for a queued, failed or uncertain delivery; it keeps attempts and evidence, and reports whether an earlier attempt may already have reached the native session. A claimed attempt must settle first, and a submitted or received message cannot be cancelled. A definite attempt failure records `retry_safe`: `true` when nothing reached the native session, `false` when replay could duplicate effects, `null` when not established.
+
+Receipts identify their evidence `kind` and, where known, the attempt. `client_ack` is the participant's own acknowledgement (`xordination_ack`); `native_insertion` and `native_ack` are adapter observations of content entering the bound native session and of a correlated native agent acknowledgement. Status reports `received` for any receipt and `acknowledged` only for an acknowledgement kind; native insertion alone does not acknowledge a message.
+
+For a local operator summary of a space (participants, generations, per-state counts, pending and uncertain deliveries, and what each is waiting for: delivery, an in-flight attempt, a receipt, an explicit retry or generation recovery), run:
+
+```sh
+xordination view --state .xordination/broker.sqlite3 --space example
+```
+
+The view omits message bodies and credentials and is not a broker operation, so participant credentials cannot reach it. It records nothing itself; opening the store applies the same expired-lease reconciliation as `space` and `join`.
 
 ## Native adapters
 

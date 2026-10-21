@@ -74,8 +74,8 @@ class MCPTests(unittest.TestCase):
         self.assertNotIn("experimental", result["capabilities"])
         self.assertEqual(INSTRUCTIONS, result["instructions"])
         names = [tool["name"] for tool in self.server.dispatch("tools/list", {}, self.cancel)["tools"]]
-        self.assertEqual(["xordination_" + name for name in ("peers", "send", "inbox", "wait", "ack", "status", "retry")], names)
-        self.assertEqual(7, len(TOOLS))
+        self.assertEqual(["xordination_" + name for name in ("peers", "send", "inbox", "wait", "ack", "status", "retry", "cancel")], names)
+        self.assertEqual(8, len(TOOLS))
         with self.assertRaises(ProtocolError):
             self.initialize()
 
@@ -90,6 +90,8 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"], json.loads(result["content"][0]["text"]))
         self.call("xordination_inbox", {"cursor": "signed.cursor", "limit": 10, "unacknowledged": True})
         self.assertEqual("signed.cursor", self.client.calls[-1][1]["cursor"])
+        self.call("xordination_cancel", {"message_id": "message-a", "reason": "superseded"})
+        self.assertEqual(("cancel", {"message_id": "message-a", "reason": "superseded"}), self.client.calls[-1])
 
     def test_schema_errors_never_reach_broker(self):
         self.initialize()
@@ -103,6 +105,9 @@ class MCPTests(unittest.TestCase):
             ("xordination_wait", {"timeout": 31}),
             ("xordination_wait", {"timeout": float("nan")}),
             ("xordination_ack", {"message_id": ""}),
+            ("xordination_ack", {"message_id": "m", "attempt_id": "a"}),
+            ("xordination_cancel", {"reason": "superseded"}),
+            ("xordination_cancel", {"message_id": "m", "reason": ""}),
             ("xordination_missing", {}),
         ]
         for name, args in invalid:
