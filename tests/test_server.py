@@ -226,6 +226,31 @@ class BrokerIntegration(unittest.TestCase):
                                                 "arguments": {"cursor": results[-1]["cursor"], "timeout": 1}}, cancel)
         self.assertEqual([later["id"]], [m["id"] for m in waited["structuredContent"]["messages"]])
 
+    def test_replacement_after_dispatch_authentication_is_fenced_by_store_operation(self):
+        sent = self.one.call("send", to="two", body="work", key="queued")
+        original = self.store.authenticate
+        replacements = []
+
+        def authenticate_then_replace(token, allow_retired=False):
+            # The HTTP layer has authenticated the old generation; the participant
+            # is replaced before the store operation runs.
+            ctx = original(token, allow_retired=allow_retired)
+            replacements.append(self.store.join("project", "two", replace=True))
+            return ctx
+
+        for operation, params in (("send", {"to": "one", "body": "late", "key": "late"}),
+                                  ("claim", {}), ("ack", {"message_id": sent["id"]}),
+                                  ("inbox", {})):
+            with self.subTest(operation=operation), \
+                    patch.object(self.store, "authenticate", side_effect=authenticate_then_replace):
+                with self.assertRaises(BrokerError) as caught:
+                    self.two.call(operation, **params)
+                self.assertEqual("stale_generation", caught.exception.code)
+            self.two = Client(self.endpoint, replacements[-1]["token"], timeout=5)
+        status = self.one.call("status", message_id=sent["id"])
+        self.assertEqual(("queued", [], []), (status["state"], status["attempts"], status["receipts"]))
+        self.assertEqual([], self.one.call("inbox")["messages"])
+
     def test_second_broker_cannot_recover_first_brokers_claim(self):
         sent = self.one.call("send", to="two", body="work", key="lease")
         self.two.call("claim")

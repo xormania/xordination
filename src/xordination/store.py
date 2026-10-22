@@ -118,19 +118,31 @@ def _private_state_file(path, *, create=False, retain=False):
         _fail("unsafe_state", "State files must be privately accessible regular files owned by the current user")
     keep = False
     try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
-            _fail("unsafe_state", "State files must be regular files owned by the current user")
-        os.fchmod(descriptor, 0o600)
-        os.fsync(descriptor)
-        current = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            _fail("unsafe_state", "State file identity changed during private initialization")
+        _private_descriptor(descriptor, path)
         keep = retain
         return descriptor if retain else None
     finally:
         if not keep:
             os.close(descriptor)
+
+
+def _private_descriptor(descriptor, path):
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
+        _fail("unsafe_state", "State files must be regular files owned by the current user")
+    os.fchmod(descriptor, 0o600)
+    os.fsync(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        _fail("unsafe_state", "State file identity changed during private initialization")
+
+
+# POSIX locks belong to the process, and closing any descriptor for a file
+# drops all of them. Stores sharing a state path in this process therefore
+# share one set of retained descriptors: a later open rechecks those instead of
+# opening its own, and only the last close releases them.
+_OPEN_STATE = {}
+_OPEN_STATE_LOCK = threading.RLock()
 
 
 class Store:
@@ -146,52 +158,94 @@ class Store:
 
     def __init__(self, path, *, recover_claims=False):
         self.path = str(path)
+        self._lock = threading.RLock()
+        self._shared = None
+        with _OPEN_STATE_LOCK:
+            self._open(recover_claims)
+
+    def _open(self, recover_claims):
+        shared = None
         if self.path != ":memory:":
             self.path = str(Path(self.path).expanduser().resolve())
-            # Newly created state directories are private; existing directories
-            # may contain unrelated operator files and are never chmod'ed here.
-            _private_state_parent(Path(self.path).parent)
-            _private_state_file(self.path, create=True)
-            _private_state_file(self.path + "-wal")
-            _private_state_file(self.path + "-shm")
-            # We precreated the database, so persist its entry ourselves before
-            # delegating transaction durability to SQLite's FULL WAL syncs.
-            _sync_directory(Path(self.path).parent)
-        self._lock = threading.RLock()
+            shared = _OPEN_STATE.get(self.path)
+            if shared is not None:
+                # Another Store here already holds SQLite's locks on these files.
+                for suffix, descriptor in shared["descriptors"]:
+                    _private_descriptor(descriptor, self.path + suffix)
+            else:
+                # Newly created state directories are private; existing directories
+                # may contain unrelated operator files and are never chmod'ed here.
+                _private_state_parent(Path(self.path).parent)
+                _private_state_file(self.path, create=True)
+                _private_state_file(self.path + "-wal")
+                _private_state_file(self.path + "-shm")
+                # We precreated the database, so persist its entry ourselves before
+                # delegating transaction durability to SQLite's FULL WAL syncs.
+                _sync_directory(Path(self.path).parent)
+            # Refuse unknown state before anything, including the journal mode,
+            # can rewrite it. There is no migration path yet. The probe is
+            # read-only: closing the last read-write connection would checkpoint
+            # a crashed newer broker's WAL into the main file and delete the
+            # sidecars. It still reads through the WAL, so uncheckpointed schema
+            # changes are seen (immutable=1 would miss them), and it keeps normal
+            # locking against a live writer (so not nolock=1).
+            self._check_schema(Path(self.path).as_uri() + "?mode=ro")
         self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.execute("PRAGMA busy_timeout=10000")
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        # SQLite inherits the main database's mode for newly created WAL/SHM.
-        # Existing files are deliberately upgraded before opening, then checked
-        # again once SQLite has initialized its journal. SQLite now holds the
-        # WAL-index lock that tells other processes this database is in use;
-        # closing a checked descriptor would drop it, letting another process
-        # reset the WAL index under this mapping. Keep them until close().
-        self._retained = []
-        if self.path != ":memory:":
-            try:
-                for suffix in ("-wal", "-shm"):
-                    descriptor = _private_state_file(self.path + suffix, retain=True)
-                    if descriptor is not None:
-                        self._retained.append(descriptor)
-            except BaseException:
-                self._close_connection()
-                raise
         try:
+            self._db.row_factory = sqlite3.Row
+            self._db.execute("PRAGMA foreign_keys=ON")
+            self._db.execute("PRAGMA busy_timeout=10000")
+            # Also the only check for :memory:, and it catches a change since the probe.
+            self._check_version(self._db)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=FULL")
+            # SQLite inherits the main database's mode for newly created WAL/SHM.
+            # Existing files are deliberately upgraded before opening, then checked
+            # again once SQLite has initialized its journal. SQLite now holds the
+            # WAL-index lock that tells other processes this database is in use;
+            # closing a checked descriptor would drop it, letting another process
+            # reset the WAL index under this mapping. Keep them until the last
+            # Store sharing them closes.
+            if self.path != ":memory:":
+                if shared is None:
+                    shared = _OPEN_STATE[self.path] = {"users": 0, "descriptors": []}
+                shared["users"] += 1
+                self._shared = shared
+                self._retain()
             self._initialize(recover_claims)
+            # A fresh database creates its WAL files only on first use.
+            self._retain()
         except BaseException:
             # Any later failure, such as a locked database, must release the
             # retained descriptors as well as the connection.
             self._close_connection()
             raise
 
-    def _initialize(self, recover_claims):
-        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+    def _check_schema(self, uri):
+        probe = sqlite3.connect(uri, timeout=10, isolation_level=None, uri=True)
+        try:
+            self._check_version(probe)
+        finally:
+            probe.close()
+
+    def _check_version(self, db):
+        version = db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, self.SCHEMA_VERSION):
             _fail("schema_version", f"Database schema {version} is unsupported")
+
+    def _retain(self):
+        # Only the first opener opens descriptors; later ones never close any.
+        shared = self._shared
+        if shared is None or shared["users"] != 1:
+            return
+        retained = {suffix for suffix, _descriptor in shared["descriptors"]}
+        for suffix in ("", "-wal", "-shm"):
+            if suffix not in retained:
+                descriptor = _private_state_file(self.path + suffix, retain=True)
+                if descriptor is not None:
+                    shared["descriptors"].append((suffix, descriptor))
+
+    def _initialize(self, recover_claims):
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS spaces (name TEXT PRIMARY KEY, created REAL NOT NULL);
@@ -259,8 +313,17 @@ class Store:
     def _close_connection(self):
         # Close SQLite first: its locks must not outlive the descriptors that guard them.
         self._db.close()
-        while self._retained:
-            os.close(self._retained.pop())
+        shared, self._shared = self._shared, None
+        if shared is None:
+            return
+        with _OPEN_STATE_LOCK:
+            shared["users"] -= 1
+            if shared["users"]:
+                return
+            if _OPEN_STATE.get(self.path) is shared:
+                del _OPEN_STATE[self.path]
+            while shared["descriptors"]:
+                os.close(shared["descriptors"].pop()[1])
 
     def close(self):
         with self._lock:
@@ -506,22 +569,22 @@ class Store:
             principal = self._context(ctx)
             self._reconcile()
             sequence, resync = self._read_cursor(cursor, principal)
-            query = "SELECT m.* FROM messages m WHERE space=? AND recipient=? AND delivery_generation=? AND sequence>?"
-            arguments = (principal["space"], principal["participant"], principal["generation"], sequence)
-            if unacknowledged:
-                # Native insertion alone is not the recipient's acknowledgement.
-                query += " AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id AND r.kind IN (?,?))"
-                arguments += self.ACK_KINDS
+            # One fixed filter serves both queries; the flag selects the
+            # unacknowledged view. Native insertion alone is not the
+            # recipient's acknowledgement.
+            visible = """FROM messages m WHERE space=? AND recipient=? AND delivery_generation=? AND sequence>?
+                AND (?=0 OR NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id AND r.kind IN (?,?)))"""
+            arguments = (principal["space"], principal["participant"], principal["generation"], sequence, int(unacknowledged), *self.ACK_KINDS)
             # Cancellation stops delivery, so a cancelled body never reaches
             # the recipient through inbox or wait. The state is terminal.
-            rows = self._db.execute(query + " AND m.state!='cancelled' ORDER BY sequence LIMIT ?", (*arguments, limit + 1)).fetchall()
+            rows = self._db.execute(f"SELECT m.* {visible} AND m.state!='cancelled' ORDER BY sequence LIMIT ?", (*arguments, limit + 1)).fetchall()
             page = rows[:limit]
             has_more = len(rows) > limit
             position = page[-1]["sequence"] if page else sequence
             if not has_more:
                 # Advance past trailing cancelled rows so the cursor reflects
                 # everything already disposed of.
-                skipped = self._db.execute("SELECT MAX(sequence) FROM (" + query + " AND m.state='cancelled')", arguments).fetchone()[0]
+                skipped = self._db.execute(f"SELECT MAX(m.sequence) {visible} AND m.state='cancelled'", arguments).fetchone()[0]
                 position = max(position, skipped or 0)
             following = self._cursor(principal, position)
             return {"messages": [self._message(row) for row in page], "cursor": following, "next_cursor": following,
@@ -594,25 +657,55 @@ class Store:
                 "kind": row["kind"], "attempt_id": row["attempt_id"], "native_id": row["native_id"],
                 "evidence": json.loads(row["evidence"]) if row["evidence"] else None, "observed_at": row["observed"]}
 
-    def status(self, ctx, message_id):
+    def status(self, ctx, message_id, limit=None):
+        """Report delivery history; ``limit`` keeps only the newest entries of each list.
+
+        A limited report adds each list's total and ``truncated``. Uncertainty
+        always reflects the complete history, including omitted entries.
+        """
+        if limit is not None and (type(limit) is not int or limit < 1 or limit > self.MAX_PAGE_SIZE):
+            _fail("limit_exceeded", f"limit must be between 1 and {self.MAX_PAGE_SIZE}")
         with self._transaction():
             principal = self._context(ctx)
             self._reconcile()
             message = self._get_message(message_id, principal)
             result = self._message(message)
-            result["attempts"] = [self._attempt(row) for row in self._db.execute("SELECT * FROM attempts WHERE message_id=? ORDER BY claimed,id", (message_id,))]
+            totals = {}
+
+            def rows(name, query, arguments, order):
+                if limit is None:
+                    return self._db.execute(f"SELECT * {query} ORDER BY {order}", arguments).fetchall()
+                totals[name] = self._db.execute(f"SELECT COUNT(*) {query}", arguments).fetchone()[0]
+                newest = ", ".join(column + " DESC" for column in order.split(","))
+                selected = self._db.execute(f"SELECT * {query} ORDER BY {newest} LIMIT ?", (*arguments, limit)).fetchall()
+                return selected[::-1]
+
+            result["attempts"] = [self._attempt(row) for row in rows("attempts", "FROM attempts WHERE message_id=?", (message_id,), "claimed,id")]
             for attempt in result["attempts"]:
                 attempt["evidence"] = [{"outcome": row["outcome"], "detail": json.loads(row["detail"]) if row["detail"] else None,
                                         "generation": row["generation"], "observed_at": row["observed"], "late": bool(row["late"])}
-                                       for row in self._db.execute("SELECT * FROM attempt_evidence WHERE attempt_id=? ORDER BY sequence", (attempt["id"],))]
-            result["receipts"] = [self._receipt(row) for row in self._db.execute("SELECT * FROM receipts WHERE message_id=? ORDER BY observed,id", (message_id,))]
-            result["replies"] = [self._message(row) for row in self._db.execute("SELECT * FROM messages WHERE reply_to=? ORDER BY sequence", (message_id,)) if self._visible(row, principal)]
-            result["receipt_kinds"] = sorted({receipt["kind"] for receipt in result["receipts"]})
-            result["recoveries"] = [dict(row) for row in self._db.execute("SELECT * FROM recoveries WHERE message_id=? ORDER BY sequence", (message_id,))]
+                                       for row in rows("evidence", "FROM attempt_evidence WHERE attempt_id=?", (attempt["id"],), "sequence")]
+                if limit is not None:
+                    attempt["evidence_total"] = totals.pop("evidence")
+            result["receipts"] = [self._receipt(row) for row in rows("receipts", "FROM receipts WHERE message_id=?", (message_id,), "observed,id")]
+            # The same visibility rule as _visible(), applied before limiting.
+            result["replies"] = [self._message(row) for row in rows("replies", """FROM messages WHERE reply_to=? AND space=?
+                AND (sender=? OR (recipient=? AND delivery_generation=?))""", (message_id, principal["space"], principal["participant"],
+                principal["participant"], principal["generation"]), "sequence")]
+            # Kinds cover every receipt, including any a limit omits.
+            result["receipt_kinds"] = [row[0] for row in self._db.execute(
+                "SELECT DISTINCT kind FROM receipts WHERE message_id=? ORDER BY kind", (message_id,))]
+            result["recoveries"] = [dict(row) for row in rows("recoveries", "FROM recoveries WHERE message_id=?", (message_id,), "sequence")]
             result["cancellation"] = self._cancellation(message_id)
-            result["uncertain"] = message["state"] == "uncertain" or any(attempt["state"] == "uncertain" or
-                    any(event["outcome"] == "uncertain" for event in attempt["evidence"]) for attempt in result["attempts"])
+            result["uncertain"] = message["state"] == "uncertain" or self._db.execute("""SELECT EXISTS(SELECT 1 FROM attempts a
+                WHERE a.message_id=? AND (a.state='uncertain' OR EXISTS(SELECT 1 FROM attempt_evidence e
+                WHERE e.attempt_id=a.id AND e.outcome='uncertain')))""", (message_id,)).fetchone()[0] == 1
             result["unresolved_uncertainty"] = message["state"] == "uncertain" and not result["received"]
+            if limit is not None:
+                result["limit"] = limit
+                result["totals"] = totals
+                result["truncated"] = any(totals[name] > len(result[name]) for name in totals) or any(
+                    attempt["evidence_total"] > len(attempt["evidence"]) for attempt in result["attempts"])
             return result
 
     @staticmethod

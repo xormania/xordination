@@ -33,22 +33,22 @@ A subprocess must inherit the startup environment and use ordinary Python startu
 
 ## Measured full-suite baseline
 
-The complete local baseline used Python 3.12.14 and Coverage.py 7.16.2. All 75 tests passed through the shared full-suite runner: 68 product contract tests and seven CI-selection tests. The unittest run took 6.064 seconds; total child-process duration was 6.556 seconds. Four product processes contributed data, including three actual CLI processes. CI-selection test source remains excluded from the product denominator.
+The complete local baseline used Python 3.12.3 and Coverage.py 7.16.2 on master `a32c528` (after PRs #3–#6). All 145 tests passed through the shared full-suite runner: 130 product contract tests and 15 CI-selection tests; 145 collected, started and executed, none skipped. The unittest run took 70.68 seconds; total child-process duration was 71.79 seconds. Most of that time is the live_tmux, live_native_busy and performance groups' real subprocess brokers and scripted natives. 37 product processes contributed data, including 16 actual CLI processes. CI-selection test source remains excluded from the product denominator.
 
 | Module | Statement coverage | Branch coverage |
 | --- | ---: | ---: |
-| `adapters.py` | 60.87% | 43.56% |
-| `cli.py` | 78.01% | 60.53% |
-| `client.py` | 81.63% | 50.00% |
-| `mcp.py` | 89.41% | 77.36% |
-| `rpc.py` | 83.02% | 78.12% |
-| `server.py` | 81.88% | 64.71% |
-| `store.py` | 89.55% | 73.38% |
-| **Total** | **1,361 / 1,747 = 77.90%** | **357 / 574 = 62.20%** |
+| `adapters.py` | 383 / 587 = 65.25% | 96 / 204 = 47.06% |
+| `cli.py` | 118 / 145 = 81.38% | 24 / 40 = 60.00% |
+| `client.py` | 40 / 49 = 81.63% | 4 / 8 = 50.00% |
+| `mcp.py` | 228 / 255 = 89.41% | 82 / 106 = 77.36% |
+| `rpc.py` | 90 / 106 = 84.91% | 25 / 32 = 78.12% |
+| `server.py` | 122 / 149 = 81.88% | 22 / 34 = 64.71% |
+| `store.py` | 438 / 485 = 90.31% | 120 / 160 = 75.00% |
+| **Total** | **1,422 / 1,779 = 79.93%** | **373 / 584 = 63.87%** |
 
-`__init__.py` and `__main__.py` were fully measured and have no branch opportunities. The combined statement-and-branch display was 74.02%.
+`__init__.py` and `__main__.py` were fully measured and have no branch opportunities. The combined statement-and-branch display was 75.96%. The previous recorded baseline (PR #2, 75 tests) was 77.90% statements and 62.20% branches over 1,747 statements; the denominators differ, so the change is not a like-for-like regression measure.
 
-The largest measured gap is adapter launch/orchestration, especially `run_claude`, terminal output handling, capability/schema inspection, and adapter run loops. Further missing branches occur in CLI command dispatch, client endpoint validation and transport errors, broker request/error handling, and store validation/rollback cases. Use `coverage.json` or HTML to select a concrete behavior risk before adding a test. Exercised lines alone do not establish adequate assertions, and missing branches do not automatically justify another test.
+The largest measured gap remains adapter launch/orchestration: `run_claude` (52 missing lines), Codex capability/schema inspection (`codex_capability`, 20), the Codex and Grok request paths, and terminal output handling (`_terminal_line`, 17). Further gaps: CLI command dispatch in `main` and `serve`; client endpoint validation and HTTP/transport error mapping; the broker's operation-level `backpressure` response, unknown-operation and wait-timeout validation, and `unavailable`/`internal_error` handling in `server.py` (the simultaneous-wait `backpressure` rejection is exercised); the MCP frontend's duplicate in-flight request ID, oversized-frame discard and channel close-after-claim/failed-settlement paths in `mcp.py` (its `-32000` concurrency rejection is exercised); malformed native frames, failing request handlers and close paths in `rpc.py`; and store validation/rollback cases in `send`, `join`, `_transaction` and private state-file setup. Use `coverage.json` or HTML to select a concrete behavior risk before adding a test. Exercised lines alone do not establish adequate assertions, and missing branches do not automatically justify another test.
 
 ## Primary references
 
