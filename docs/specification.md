@@ -158,6 +158,8 @@ Harness names are attributes, not unique peer identifiers. Two Codex sessions mu
 
 **ID-7.** Broker restart, adapter reconnect, native-session resume, and native-session replacement are distinct operations. Reuse a binding only when continuity is established; create a new generation when the native session changes or continuity cannot be safely established.
 
+**ID-7a.** When a live binding's harness reports a different native session than the one bound, the broker fences that binding durably rather than replacing it, and records the observed identity separately from caller-supplied capabilities, so recording it cannot exceed their size limit. Until explicit replacement, every model-facing communication operation on the binding (peers, send, inbox, wait, ack, retry, claim and recover) is refused with `replacement_required`. Identity, and status with message content withheld, remain available for diagnosis. Late attempt evidence is retained but cannot settle delivery.
+
 **ID-8.** Process liveness, connection liveness, native activity, and agent readiness are separate facts. A heartbeat does not prove the agent can receive or respond.
 
 **ID-9.** Shutdown and cleanup operate only on resources owned by the current Xordination instance. Record ownership of launched processes, native sessions, terminal windows, sockets, and generated files. Externally joined sessions survive broker shutdown; closing their communication connection does not authorize terminating them.
