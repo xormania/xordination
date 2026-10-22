@@ -150,7 +150,12 @@ def harness_fingerprint(participant):
     """Settings and inherited native configuration, by content hash; no credential file is read."""
     files = {}
     for variable, default, name in NATIVE_CONFIG[participant["harness"]]:
-        path = (Path(os.environ[variable]) if os.environ.get(variable) else Path.home() / default) / name
+        home = Path(os.environ[variable]) if os.environ.get(variable) else Path.home() / default
+        if not home.is_absolute():
+            # The native CLI resolves it from its workspace/--project cwd, not from where prepare runs.
+            raise ValueError(variable + " must be an absolute path so its fingerprint names the file the "
+                             "native harness reads")
+        path = home / name
         files[str(path)] = file_fingerprint(path)
     value = {"settings": {key: participant.get(key) for key in ("harness", "model", "reasoning")},
              "prompt_sha256": hashlib.sha256(INITIAL_PROMPT.encode()).hexdigest(),

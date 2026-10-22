@@ -526,6 +526,21 @@ class LiveAcceptanceTests(unittest.TestCase):
         self.assertEqual((report["environment"]["image_digest"], report["environment"]["capability_probes"]),
                          ("unsupplied", "unrecorded"))
 
+    def test_relative_native_config_home_is_refused_before_run_state(self):
+        # The launcher runs each native CLI in its participant workspace (or an adapter --project), so a
+        # relative config home fingerprinted from prepare's cwd could describe a different file.
+        folder = Path(self.temporary.name)
+        config = {"participants": [{"name": "alice", "harness": "codex"}, {"name": "bob", "harness": "claude"}]}
+        for variable in ("CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+            for value in ("relative-home", "./home", "~/.codex"):
+                with self.subTest(variable=variable, value=value), patch.dict(os.environ, {variable: value}):
+                    with self.assertRaisesRegex(ValueError, variable + " must be an absolute path"):
+                        live.prepare(config, folder / "relative-run")
+                    self.assertFalse((folder / "relative-run").exists())
+        with patch.dict(os.environ, {"CODEX_HOME": str(folder / "absolute-home")}):
+            files = live.harness_fingerprint(config["participants"][0])["native_config_files"]
+        self.assertEqual(files, {str(folder / "absolute-home" / "config.toml"): "absent"})
+
     def observed(self, name):
         from xordination.client import Client
         token = live.load(self.directory / (name + ".connection.json"))["token"]
