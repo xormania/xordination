@@ -280,13 +280,16 @@ class NativeAdapter:
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        # Stop the native family before any broker call: each settlement can
+        # block for the client timeout, and a service manager that escalates to
+        # SIGKILL meanwhile would otherwise orphan the family.
+        if self.rpc:
+            await self.rpc.close()
         for message in list(self.pending_attempts.values()):
             try:
                 await self.finish(message, "uncertain", "adapter_shutdown", evidence="submission not settled")
             except Exception:
                 pass  # Broker expiry/restart handles an unsettled durable claim.
-        if self.rpc:
-            await self.rpc.close()
         if self.stderr_task:
             if not self.stderr_task.done():
                 self.stderr_task.cancel()

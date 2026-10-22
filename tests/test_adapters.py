@@ -628,6 +628,56 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
                 child.wait()
             child.stdout.close()
 
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_termination_stops_native_family_before_blocked_settlement(self):
+        # A pending attempt's broker finish can block for the client timeout; the
+        # family must not wait for it, or a SIGKILL escalation orphans it.
+        lock = str(Path(self.temporary.name) / "settling.lock")
+        record = Path(self.temporary.name) / "finish.json"
+        script = (
+            "import asyncio,json,sys,time\n"
+            "from xordination.adapters import CodexAdapter, supervise\n"
+            "class Client:\n"
+            "    def call(self, operation, **params):\n"
+            "        if operation == 'finish':\n"
+            "            with open(sys.argv[3], 'w') as handle:\n"
+            "                json.dump(params, handle)\n"
+            "            time.sleep(30)\n"
+            "        return {}\n"
+            "adapter = CodexAdapter(Client(), sys.executable, '.')\n"
+            "async def start():\n"
+            "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'polite'], jsonrpc=False)\n"
+            "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
+            "    adapter.pending_attempts['attempt-1'] = {'id': 'message-1', 'attempt_id': 'attempt-1'}\n"
+            "    print('ready', flush=True)\n"
+            "adapter.start = start\n"
+            "sys.exit(asyncio.run(supervise(adapter)))\n")
+        import xordination
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
+        child = subprocess.Popen([sys.executable, "-c", script, FAMILY_NATIVE, lock, str(record)],
+                                 cwd=self.temporary.name, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        try:
+            ready = await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)
+            self.assertEqual(ready, b"ready\n")
+            self.assertTrue(self.lock_held(lock))
+            child.terminate()
+            await self.until_released(lock)
+            async def settled():
+                while not record.exists() or not record.read_text():
+                    await asyncio.sleep(.02)
+            await asyncio.wait_for(settled(), 5)
+            # Settlement is still attempted after the stop, and only as uncertain.
+            finish = json.loads(record.read_text())
+            self.assertEqual((finish["attempt_id"], finish["outcome"]), ("attempt-1", "uncertain"))
+            self.assertIsNone(child.poll(), "The adapter is still blocked in settlement")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+
 
 class ProbeAndChannelTests(unittest.TestCase):
     def test_mismatched_authenticated_harness_never_probes_launches_or_mutates_binding(self):
