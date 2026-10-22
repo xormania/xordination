@@ -128,7 +128,17 @@ python scripts/testing/benchmark.py --messages 8 --workers 4 --trials 3 --warmup
 
 Operation timings use a monotonic clock and include client serialization, loopback HTTP, broker work and SQLite work. Reports retain individual samples, nearest-rank p50/p95 with sample counts, workload-specific throughput, separate setup/steady/cleanup duration and retained SQLite/WAL storage. A serial work unit is a two-way question/reply; a concurrent work unit is one-way send/read/receipt. Comparing their throughput without those units would be misleading. Storage observations are not process-memory measurements.
 
-Warmups run the same correctness checks and are discarded from timing statistics. The manifest records configuration, seed, product and driver/helper hashes, actual imported product paths, Python/platform/SQLite identity and unmeasured phases. Native submission, native receipt, model response, remote networking and broker process RSS are unmeasured by this driver.
+Warmups run the same correctness checks and are discarded from timing statistics. The manifest records configuration, seed, product and driver/helper hashes, actual imported product paths, Python/platform/SQLite identity, the broker's default limits and unmeasured phases. Native submission, native receipt, model response and remote networking are unmeasured by this driver.
+
+### Broker process, wait capacity and restart
+
+`broker_process` adds `--process-trials` (default 2, no warmup) trials against a separate `xordination serve` child started with `python -I` from the selected source tree and its default limits. Those defaults are read from the product and recorded as `manifest.broker_limits`: 64 concurrent requests/connections and 16 simultaneous waits, with each wait bounded to 0–30 seconds (default 20). A wait beyond the limit is refused immediately with HTTP 503 `backpressure`; it is not queued. Each trial:
+
+- samples the child's CPU and RSS from Linux `/proc` while idle (`--idle-ms`, default 200), during the concurrent backlog workload (`loaded`) and during the wait-capacity phase (`waiting`). `cpu_percent` is of one core with clock-tick resolution; `peak_rss_bytes` is the kernel high-water mark. Without `/proc` these windows are `null`; `lifetime.cpu_ms` comes from `os.wait4` where available. Child RSS includes the interpreter, so it is not an incremental per-message cost;
+- holds every wait slot with distinct waiting clients, confirms saturation with a refused probe, requires `--wait-overflow` additional clients (default 2) to receive `backpressure`, times inbox and send calls while all waits are held, wakes each waiter with its own message and confirms a released slot accepts a new wait. Wake latency includes the broker's 100 ms wait polling interval. A waiter that is admitted only after saturation fails the run, so a lower effective limit is not reported as capacity;
+- leaves one pending message and one receipt, interrupts the broker like an operator, restarts it on the same endpoint and polls from spawn until the first authenticated request returns the retained pending message, then checks the receipt. `restart_ms` reports stop, announce and first-success times.
+
+Clients are constructed before measured windows. These are small report-only baselines: one-host loopback numbers with few samples, not capacity guarantees or budgets.
 
 For a comparison, run the same current driver against both source trees on the same runner, with identical arguments and one shared measurement-session identifier:
 

@@ -23,9 +23,11 @@ SPEC.loader.exec_module(benchmark)
 class PerformanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Six fresh trials, four retained; small real HTTP workload shared only
-        # as immutable evidence for report-format tests.
-        cls.config = benchmark.Config(messages=2, workers=2, trials=2, warmup=1)
+        # Six fresh trials, four retained, plus one separate broker process;
+        # small real HTTP workload shared only as immutable evidence for
+        # report-format tests.
+        cls.config = benchmark.Config(messages=2, workers=2, trials=2, warmup=1,
+                                      process_trials=1, idle_ms=50)
         with patch.object(benchmark, "trial", wraps=benchmark.trial) as measured:
             cls.report = benchmark.run(cls.config, session_id="paired-test-session")
             cls.executed_trials = measured.call_count
@@ -47,6 +49,56 @@ class PerformanceTests(unittest.TestCase):
         self.assertNotEqual(report["summary"]["serial_roundtrip"]["work_unit"],
                             report["summary"]["concurrent_backlog"]["work_unit"])
 
+    def test_broker_process_reports_resources_wait_capacity_and_restart(self):
+        process = self.report["broker_process"]
+        limits = self.report["manifest"]["broker_limits"]
+        self.assertEqual({"max_requests": 64, "max_waits": 16}, limits)
+        self.assertEqual(1, len(process["trials"]))
+        trial = process["trials"][0]
+        self.assertEqual("verified", trial["correctness"])
+        waits = trial["wait_capacity"]
+        self.assertEqual(16, waits["waiting_clients"])
+        self.assertEqual(self.config.wait_overflow, waits["overflow_backpressure"])
+        self.assertTrue(waits["capacity_recovered"])
+        self.assertEqual(16, process["summary"]["wait_ms"]["wake"]["count"])
+        self.assertEqual(3, process["summary"]["wait_ms"]["saturated_inbox"]["count"])
+        self.assertEqual(4, trial["loaded_work_units"])
+        restart = trial["restart"]
+        self.assertGreater(restart["first_success_ms"], 0)
+        self.assertGreaterEqual(restart["first_success_attempts"], 1)
+        self.assertEqual((1, 1), (restart["retained_pending_messages"], restart["retained_receipts"]))
+        # /proc is optional; where present every window reports the broker child.
+        linux = Path("/proc/self/stat").is_file()
+        self.assertEqual("/proc" if linux else None, trial["resource_source"])
+        for window in ("idle", "loaded", "waiting"):
+            if linux:
+                self.assertGreater(trial[window]["rss_bytes"], 0)
+                self.assertGreaterEqual(trial[window]["cpu_percent"], 0)
+                self.assertIn(window, process["summary"])
+            else:
+                self.assertIsNone(trial[window])
+        self.assertNotIn("broker process RSS", self.report["manifest"]["unmeasured"])
+
+    def test_wait_measurement_refuses_a_limit_below_the_documented_capacity(self):
+        with patch.object(sys, "path", sys.path[:]):
+            product = benchmark.runtime(ROOT / "src")
+        config = benchmark.Config(wait_overflow=1)
+        for actual, claimed in ((2, 2), (2, 3)):
+            names = [f"waiter-{n}" for n in range(claimed)] + ["overflow-0", "waker", "probe"]
+            with self.subTest(actual=actual, claimed=claimed), tempfile.TemporaryDirectory() as temporary, \
+                    product.owned_broker(Path(temporary) / "state.sqlite3", max_waits=actual) as (store, _, endpoint):
+                store.create_space("benchmark")
+                bindings = {name: store.join("benchmark", name) for name in names}
+                clients = {name: product.Client(endpoint, bindings[name]["token"]) for name in names}
+                arguments = (config, clients, product.BrokerError, bindings, claimed, "body")
+                if actual == claimed:
+                    result = benchmark.wait_capacity(*arguments, hold_deadline_s=5)
+                    self.assertEqual((2, 1), (result["waiting_clients"], result["overflow_backpressure"]))
+                else:
+                    # A waiter queued behind the real limit is not a held wait.
+                    with self.assertRaisesRegex(AssertionError, "not held at the documented limit"):
+                        benchmark.wait_capacity(*arguments, hold_deadline_s=5)
+
     def test_statistics_use_nearest_rank_and_reject_invalid_samples(self):
         self.assertEqual({"count": 5, "min": 1, "max": 5, "p50": 3, "p95": 5},
                          benchmark.stats([5, 3, 1, 4, 2]))
@@ -57,7 +109,8 @@ class PerformanceTests(unittest.TestCase):
     def test_invalid_configuration_is_refused_before_running_product(self):
         for name, value in (("trials", 0), ("warmup", -1), ("messages", 1001),
                             ("workers", 17), ("payload_bytes", 65537), ("seed", -1),
-                            ("trials", True)):
+                            ("trials", True), ("process_trials", 0), ("idle_ms", -1),
+                            ("wait_overflow", 17)):
             config = benchmark.Config(**{name: value})
             with self.subTest(name=name, value=value), patch.object(benchmark, "runtime") as product:
                 with self.assertRaises(ValueError):
@@ -77,6 +130,17 @@ class PerformanceTests(unittest.TestCase):
             bad["manifest"][field] = "different"
             with self.subTest(field=field), self.assertRaises(ValueError):
                 benchmark.compare(self.report, bad)
+        process = comparison["broker_process"]
+        self.assertIn("restart_ms.first_success.p50", process)
+        self.assertIn("wait_ms.wake.p95", process)
+        # Reports from before process measurements still compare their scenarios.
+        older = copy.deepcopy(head)
+        del older["broker_process"]
+        for field in ("broker_process_scope", "broker_limits"):
+            del older["manifest"][field]
+        comparison = benchmark.compare(self.report, older)
+        self.assertEqual(({}, "unavailable"), (comparison["broker_process"],
+                                               comparison["broker_process_comparison"]))
         head["status"] = "failed"
         with self.assertRaises(ValueError):
             benchmark.compare(self.report, head)
@@ -102,7 +166,7 @@ class PerformanceTests(unittest.TestCase):
             completed = subprocess.run(
                 [sys.executable, str(ROOT / "scripts/testing/benchmark.py"), "--source-root", str(source),
                  "--messages", "1", "--workers", "1", "--warmup", "0", "--trials", "1",
-                 "--output", str(output)], cwd=temporary, env=env,
+                 "--process-trials", "1", "--idle-ms", "0", "--output", str(output)], cwd=temporary, env=env,
                 capture_output=True, text=True, timeout=20)
             self.assertEqual(0, completed.returncode, completed.stderr)
             report = json.loads(output.read_text())
