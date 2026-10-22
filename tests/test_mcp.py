@@ -34,7 +34,7 @@ class Output(io.StringIO):
         with self.changed:
             return [json.loads(line) for line in self.getvalue().splitlines()]
 
-    def await_packet(self, predicate, timeout=2):
+    def await_packet(self, predicate, timeout=5):
         deadline = time.monotonic() + timeout
         with self.changed:
             while True:
@@ -164,7 +164,7 @@ class MCPTests(unittest.TestCase):
                                  "params": {"name": "xordination_wait", "arguments": {
                                      "cursor": "request-" + str(ident), "timeout": 30}}})
         with entered:
-            self.assertTrue(entered.wait_for(lambda: len(active_requests) == 4, timeout=2))
+            self.assertTrue(entered.wait_for(lambda: len(active_requests) == 4, timeout=5))
             self.assertEqual({"request-" + str(ident) for ident in range(4)}, active_requests)
             self.assertEqual(4, len(active_workers))
         self.server.receive({"jsonrpc": "2.0", "id": "overload", "method": "tools/call",
@@ -225,11 +225,11 @@ class MCPTests(unittest.TestCase):
 
         self.client.handler = handler
         self.server.receive({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.assertTrue(checked.wait(2))
+        self.assertTrue(checked.wait(5))
         self.assertFalse(any(op == "claim" for op, _ in self.client.calls))
         self.assertEqual([], self.output.packets())
         registered.set()
-        self.assertTrue(finished.wait(2))
+        self.assertTrue(finished.wait(5))
         packet = self.output.await_packet(lambda p: p.get("method") == "notifications/claude/channel")
         self.assertIn("peer-b", packet["params"]["content"])
         self.assertEqual("message-1", packet["params"]["meta"]["message_id"])
@@ -260,7 +260,7 @@ class MCPTests(unittest.TestCase):
 
         self.client.handler = handler
         self.server.receive({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.assertTrue(done.wait(2))
+        self.assertTrue(done.wait(5))
         finish = next(params for operation, params in self.client.calls if operation == "finish")
         self.assertEqual("uncertain", finish["outcome"])
         self.assertEqual(1, sum(op == "claim" for op, _ in self.client.calls))

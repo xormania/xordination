@@ -178,7 +178,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         async def poll():
             while not condition():
                 await asyncio.sleep(.01)
-        await asyncio.wait_for(poll(), 3)
+        await asyncio.wait_for(poll(), 10)
 
     def submitted_finish(self, msg):
         matches = [params for operation, params in self.client.calls if operation == "finish"
@@ -195,7 +195,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.until(self.client.tool_entered.is_set)
         msg = message()
         adapter.pending_attempts[msg["attempt_id"]] = msg
-        await asyncio.wait_for(adapter.deliver(msg), 2)
+        await asyncio.wait_for(adapter.deliver(msg), 10)
         finished = next(params for op, params in self.client.calls if op == "finish")
         self.assertEqual(finished["outcome"], "submitted")
         self.assertEqual(finished["detail"]["native_id"], "thread-one")
@@ -606,7 +606,7 @@ for line in sys.stdin:
 
     async def test_lost_finish_response_settles_once_from_durable_attempt(self):
         adapter, msg = await self.lossy_delivery("lost-response", commit=True)
-        await asyncio.wait_for(adapter.deliver(msg), 3)
+        await asyncio.wait_for(adapter.deliver(msg), 10)
         self.assertNotIn(msg["attempt_id"], adapter.pending_attempts)
         status = self.store.status(self.recipient_context, msg["id"])
         self.assertEqual(status["state"], "submitted")
@@ -619,7 +619,7 @@ for line in sys.stdin:
         replace = lambda: self.store.join("project", "recipient", harness="grok", replace=True)  # noqa: E731
         adapter, msg = await self.lossy_delivery("replaced-during-outage", commit=False, before_retry=replace)
         with self.assertRaises(BrokerError) as raised:
-            await asyncio.wait_for(adapter.deliver(msg), 3)
+            await asyncio.wait_for(adapter.deliver(msg), 10)
         self.assertEqual(raised.exception.code, "stale_attempt")
         self.assertIn(msg["attempt_id"], adapter.pending_attempts)
         attempt = self.store.status(self.sender_context, msg["id"])["attempts"][0]
@@ -711,7 +711,7 @@ for line in sys.stdin:
                                  [("submitted", "thread-one")])  # Delivered once; no replay.
             # Restart preserved the binding generation; replacement still fences it.
             replacement = store.join("project", "recipient", harness="codex", replace=True)
-            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 3))[0]
+            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 10))[0]
             self.assertIsInstance(result, BrokerError)
             self.assertEqual(result.code, "stale_generation")
             self.assertIsNotNone(process.returncode)

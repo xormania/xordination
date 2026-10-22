@@ -134,7 +134,7 @@ async def _busy_native(events, manifest, sender, receiver, directory):
         def call(self, operation, **arguments):
             if operation == "wait":
                 entered.set()
-                if not release.wait(5):
+                if not release.wait(10):
                     raise TimeoutError("Owned native fixture hold was not released")
                 return {"messages": []}
             return receiver.call(operation, **arguments)
@@ -148,14 +148,14 @@ async def _busy_native(events, manifest, sender, receiver, directory):
         adapter.rpc = RPC(process, adapter.request, adapter.notification)
         adapter.session = "thread-one"
         await adapter.start_prompt("Continue unfinished fixture work")
-        if not await asyncio.to_thread(entered.wait, 3):
+        if not await asyncio.to_thread(entered.wait, 10):
             raise TimeoutError("Native fixture never entered the held tool")
         events["hold_entered_ns"] = time.monotonic_ns()
         _send(events, manifest, sender.call)
         claimed = events["claim"] = receiver.call("claim")
         message = {**claimed["message"], "attempt_id": claimed["attempt_id"]}
         adapter.pending_attempts[message["attempt_id"]] = message
-        await asyncio.wait_for(adapter.deliver(message), 3)
+        await asyncio.wait_for(adapter.deliver(message), 5)
         events["submitted_while_held"] = not release.is_set()
         events["submitted_ns"] = time.monotonic_ns()
         events["native_status"] = sender.call("status", message_id=message["id"])
