@@ -58,8 +58,8 @@ TOOLS = [
      "inputSchema": _object({**_INBOX, "timeout": {"type": "number", "minimum": 0, "maximum": 30}})},
     {"name": "xordination_ack", "description": "Record your explicit receipt of a message; this is not assignment acceptance or work completion.",
      "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
-    {"name": "xordination_status", "description": "Inspect an authorized message's attempts, receipts, replies and unresolved uncertainty.",
-     "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
+    {"name": "xordination_status", "description": "Inspect an authorized message's attempts, receipts, replies and unresolved uncertainty. A limit keeps the newest entries of each list and reports totals.",
+     "inputSchema": _object({"message_id": _IDENT, "limit": _INBOX["limit"]}, ("message_id",))},
     {"name": "xordination_retry", "description": "Explicitly retry an eligible uncertain delivery. The recipient may already have acted on it.",
      "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
 ]

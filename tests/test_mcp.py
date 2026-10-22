@@ -90,6 +90,8 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"], json.loads(result["content"][0]["text"]))
         self.call("xordination_inbox", {"cursor": "signed.cursor", "limit": 10, "unacknowledged": True})
         self.assertEqual("signed.cursor", self.client.calls[-1][1]["cursor"])
+        self.call("xordination_status", {"message_id": "message-a", "limit": 5})
+        self.assertEqual(("status", {"message_id": "message-a", "limit": 5}), self.client.calls[-1])
 
     def test_schema_errors_never_reach_broker(self):
         self.initialize()
@@ -103,6 +105,8 @@ class MCPTests(unittest.TestCase):
             ("xordination_wait", {"timeout": 31}),
             ("xordination_wait", {"timeout": float("nan")}),
             ("xordination_ack", {"message_id": ""}),
+            ("xordination_status", {"message_id": "m", "limit": 0}),
+            ("xordination_status", {"message_id": "m", "limit": 101}),
             ("xordination_missing", {}),
         ]
         for name, args in invalid:
