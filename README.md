@@ -82,6 +82,30 @@ Use the MCP tool schemas for exact arguments. The sender comes from authenticate
 
 A peer message is attributed content. It carries no additional operator authority or tool permission. The broker never composes automatic replies.
 
+## Limits and backpressure
+
+The initial limits are fixed in source; `xordination serve` and `xordination stdio` expose no options to change them. They are starting defaults, not measured capacity.
+
+| Boundary | Limit | When exceeded |
+| --- | --- | --- |
+| Message body | 65,536 bytes (UTF-8) | `limit_exceeded` |
+| Message metadata | 16,384 bytes as serialized JSON | `limit_exceeded` |
+| `to`, `key`, `reply_to`, `to_generation` | 200 bytes (UTF-8), no control characters | `invalid_argument` |
+| Inbox/wait page | `limit` 1–100, default 20 | `limit_exceeded` |
+| Pending messages per recipient | 1,000 unacknowledged, unexpired messages | `queue_full`; an identical replay of an already accepted message still returns it |
+| Wait duration | 0–30 seconds (broker default 20; MCP tool default 30) | HTTP 400 `invalid_request` |
+| Delivery claim lease | 60 seconds, after which an unsettled attempt becomes uncertain | Requires explicit retry; never replayed automatically |
+| Broker HTTP request body | 262,144 bytes; chunked transfer is rejected | HTTP 400 `invalid_request` |
+| Broker connections | 64 open connections; a socket read or write that stalls for 40 seconds closes the connection | Further connections are closed before their headers are read, without a response |
+| Broker operations | 64 concurrent `/rpc` requests; this equals the connection bound, so the connection limit normally applies first | HTTP 503 `backpressure` |
+| Broker waits | 16 concurrent `wait` operations across all clients | HTTP 503 `backpressure`; other operations still run |
+| Client HTTP timeout | 40 seconds of socket inactivity (connect or each read); not a whole-request deadline, so a peer that keeps sending bytes can hold a request longer | `connection_error` |
+| MCP stdio frame | 1 MiB of encoded bytes per JSON-RPC line | JSON-RPC `-32700`; the next frame is read normally |
+| MCP tool calls per frontend | 16 in flight (8 worker threads), excluding waits | JSON-RPC `-32000` "Too many concurrent requests" |
+| MCP waits per frontend | 4 in flight (4 dedicated threads) | JSON-RPC `-32000`; send, ack and other calls keep their own budget |
+
+Each frontend holds its own MCP budgets; the broker budgets are shared by every client of one broker. A frontend wait polls the broker in steps of at most 0.5 seconds, so it holds a broker wait slot only briefly. The frontend rejects arguments outside its tool schema (for example a page `limit` above 100 or a wait above 30 seconds) with JSON-RPC `-32602` before calling the broker. A broker rejection, including `backpressure` and `queue_full`, reaches the model as a tool result with `isError: true` and the broker's error code. `initialize` and `ping` bypass the call budget but not the in-flight check: a request ID that is already in flight is rejected with `-32600` for every method. Backpressure means the operation was not performed: retry after a delay, repeating a `send` with the same idempotency key and intent.
+
 ## Native adapters
 
 Use `--harness codex`, `claude`, or `grok` when joining a participant intended for the corresponding managed adapter. Native CLIs and their authentication remain where the operator already runs them. Inspect the local environment without invoking a model:

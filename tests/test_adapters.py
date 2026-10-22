@@ -1,6 +1,8 @@
 """Native transport semantics, exercised with real owned mock subprocesses."""
 
 import asyncio
+import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -8,10 +10,35 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from xordination.adapters import (CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
+from xordination.adapters import (BrokerReconnect, CapabilityError, ClaudeChannelLog, CodexAdapter, GrokAdapter,
                                  claude_hook, doctor, run_adapter, run_claude)
+from xordination.client import BrokerError, Client
+from xordination.mcp import _Server
 from xordination.rpc import RPC, RPCError
+from xordination.store import StoreError
 from native_fixtures import MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
+
+
+def crash_after_reading(script, methods, receipts):
+    """Wrap a native fixture so it records, then dies on, the first frame naming one of methods.
+
+    The frame has been written by the adapter and read by the native before the
+    transport is lost, so the outcome is genuinely ambiguous.
+    """
+    return """
+import json,os,sys
+class _CrashAfterReading:
+    def __init__(self, stream):
+        self.stream = stream
+    def __iter__(self):
+        for line in self.stream:
+            if json.loads(line).get("method") in %r:
+                with open(%r, "a") as receipts:
+                    receipts.write(line)
+                os._exit(5)
+            yield line
+sys.stdin = _CrashAfterReading(sys.stdin)
+""" % (tuple(methods), str(receipts)) + script
 
 
 class ClientFixture:
@@ -51,6 +78,25 @@ def message(identifier="message-one", attempt="attempt-one"):
     return {"id": identifier, "from": "sender", "from_generation": "s-one", "to": "recipient",
             "to_generation": "r-one", "delivery_generation": "r-one", "body": "Review this change", "reply_to": None,
             "metadata": {}, "attempt_id": attempt}
+
+
+def fake_claude(folder, help_flags, accepts_channel,
+                session="raise SystemExit('fixture received an unexpected session request')\n"):
+    # Owned executable mirroring the observed parser: unknown options fail before input checks.
+    path = Path(folder) / "claude"
+    path.write_text("#!" + sys.executable + "\n" + "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args == ['--version']: print('2.1.302 (Claude Code)'); raise SystemExit(0)\n"
+        "if args == ['--help']: print(" + repr(" ".join(help_flags)) + "); raise SystemExit(0)\n"
+        "if '--dangerously-load-development-channels' in args and not " + repr(accepts_channel) + ":\n"
+        "    print(\"error: unknown option '--dangerously-load-development-channels'\", file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "if '--print' in args and not sys.stdin.read():\n"
+        "    print('Error: Input must be provided either through stdin or as a prompt argument', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        + session)
+    path.chmod(0o700)
+    return str(path)
 
 
 class OrderedFinishClient(ClientFixture):
@@ -452,6 +498,153 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(msg["attempt_id"], adapter.pending_attempts)
         self.assertFalse(any(op == "retry" for op, _ in self.client.calls))
 
+    def broker_client(self, *, commit, before_retry=None):
+        """The real store reached like the HTTP client: errors become BrokerError.
+
+        The first finish loses its connection, after committing when ``commit``
+        is set (only the response was lost). ``before_retry`` runs before the
+        retried finish reaches the store.
+        """
+        from xordination.store import StoreError
+        store, context = self.store, self.recipient_context
+        class Lossy(ClientFixture):
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                finishes = sum(op == "finish" for op, _ in self.calls)
+                if operation == "finish" and finishes == 1:
+                    if commit:
+                        store.finish(context, **params)
+                    raise BrokerError("connection_error", "Broker connection lost: RemoteDisconnected")
+                if operation == "finish" and finishes == 2 and before_retry:
+                    before_retry()
+                try:
+                    return getattr(store, operation)(context, **params)
+                except StoreError as error:
+                    raise BrokerError(error.code, str(error)) from None
+        return Lossy()
+
+    async def lossy_delivery(self, key, **options):
+        self.store_client()
+        msg = self.stored_message(key)
+        self.client = self.broker_client(**options)
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        adapter.reconnect = BrokerReconnect(window=2, initial=.01)
+        await self.process(MOCK_CODEX, adapter)
+        adapter.session = "thread-one"
+        adapter.pending_attempts[msg["attempt_id"]] = msg
+        return adapter, msg
+
+    async def test_lost_finish_response_settles_once_from_durable_attempt(self):
+        adapter, msg = await self.lossy_delivery("lost-response", commit=True)
+        await asyncio.wait_for(adapter.deliver(msg), 3)
+        self.assertNotIn(msg["attempt_id"], adapter.pending_attempts)
+        status = self.store.status(self.recipient_context, msg["id"])
+        self.assertEqual(status["state"], "submitted")
+        self.assertEqual([attempt["state"] for attempt in status["attempts"]], ["submitted"])
+        # The retried evidence is retained as late, never as a second submission.
+        self.assertEqual([event["late"] for event in status["attempts"][0]["evidence"]], [False, True])
+        self.assertFalse(any(op in {"retry", "claim"} for op, _ in self.client.calls))
+
+    async def test_reconnected_finish_of_replaced_generation_stays_fenced(self):
+        replace = lambda: self.store.join("project", "recipient", harness="grok", replace=True)  # noqa: E731
+        adapter, msg = await self.lossy_delivery("replaced-during-outage", commit=False, before_retry=replace)
+        with self.assertRaises(BrokerError) as raised:
+            await asyncio.wait_for(adapter.deliver(msg), 3)
+        self.assertEqual(raised.exception.code, "stale_attempt")
+        self.assertIn(msg["attempt_id"], adapter.pending_attempts)
+        attempt = self.store.status(self.sender_context, msg["id"])["attempts"][0]
+        self.assertEqual(attempt["state"], "uncertain")
+        # Replacement settled the claim; the old generation's evidence is late.
+        self.assertEqual([(event["outcome"], event["late"]) for event in attempt["evidence"]],
+                         [("uncertain", False), ("submitted", True), ("uncertain", True)])
+
+    async def test_broker_reconnect_is_bounded_and_never_retries_broker_answers(self):
+        class Unreachable(ClientFixture):
+            code = "connection_error"
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                raise BrokerError(self.code, "unavailable fixture")
+        self.client = Unreachable()
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        adapter.reconnect = BrokerReconnect(window=.3, initial=.02, maximum=.05)
+        started = asyncio.get_running_loop().time()
+        with self.assertRaises(BrokerError) as raised:
+            await adapter.call("claim")
+        self.assertEqual(raised.exception.code, "connection_error")
+        self.assertGreaterEqual(asyncio.get_running_loop().time() - started, .25)
+        self.assertGreater(len(self.client.calls), 2)
+        for code in ("stale_generation", "unauthorized", "forbidden"):
+            with self.subTest(code=code):
+                self.client.calls.clear()
+                self.client.code = code
+                adapter.reconnect = BrokerReconnect(window=5, initial=.02)
+                with self.assertRaises(BrokerError):
+                    await adapter.call("claim")
+                self.assertEqual(len(self.client.calls), 1)
+
+    async def test_managed_codex_session_survives_broker_restart_and_keeps_fencing(self):
+        from xordination.server import BrokerServer
+        from xordination.store import Store
+        path = Path(self.temporary.name) / "restart.sqlite"
+        brokers = []
+        def start(port=0):
+            store = Store(str(path))
+            server = BrokerServer(("127.0.0.1", port), store)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02}, daemon=True)
+            thread.start()
+            brokers.append((store, server, thread))
+            return store, server.server_port
+        def stop():
+            store, server, thread = brokers.pop()
+            server.stopping.set()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+            store.close()
+        store, port = start()
+        try:
+            store.create_space("project")
+            sender = store.join("project", "sender")
+            recipient = store.join("project", "recipient", harness="codex")
+            sender_context = {"_token": sender["token"]}
+            recipient_context = {"_token": recipient["token"]}
+            adapter = self.adapter = CodexAdapter(Client("http://127.0.0.1:" + str(port), recipient["token"]),
+                                                  sys.executable, self.temporary.name, poll_interval=.02)
+            adapter.reconnect = BrokerReconnect(window=10, initial=.02, maximum=.1)
+            async def spawn(argv, **kwargs):
+                await self.process(MOCK_CODEX, adapter)
+            adapter.spawn = spawn
+            with patch("xordination.adapters.codex_capability", return_value={"status": "supported"}):
+                runner = asyncio.create_task(adapter.run())
+                first = store.send(sender_context, "recipient", "Before restart", "before")
+                await self.until(lambda: store.status(recipient_context, first["id"])["state"] == "submitted")
+            process = adapter.rpc.process
+            stop()
+            await asyncio.sleep(.3)  # Many claim polls fail while the broker is down.
+            self.assertFalse(runner.done())
+            self.assertIsNotNone(adapter.reconnect.since)
+            self.assertIsNone(process.returncode)
+            store, _ = start(port)
+            second = store.send(sender_context, "recipient", "After restart", "after")
+            await self.until(lambda: store.status(recipient_context, second["id"])["state"] == "submitted")
+            self.assertIs(adapter.rpc.process, process)
+            self.assertIsNone(adapter.reconnect.since)
+            for queued in (first, second):
+                attempts = store.status(recipient_context, queued["id"])["attempts"]
+                self.assertEqual([(row["state"], row["native_id"]) for row in attempts],
+                                 [("submitted", "thread-one")])  # Delivered once; no replay.
+            # Restart preserved the binding generation; replacement still fences it.
+            replacement = store.join("project", "recipient", harness="codex", replace=True)
+            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 3))[0]
+            self.assertIsInstance(result, BrokerError)
+            self.assertEqual(result.code, "stale_generation")
+            self.assertIsNotNone(process.returncode)
+            third = store.send(sender_context, "recipient", "For the replacement", "third")
+            self.assertEqual(store.status({"_token": replacement["token"]}, third["id"])["attempts"], [])
+        finally:
+            while brokers:
+                stop()
+
     async def test_nonowned_transport_cleanup_never_kills_foreign_process(self):
         async def reject(method, params):
             raise ValueError(method)
@@ -510,38 +703,21 @@ class ProbeAndChannelTests(unittest.TestCase):
         self.assertEqual(observed["status"], "unavailable")
         self.assertEqual(observed["live_round_trip"], "unverified")
 
-    def fake_claude(self, folder, help_flags, accepts_channel):
-        # Owned executable mirroring the observed parser: unknown options fail before input checks.
-        path = Path(folder) / "claude"
-        path.write_text("#!" + sys.executable + "\n" + "import sys\n"
-            "args = sys.argv[1:]\n"
-            "if args == ['--version']: print('2.1.302 (Claude Code)'); raise SystemExit(0)\n"
-            "if args == ['--help']: print(" + repr(" ".join(help_flags)) + "); raise SystemExit(0)\n"
-            "if '--dangerously-load-development-channels' in args and not " + repr(accepts_channel) + ":\n"
-            "    print(\"error: unknown option '--dangerously-load-development-channels'\", file=sys.stderr)\n"
-            "    raise SystemExit(1)\n"
-            "if '--print' in args and not sys.stdin.read():\n"
-            "    print('Error: Input must be provided either through stdin or as a prompt argument', file=sys.stderr)\n"
-            "    raise SystemExit(1)\n"
-            "raise SystemExit('fixture received an unexpected session request')\n")
-        path.chmod(0o700)
-        return str(path)
-
     def test_claude_doctor_accepts_listed_or_parser_accepted_channel_flag(self):
         listed = ("--session-id", "--mcp-config", "--debug-file", "--dangerously-load-development-channels")
         with tempfile.TemporaryDirectory() as folder:
-            observed = doctor("claude", binary=self.fake_claude(folder, listed, accepts_channel=False))
+            observed = doctor("claude", binary=fake_claude(folder, listed, accepts_channel=False))
             self.assertEqual(observed["status"], "supported")
             self.assertEqual(observed["launch"]["basis"], "installed CLI help; runtime handshake still required")
         with tempfile.TemporaryDirectory() as folder:
-            observed = doctor("claude", binary=self.fake_claude(folder, listed[:3], accepts_channel=True))
+            observed = doctor("claude", binary=fake_claude(folder, listed[:3], accepts_channel=True))
             self.assertEqual(observed["status"], "supported")
             self.assertIn("unlisted channel flag accepted", observed["launch"]["basis"])
             self.assertEqual(observed["live_round_trip"], "unverified")
 
     def test_claude_doctor_rejected_channel_flag_remains_unverified(self):
         with tempfile.TemporaryDirectory() as folder:
-            binary = self.fake_claude(folder, ("--session-id", "--mcp-config", "--debug-file"), accepts_channel=False)
+            binary = fake_claude(folder, ("--session-id", "--mcp-config", "--debug-file"), accepts_channel=False)
             observed = doctor("claude", binary=binary)
             self.assertEqual(observed["status"], "unverified")
             self.assertEqual(observed["launch"]["basis"],
@@ -563,6 +739,54 @@ class ProbeAndChannelTests(unittest.TestCase):
                 stream.write("\n")
             self.assertTrue(observer.poll())
 
+    def test_claude_supervisor_survives_broker_outage(self):
+        class Outage(ClientFixture):
+            """Two lost identity polls and a lost registration bind, then an explicit stop."""
+            def call(self, operation, **params):
+                self.calls.append((operation, params))
+                registrations = sum(op == "bind" and row["capabilities"].get("channel_registered") is True
+                                    for op, row in self.calls)
+                if operation == "identity":
+                    if sum(op == "identity" for op, _ in self.calls) <= 2:
+                        raise BrokerError("connection_error", "Broker connection lost: ConnectionRefusedError")
+                    return {"stopped": True} if registrations >= 2 or len(self.calls) > 200 else {"active": True}
+                if operation == "bind" and registrations == 1:
+                    raise BrokerError("unavailable", "Broker operation unavailable")
+                return {}
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder) / "claude"
+            binary.write_text("#!" + sys.executable + "\nimport sys, time\n"
+                "log = sys.argv[sys.argv.index('--debug-file') + 1]\n"
+                "open(log, 'w').write('x [DEBUG] MCP server \"xordination\": Channel notifications registered\\n')\n"
+                "time.sleep(30)\n")
+            binary.chmod(0o700)
+            client = Outage()
+            with patch("xordination.adapters.doctor", return_value={"status": "supported"}):
+                self.assertEqual(run_claude(client, str(binary), folder), 0)
+        registrations = [params for op, params in client.calls
+                         if op == "bind" and params["capabilities"].get("channel_registered")]
+        self.assertEqual(len(registrations), 2)  # Lost once, then recorded after reconnect.
+        self.assertEqual(client.calls[-1][0], "stop")
+
+    def test_client_reports_dropped_broker_connection_as_connection_error(self):
+        import socket
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        def drop():
+            connection, _ = listener.accept()
+            connection.recv(65536)
+            connection.close()  # Request accepted, response never sent.
+        thread = threading.Thread(target=drop, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(BrokerError) as raised:
+                Client("http://127.0.0.1:" + str(listener.getsockname()[1]), "token", timeout=5).call("claim")
+            self.assertEqual(raised.exception.code, "connection_error")
+        finally:
+            thread.join(timeout=5)
+            listener.close()
+
     def test_claude_hook_reports_observed_identity_without_tool_decision(self):
         client = ClientFixture()
         with patch("xordination.client.Client", return_value=client):
@@ -571,6 +795,434 @@ class ProbeAndChannelTests(unittest.TestCase):
         self.assertEqual(client.calls[0][0], "bind")
         self.assertEqual(client.calls[0][1]["native_id"], "actual-native")
         self.assertTrue(client.calls[0][1]["capabilities"]["identity_observed"])
+
+
+CLAUDE_FLAGS = ("--session-id", "--mcp-config", "--debug-file", "--dangerously-load-development-channels")
+
+
+def recording_native(folder, name, script):
+    """An owned executable recording its launch and every received frame, then running a scripted native."""
+    path = Path(folder) / name
+    path.write_text("#!" + sys.executable + "\n" + r'''
+import json, os, sys
+_record = open(os.environ["XORDINATION_FIXTURE_RECORD"], "a")
+_record.write(json.dumps({"argv": sys.argv, "cwd": os.getcwd(), "env": {key: os.environ.get(key) for key in
+    ("HOME", "GROK_HOME", "CLAUDE_CONFIG_DIR", "OPERATOR_SETTING", "XORDINATION_TOKEN")}}) + "\n")
+_record.flush()
+class _Received:
+    def __init__(self, stream):
+        self.stream = stream
+    def __iter__(self):
+        for line in self.stream:
+            _record.write(line)
+            _record.flush()
+            yield line
+sys.stdin = _Received(sys.stdin)
+''' + script)
+    path.chmod(0o700)
+    return str(path)
+
+
+def tree_snapshot(root):
+    """Content and mode of every operator-owned file, to detect any setup mutation."""
+    root = Path(root)
+    return {str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mode)
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def operator_project(root, harness):
+    """A project whose operator already has partial native configuration and a usable tool."""
+    project, home = Path(root) / "project", Path(root) / "home"
+    files = {project / "tools" / "check.sh": "#!/bin/sh\nexit 0\n",
+             project / "AGENTS.md": "Operator conventions stay authoritative.\n"}
+    if harness == "claude":
+        files.update({
+            project / ".claude" / "settings.json": json.dumps({
+                "model": "operator-model", "permissions": {"allow": ["Bash(tools/check.sh)"], "defaultMode": "plan"},
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "tools/check.sh"}]}]}}),
+            project / ".claude" / "settings.local.json": json.dumps({"env": {"OPERATOR_FLAG": "1"}}),
+            project / ".mcp.json": json.dumps({"mcpServers": {"project-tools": {"command": "tools/check.sh"}}}),
+            home / "settings.json": json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}}),
+        })
+    else:
+        files.update({
+            project / ".grok" / "settings.json": json.dumps({"mcpServers": {"project-tools": {"command": "tools/check.sh"}}}),
+            home / "config.toml": 'model = "operator-model"\n[permissions]\ndefault = "ask"\n',
+        })
+    for path, text in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    (project / "tools" / "check.sh").chmod(0o755)
+    return project, home
+
+
+class ConfigurationPreservationTests(unittest.IsolatedAsyncioTestCase):
+    """Launch adds communication only; partial operator settings, MCP entries, hooks and tools stay native (AC-13)."""
+
+    # Launch options that would replace or narrow operator-owned native configuration.
+    OVERRIDES = ("--strict-mcp-config", "--setting-sources", "--permission-mode", "--dangerously-skip-permissions",
+                 "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
+                 "--model", "--effort", "--bare", "--sandbox", "--yolo")
+
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.record = self.root / "native-record.jsonl"
+        (self.root / "bin").mkdir()
+
+    async def asyncTearDown(self):
+        self.temporary.cleanup()
+
+    def recorded(self):
+        rows = [json.loads(line) for line in self.record.read_text().splitlines()]
+        return [row for row in rows if "argv" in row], [row for row in rows if "argv" not in row]
+
+    def assert_preserved(self, snapshot, project, home, launch):
+        self.assertEqual(tree_snapshot(project), snapshot["project"])
+        self.assertEqual(tree_snapshot(home), snapshot["home"])
+        self.assertEqual(launch["cwd"], str(project.resolve()))
+        self.assertEqual((launch["env"].get("HOME"), launch["env"].get("OPERATOR_SETTING")), (str(home), "kept"))
+        self.assertFalse(set(launch["argv"]) & set(self.OVERRIDES))
+
+    async def test_claude_launch_preserves_partial_operator_configuration_and_project_tools(self):
+        project, home = operator_project(self.root, "claude")
+        snapshot = {"project": tree_snapshot(project), "home": tree_snapshot(home)}
+        session = (
+            "import json, os\n"
+            "flag = lambda name: args[args.index(name) + 1]\n"
+            "keys = ('HOME', 'CLAUDE_CONFIG_DIR', 'OPERATOR_SETTING', 'XORDINATION_TOKEN')\n"
+            "launch = {'argv': args, 'cwd': os.getcwd(), 'env': {key: os.environ.get(key) for key in keys},\n"
+            "          'mcp': json.load(open(flag('--mcp-config'))), 'settings': json.load(open(flag('--settings'))),\n"
+            "          'injected': [flag('--mcp-config'), flag('--settings')],\n"
+            "          'tool_usable': os.access('tools/check.sh', os.X_OK)}\n"
+            "open(os.environ['XORDINATION_FIXTURE_RECORD'], 'a').write(json.dumps(launch) + '\\n')\n")
+        binary = fake_claude(self.root / "bin", CLAUDE_FLAGS, accepts_channel=True, session=session)
+        client = ClientFixture()
+        environment = {"HOME": str(home), "CLAUDE_CONFIG_DIR": str(home), "OPERATOR_SETTING": "kept",
+                       "XORDINATION_FIXTURE_RECORD": str(self.record)}
+        with patch.dict("os.environ", environment):
+            self.assertEqual(await asyncio.to_thread(run_claude, client, binary, project), 0)
+        [launch], _ = self.recorded()
+        self.assert_preserved(snapshot, project, home, launch)
+        self.assertEqual(launch["env"]["CLAUDE_CONFIG_DIR"], str(home))
+        self.assertEqual(launch["env"]["XORDINATION_TOKEN"], client.token)
+        self.assertTrue(launch["tool_usable"])
+        # Communication is added beside, not instead of, the operator's MCP servers and hooks.
+        self.assertEqual(set(launch["mcp"]["mcpServers"]), {"xordination"})
+        self.assertEqual(set(launch["settings"]), {"hooks"})
+        self.assertEqual(set(launch["settings"]["hooks"]), {"SessionStart"})
+        [entry] = launch["settings"]["hooks"]["SessionStart"]
+        self.assertEqual(set(entry), {"hooks"})
+        self.assertIn(" claude-hook ", entry["hooks"][0]["command"])
+        # The injected files were temporary and outside the project.
+        for path in launch["injected"]:
+            self.assertNotIn(project.resolve(), Path(path).resolve().parents)
+            self.assertFalse(Path(path).exists())
+
+    async def test_grok_start_preserves_partial_operator_configuration_and_project_tools(self):
+        project, home = operator_project(self.root, "grok")
+        snapshot = {"project": tree_snapshot(project), "home": tree_snapshot(home)}
+        binary = recording_native(self.root / "bin", "grok", MOCK_GROK)
+        client = ClientFixture()
+        environment = {"HOME": str(home), "GROK_HOME": str(home), "OPERATOR_SETTING": "kept",
+                       "XORDINATION_FIXTURE_RECORD": str(self.record)}
+        adapter = GrokAdapter(client, binary, project)
+        try:
+            with patch.dict("os.environ", environment):
+                await adapter.start()
+        finally:
+            await adapter.close()
+        [launch], received = self.recorded()
+        self.assert_preserved(snapshot, project, home, launch)
+        self.assertEqual(launch["argv"][1:], ["--no-auto-update", "agent", "stdio"])
+        self.assertEqual(launch["env"]["GROK_HOME"], str(home))
+        self.assertEqual(launch["env"]["XORDINATION_TOKEN"], client.token)
+        # No authentication change, mode/model switch or tool policy accompanies session creation.
+        self.assertEqual([frame["method"] for frame in received], ["initialize", "session/new"])
+        created = received[1]["params"]
+        self.assertEqual(set(created), {"cwd", "mcpServers"})
+        self.assertEqual(created["cwd"], str(project.resolve()))
+        self.assertEqual([server["name"] for server in created["mcpServers"]], ["xordination"])
+        self.assertEqual(set(created["mcpServers"][0]), {"name", "command", "args", "env"})
+
+
+class BrokerClient(ClientFixture):
+    """Real broker authority for one captured credential, with injectable broker faults."""
+
+    def __init__(self, store, token):
+        super().__init__()
+        self.store, self.token = store, token
+        self.context = store.authenticate(token)
+        self.after_claim = None
+
+    def call(self, operation, **params):
+        self.calls.append((operation, params))
+        if operation == "finish" and self.fail_finish:
+            raise StoreError("stale_attempt", "Injected stale durable finish")
+        result = getattr(self.store, operation)(self.context, **params)
+        if operation == "claim" and result.get("message") and self.after_claim:
+            self.after_claim()
+        return result
+
+
+class AdapterConformance:
+    """Shared AC-12 failure contracts; each harness supplies only its native fixture.
+
+    Subclasses provide launch(), launch_failing_native(), refuse_capability(),
+    quiesced() and shutdown(), and record native submissions and session
+    creations. Every scenario uses a real SQLite broker and recipient credential.
+    """
+
+    harness = None
+    launch_sessions = 0
+    refused_state = "failed"
+
+    async def asyncSetUp(self):
+        from xordination.store import Store
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.temporary.name) / "broker.sqlite")
+        self.store.create_space("project")
+        self.sender = self.store.authenticate(self.store.join("project", "sender", harness="codex")["token"])
+        self.recipient = self.store.join("project", "recipient", harness=self.harness)
+        self.client = BrokerClient(self.store, self.recipient["token"])
+        self.submissions, self.sessions = [], []
+        self.break_on_submit = self.refuse_on_submit = False
+
+    async def asyncTearDown(self):
+        await self.shutdown()
+        self.store.close()
+        self.temporary.cleanup()
+
+    def send(self, key):
+        return self.store.send(self.sender, "recipient", "Review " + key, key)
+
+    def status(self, message):
+        return self.store.status(self.sender, message["id"])
+
+    async def until(self, condition, timeout=5):
+        async def poll():
+            while not condition():
+                await asyncio.sleep(.01)
+        try:
+            await asyncio.wait_for(poll(), timeout)
+        except asyncio.TimeoutError:
+            self.fail("Harness did not reach the expected broker/native state")
+
+    def assert_not_replayed(self, message, states):
+        status = self.status(message)
+        self.assertIn(status["state"], states)
+        self.assertEqual(len(status["attempts"]), 1)
+        self.assertEqual(len(self.submissions), 1, "The native received exactly one submission")
+        self.assertEqual(len(self.sessions), self.launch_sessions, "No fallback native session was created")
+        self.assertFalse(any(operation == "retry" for operation, _ in self.client.calls))
+        return status
+
+    def assert_native_read_delivery(self):
+        """Harnesses with a native process prove the lost delivery frame was read before the loss."""
+
+    async def test_startup_failure_never_reports_readiness(self):
+        queued = self.send("before-startup")
+        outcome = await self.launch_failing_native()
+        self.assertTrue(isinstance(outcome, Exception) or outcome != 0, outcome)
+        binding = self.store.authenticate(self.recipient["token"], allow_retired=True)
+        self.assertFalse(binding["active"])
+        self.assertIsNot(binding["capabilities"].get("channel_registered"), True)
+        self.assertEqual(binding["capabilities"].get("live_round_trip", "unverified"), "unverified")
+        status = self.status(queued)
+        self.assertEqual((status["state"], status["attempts"]), ("queued", []))
+        self.assertEqual(self.submissions, [])
+
+    async def test_ambiguous_submission_is_uncertain_without_retry(self):
+        queued = self.send("ambiguous")
+        self.break_on_submit = True
+        await self.launch()
+        await self.until(lambda: self.status(queued)["state"] == "uncertain" and self.quiesced())
+        status = self.assert_not_replayed(queued, {"uncertain"})
+        self.assertTrue(status["unresolved_uncertainty"])
+        self.assertEqual(status["attempts"][0]["state"], "uncertain")
+        self.assert_native_read_delivery()
+
+    async def test_stale_finish_is_not_replayed(self):
+        queued = self.send("stale")
+        self.client.fail_finish = True
+        await self.launch()
+        await self.until(lambda: self.submissions and self.quiesced())
+        # The durable claim stays with broker recovery; it is never settled or resubmitted.
+        status = self.assert_not_replayed(queued, {"claimed", "uncertain"})
+        self.assertFalse(any(event["outcome"] == "submitted" for event in status["attempts"][0]["evidence"]))
+
+    async def test_replacement_fences_late_native_evidence(self):
+        queued = self.send("replaced")
+        replacement = {}
+        def replace():
+            self.client.after_claim = None
+            replacement.update(self.store.join("project", "recipient", harness=self.harness, replace=True))
+        self.client.after_claim = replace
+        await self.launch()
+        def late():
+            evidence = self.status(queued)["attempts"][0]["evidence"] if replacement else []
+            return any(event["late"] and event["outcome"] == "submitted" for event in evidence)
+        await self.until(lambda: late() and self.quiesced())
+        status = self.assert_not_replayed(queued, {"uncertain"})
+        self.assertTrue(all(event["late"] for event in status["attempts"][0]["evidence"]
+                            if event["outcome"] == "submitted"))
+        with self.assertRaises(StoreError) as raised:
+            self.store.claim(self.client.context)
+        self.assertEqual(raised.exception.code, "stale_generation")
+        current = self.store.authenticate(replacement["token"])
+        self.assertIsNone(self.store.claim(current)["message"], "Handover requires explicit recovery")
+        self.assertEqual((current["native_id"], current["capabilities"]), (None, {}))
+
+    async def test_capability_refusal_has_no_fallback_submission(self):
+        with self.assertRaisesRegex(CapabilityError, "attach/resume"):
+            run_adapter(self.harness, "http://127.0.0.1:1", self.recipient["token"], self.temporary.name,
+                        mode="attach", native_id="existing-native")
+        queued = self.send("refused")
+        await self.refuse_capability()
+        await self.until(self.quiesced)
+        status = self.status(queued)
+        self.assertEqual(status["state"], self.refused_state)
+        self.assertEqual([attempt["state"] for attempt in status["attempts"]],
+                         [] if self.refused_state == "queued" else [self.refused_state])
+        self.assertEqual(len(self.submissions), len(status["attempts"]), "Only the refused submission was made")
+        self.assertEqual(len(self.sessions), self.launch_sessions, "No fallback native session was created")
+        self.assertFalse(any(operation == "retry" for operation, _ in self.client.calls))
+
+
+class NativeRPCConformance(AdapterConformance):
+    """Managed Codex/Grok loops against their scripted native subprocesses."""
+
+    launch_sessions = 1
+    native_script = None
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.runner = None
+        self.native_receipts = Path(self.temporary.name) / "native-receipts.jsonl"
+
+    def assert_native_read_delivery(self):
+        # The native itself read exactly the one delivery frame before its transport was lost.
+        frames = self.native_receipts.read_text().splitlines() if self.native_receipts.exists() else []
+        self.assertEqual([json.loads(frame)["method"] for frame in frames], self.submissions)
+
+    async def launch(self):
+        adapter = self.adapter = self.adapter_class(self.client, sys.executable, self.temporary.name,
+                                                    poll_interval=.01)
+        script = self.native_script or self.script
+        if self.break_on_submit:
+            script = crash_after_reading(script, self.submission_methods, self.native_receipts)
+        async def spawn(argv, **kwargs):
+            process = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", script,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL, limit=4 * 1024 * 1024)
+            adapter.rpc = RPC(process, adapter.request, adapter.notification, jsonrpc=self.jsonrpc)
+            native = adapter.rpc.request
+            async def request(method, params, **options):
+                if method in self.session_methods:
+                    self.sessions.append(method)
+                if method in self.submission_methods:
+                    self.submissions.append(method)
+                    if self.refuse_on_submit:
+                        raise RPCError({"code": -32601, "message": "Native delivery method is not supported"})
+                return await native(method, params, **options)
+            adapter.rpc.request = request
+        adapter.spawn = spawn
+        self.runner = asyncio.create_task(adapter.run())
+
+    async def launch_failing_native(self):
+        self.native_script = "import sys; sys.exit(3)"
+        await self.launch()
+        return (await asyncio.gather(self.runner, return_exceptions=True))[0]
+
+    async def refuse_capability(self):
+        self.refuse_on_submit = True
+        await self.launch()
+
+    def quiesced(self):
+        return self.runner is not None and self.runner.done()
+
+    async def shutdown(self):
+        if self.runner:
+            self.runner.cancel()
+            await asyncio.gather(self.runner, return_exceptions=True)
+
+
+class CodexConformanceTests(NativeRPCConformance, unittest.IsolatedAsyncioTestCase):
+    harness, adapter_class, script, jsonrpc = "codex", CodexAdapter, MOCK_CODEX, False
+    submission_methods, session_methods = ("turn/start",), ("thread/start",)
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        probe = patch("xordination.adapters.codex_capability", return_value={"status": "supported"})
+        probe.start()
+        self.addCleanup(probe.stop)
+
+
+class GrokConformanceTests(NativeRPCConformance, unittest.IsolatedAsyncioTestCase):
+    harness, adapter_class, script, jsonrpc = "grok", GrokAdapter, MOCK_GROK, True
+    submission_methods, session_methods = ("session/prompt", "_x.ai/interject"), ("session/new",)
+
+
+class ChannelOutput:
+    """Claude channel stdout: records each attempted frame and may close as one is written."""
+
+    def __init__(self, test):
+        self.test = test
+        self.after_frame = None
+
+    def write(self, text):
+        method = json.loads(text).get("method")
+        if method != "notifications/claude/channel":
+            return len(text)
+        self.test.submissions.append(method)
+        self.after_frame = len(self.test.client.calls)
+        if self.test.break_on_submit:
+            raise BrokenPipeError("Claude channel closed while the frame was written")
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+class ClaudeChannelConformanceTests(AdapterConformance, unittest.IsolatedAsyncioTestCase):
+    """The Claude delivery path: the MCP channel frontend after fresh registration."""
+
+    harness, refused_state = "claude", "queued"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.server = None
+
+    async def launch(self):
+        self.output = ChannelOutput(self)
+        self.server = _Server(self.client, self.output, channel=True, error_output=io.StringIO())
+        self.server.dispatch("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                            "clientInfo": {"name": "claude-fixture", "version": "1"}}, threading.Event())
+        # run_claude publishes this only after observing fresh native handler registration.
+        await asyncio.to_thread(self.client.call, "bind", native_id="claude-session",
+                                capabilities={"channel_registered": True})
+        self.server.receive({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    async def launch_failing_native(self):
+        binary = fake_claude(self.temporary.name, CLAUDE_FLAGS, accepts_channel=True, session="raise SystemExit(3)\n")
+        return await asyncio.to_thread(run_claude, self.client, binary, self.temporary.name)
+
+    async def refuse_capability(self):
+        binary = fake_claude(self.temporary.name, CLAUDE_FLAGS[:3], accepts_channel=False)
+        with self.assertRaisesRegex(CapabilityError, "unverified"):
+            await asyncio.to_thread(run_claude, self.client, binary, self.temporary.name)
+        self.assertEqual(self.client.calls, [])  # Refused before binding or launching.
+
+    def quiesced(self):
+        if self.server is None or self.server.stop.is_set():
+            return True
+        # The channel loop has polled the broker again after its single frame.
+        after = self.output.after_frame
+        return after is not None and any(operation == "identity" for operation, _ in self.client.calls[after:])
+
+    async def shutdown(self):
+        if self.server:
+            await asyncio.to_thread(self.server.close)
 
 
 if __name__ == "__main__":

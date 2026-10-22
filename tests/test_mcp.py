@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from xordination.client import BrokerError
-from xordination.mcp import INSTRUCTIONS, TOOLS, ProtocolError, _Server, run_stdio
+from xordination.mcp import INSTRUCTIONS, MAX_LINE, TOOLS, ProtocolError, _Server, run_stdio
 
 
 INITIALIZE = {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -90,6 +90,8 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"], json.loads(result["content"][0]["text"]))
         self.call("xordination_inbox", {"cursor": "signed.cursor", "limit": 10, "unacknowledged": True})
         self.assertEqual("signed.cursor", self.client.calls[-1][1]["cursor"])
+        self.call("xordination_status", {"message_id": "message-a", "limit": 5})
+        self.assertEqual(("status", {"message_id": "message-a", "limit": 5}), self.client.calls[-1])
 
     def test_schema_errors_never_reach_broker(self):
         self.initialize()
@@ -103,6 +105,8 @@ class MCPTests(unittest.TestCase):
             ("xordination_wait", {"timeout": 31}),
             ("xordination_wait", {"timeout": float("nan")}),
             ("xordination_ack", {"message_id": ""}),
+            ("xordination_status", {"message_id": "m", "limit": 0}),
+            ("xordination_status", {"message_id": "m", "limit": 101}),
             ("xordination_missing", {}),
         ]
         for name, args in invalid:
@@ -250,6 +254,42 @@ class MCPTests(unittest.TestCase):
         self.assertEqual("uncertain", finish["outcome"])
         self.assertEqual(1, sum(op == "claim" for op, _ in self.client.calls))
         self.assertTrue(self.server.stop.is_set())
+
+    def test_ping_and_initialize_cannot_reuse_an_in_flight_request_id(self):
+        self.initialize()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def handler(operation, params):
+            entered.set()
+            release.wait(5)
+            return {"id": "accepted", "state": "queued"}
+
+        self.client.handler = handler
+        self.server.receive({"jsonrpc": "2.0", "id": "held", "method": "tools/call",
+                             "params": {"name": "xordination_send", "arguments": {"to": "b", "body": "hello", "key": "k"}}})
+        self.assertTrue(entered.wait(5))
+        for method in ("ping", "initialize"):
+            self.server.receive({"jsonrpc": "2.0", "id": "held", "method": method, "params": INITIALIZE})
+        release.set()
+        self.output.await_packet(lambda p: p.get("id") == "held" and "result" in p, timeout=5)
+        replies = [packet for packet in self.output.packets() if packet.get("id") == "held"]
+        self.assertEqual([-32600, -32600], [reply["error"]["code"] for reply in replies if "error" in reply])
+        self.assertEqual(1, sum("result" in reply for reply in replies))
+
+    def test_stdio_frame_limit_counts_encoded_bytes(self):
+        # 300,000 four-byte characters stay under the character count but exceed the 1 MiB byte limit.
+        frame = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping", "pad": "\U0001F600" * 300000}, ensure_ascii=False)
+        self.assertLess(len(frame), MAX_LINE)
+        self.assertGreater(len(frame.encode()), MAX_LINE)
+        data = (frame + "\n" + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": INITIALIZE}) + "\n").encode()
+        output = io.StringIO()
+        with patch("xordination.mcp.Client", return_value=self.client), \
+             patch("sys.stdin", io.TextIOWrapper(io.BytesIO(data), encoding="utf-8")), patch("sys.stdout", output):
+            self.assertEqual(0, run_stdio("http://localhost:8765", "test-token"))
+        packets = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(-32700, packets[0]["error"]["code"])
+        self.assertEqual("2025-06-18", packets[1]["result"]["protocolVersion"])
 
     def test_stdio_parse_errors_recover_on_next_frame(self):
         input_lines = io.StringIO('{broken}\nNaN\n' + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": INITIALIZE}) + '\n')
