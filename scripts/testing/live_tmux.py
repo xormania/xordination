@@ -147,17 +147,17 @@ def claude_settings(job, name, phase_timeout):
     # The held wait may last twice the phase timeout before its deadline closes it.
     timeout = math.ceil(2 * phase_timeout) + 30
     return {"hooks": {"PreToolUse": [{"matcher": "mcp__xordination__.*",
-                                      "hooks": [{"type": "command", "command": command, "timeout": timeout}]}]}}
+                                      "hooks": [{"type": "command", "command": command, "timeout": timeout}]}],
+                      # Records that the session waits on a permission prompt; it never answers one.
+                      "Notification": [{"matcher": "permission_prompt",
+                                        "hooks": [{"type": "command", "command": command, "timeout": 30}]}]}}
 
 
 def preflight(config, doctor):
     names = required_names(config)
     if RESERVED & set(names):
         raise ValueError("Participant names dashboard/broker are reserved by the launcher")
-    observations = {}
-    for participant in config["participants"]:
-        if participant["name"] in names and participant["harness"] not in observations:
-            observations[participant["harness"]] = doctor(participant["harness"])
+    observations = live.probe_harnesses(config, doctor)
     gaps = [harness + ": " + observation.get("status", "unknown") for harness, observation in observations.items()
             if observation.get("status") != "supported"]
     return {"harnesses": observations}, gaps
@@ -196,7 +196,7 @@ def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, repl
         if "version" not in participant and observed:
             participant["version"] = observed[:500]  # Observed --version output, still an operator observation.
     write_json(job / "config.json", config)
-    live.prepare(config, job / "run")
+    live.prepare(config, job / "run", probes=found["harnesses"])  # The report embeds the probes.
     for participant in config["participants"]:
         workspace = job / "workspaces" / participant["name"]
         workspace.mkdir(parents=True, mode=0o700)
@@ -310,6 +310,11 @@ def summarize(record, report):
                        failed=[{"case_id": case["case_id"], "scenario": case["scenario"],
                                 "sender": case["sender"], "recipient": case["recipient"],
                                 "failures": case["failures"]} for case in report["cases"] if case["status"] != "pass"],
+                       busy=[{"sender": case["sender"], "recipient": case["recipient"], **case["busy"]}
+                             for case in report["cases"] if "busy" in case],
+                       native_settings=report["native_settings"],
+                       approval_waits=sum(event["kind"] == "wait" for event in report["approval_waits"]),
+                       source=report["environment"]["source"] if isinstance(report["environment"], dict) else None,
                        errors=report["errors"])
     return summary
 
@@ -321,6 +326,11 @@ def render(summary):
         for case in summary["failed"]:
             lines.append("  " + case["scenario"] + " " + case["sender"] + " -> " + case["recipient"] + ": " +
                          ", ".join(case["failures"]))
+        for case in summary.get("busy", []):
+            lines.append("  busy " + case["sender"] + " -> " + case["recipient"] + ": submission " +
+                         case["submission_during_work"] + ", handling " + case["handling"] + ", in-turn " + case["in_turn"])
+        if summary.get("approval_waits"):
+            lines.append("Native approval waits: " + str(summary["approval_waits"]))
     if summary.get("error"):
         lines.append("Supervisor: " + summary["error"])
     return "\n".join(lines) + "\n"
