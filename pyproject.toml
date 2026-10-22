@@ -23,7 +23,8 @@ classifiers = [
 
 [project.optional-dependencies]
 ci = ["coverage==7.16.2"]
-lint = ["ruff==0.17.1", "shellcheck-py==0.11.0.1", "actionlint-py==1.7.12.25"]
+lint = ["ruff==0.17.1", "shellcheck-py==0.11.0.1", "actionlint-py==1.7.12.25",
+        "tomli==2.2.1; python_version < '3.11'"]
 
 [project.scripts]
 xordination = "xordination.cli:main"
@@ -44,5 +45,26 @@ target-version = "py310"
 
 [tool.ruff.lint]
 # Correctness rules only: pyflakes, syntax/statement errors and bugbear; no style or formatting rules.
-select = ["E4", "E7", "E9", "F", "B"]
+# Plus reviewed flake8-bandit (S) rules for patterns never intended here; scripts/ci/lint_checks.py proves
+# each one is enforced by the pinned Ruff and needs a sample pair for every S rule listed.
+select = [
+    "E4", "E7", "E9", "F", "B",
+    "S102",  # exec
+    "S103",  # permissive chmod
+    "S104",  # binding all interfaces
+    "S202",  # unsafe archive extraction
+    "S301",  # pickle deserialization
+    "S302",  # marshal deserialization
+    "S306",  # insecure temporary paths
+    "S307",  # eval
+    "S323",  # unverified TLS context
+    "S324",  # weak security hashes
+    "S501",  # disabled certificate verification
+    "S506",  # unsafe YAML loading
+    "S602",  # subprocess shell execution
+    "S604",  # other calls with shell=True
+    "S605",  # shell-based process APIs
+    "S608",  # SQL built from strings
+    "S609",  # wildcard injection in Unix commands
+]
 
