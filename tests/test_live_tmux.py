@@ -41,6 +41,7 @@ client = Client(record["endpoint"], token)
 native = "scripted-native-" + name
 client.call("bind", native_id=native, capabilities={"transport": "launcher-fixture"})
 calls = 0
+memos = {}  # Session context: what earlier messages in this native session said.
 def observe(tool, arguments):
     global calls
     calls += 1
@@ -69,8 +70,14 @@ while True:
             if task["tool"] == "xordination_send":
                 send(task["arguments"])  # No native wait hold: busy readiness never arrives.
     elif "reply" in body and not message["reply_to"]:
+        if "memo" in body:
+            memos[body["case_id"]] = body["memo"]
         time.sleep(reply_delay)
         send({"to": message["from"], "to_generation": message["from_generation"], "body": body["reply"],
+              "reply_to": message["id"], "key": "reply-" + message["id"]})
+    elif body.get("phase") == "recall":
+        send({"to": message["from"], "to_generation": message["from_generation"],
+              "body": body["reply_prefix"] + memos.get(body["case_id"], "forgotten"),
               "reply_to": message["id"], "key": "reply-" + message["id"]})
 '''
 
@@ -127,8 +134,9 @@ class ProcessTmux:
         self.owner = None
 
 
-def supported(harness):
-    return {"harness": harness, "status": "supported", "version": {"value": "fixture " + harness + " 1.0"}}
+def supported(harness, binary=None):
+    return {"harness": harness, "status": "supported", "binary": binary or "/opt/" + harness + "/bin/" + harness,
+            "version": {"value": "fixture " + harness + " 1.0"}}
 
 
 class LauncherTests(unittest.TestCase):
@@ -159,6 +167,8 @@ class LauncherTests(unittest.TestCase):
                        startup_timeout=30, reply_timeout=30)
         config = json.loads((job / "config.json").read_text())
         self.assertEqual(config["participants"][0]["version"], "fixture codex 1.0")
+        # The probed executable is recorded so readiness can match evidence to it later.
+        self.assertEqual(config["participants"][0]["binary"], "/opt/codex/bin/codex")
         processes = []
         launch = self.tmux.launch
         self.tmux.launch = lambda record, name, argv: processes.append(name) or launch(record, name, argv)
@@ -177,6 +187,14 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(all(item["status"] == "closed" for item in record["cleanup"]))
         self.assertEqual(self.tmux.panes, {})
         self.assertEqual(len(list((job / "run").glob("report-*.json"))), 1)
+        report = json.loads(next((job / "run").glob("report-*.json")).read_text())
+        # The retained report carries the run identity and the preflight doctor probe.
+        self.assertEqual(report["environment"]["capability_probes"],
+                         {"alpha": supported("codex"), "beta": supported("codex")})
+        self.assertEqual(summary["source"], report["environment"]["source"])
+        self.assertEqual({name: (entry["observed_model"], entry["observed_reasoning"])
+                          for name, entry in summary["native_settings"].items()},
+                         {"alpha": ("unobserved", "unobserved"), "beta": ("unobserved", "unobserved")})
         tokens = [json.loads(path.read_text())["token"] for path in (job / "run").glob("*.connection.json")]
         for log in (job / "logs").glob("*-terminal.log"):
             self.assertFalse(any(token in log.read_text() for token in tokens))
@@ -184,6 +202,33 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("scripted native ready", alpha)
         self.assertIn("diagnostic token=[redacted]", alpha)
         self.assertEqual(list((job / "environment").iterdir()), [])
+
+    def test_retained_context_recall_is_sent_only_after_the_earlier_exchange(self):
+        path = self.folder / "config.json"
+        path.write_text(json.dumps({"participants": [{"name": "alpha", "harness": "codex"},
+                                                     {"name": "beta", "harness": "codex"}],
+                                    "pairs": [["alpha", "beta"]], "scenarios": ["idle", "context"]}))
+        record = launcher.prepare_job(path, self.folder / "job", doctor=supported, startup_timeout=30,
+                                      reply_timeout=30)
+        self.tmux.create(record)
+        job = Path(record["directory"])
+        self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 0)
+        summary = json.loads((job / "summary.json").read_text())
+        self.assertEqual((summary["status"], summary["passed_cases"], summary["required_cases"]), ("pass", 2, 2))
+        run = job / "run"
+        frozen = json.loads((run / "frozen.json").read_text())
+        case = next(case for case in frozen["cases"] if case["scenario"] == "context")
+        self.assertNotIn(case["memo"], case["recall"]["body"])  # Only the earlier message carries it.
+        report = launcher.live.verify(run, retain=False)
+        phases = next(item for item in report["cases"] if item["case_id"] == case["case_id"])["phases"]
+        self.assertTrue(phases["context_order"] and phases["recall_reply"] and phases["recall_native_ack"])
+        settled = json.loads((run / "context-earlier-complete.json").read_text())
+        self.assertEqual(settled["case_ids"], [case["case_id"]])
+        # The recall task left the controller only after the earlier exchange was verified complete.
+        events = [json.loads(line) for line in (run / "native" / "alpha.jsonl").read_text().splitlines()]
+        recall_send = next(event for event in events if event["tool"] == "xordination_send"
+                           and event["arguments"]["body"] == case["recall"]["body"])
+        self.assertGreater(recall_send["monotonic_ns"], settled["monotonic_ns"])
 
     def test_missing_native_readiness_stops_before_capture_or_dispatch(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
@@ -229,6 +274,9 @@ class LauncherTests(unittest.TestCase):
         summary = json.loads((job / "summary.json").read_text())
         self.assertEqual(summary["status"], "fail")
         self.assertEqual(sum(case["scenario"] == "idle" for case in summary["failed"]), 0)  # Idle evidence kept.
+        # No native readiness: busy submission failed explicitly, while unobserved handling stays unknown.
+        self.assertEqual([(case["submission_during_work"], case["handling"], case["in_turn"]) for case in summary["busy"]],
+                         [("failed", "unknown", "unknown")] * 2)
         self.assertEqual(self.tmux.panes, {})
 
     def test_stop_during_dispatch_cancels_the_held_phase(self):
@@ -396,6 +444,41 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(json.loads((job / "session.json").read_text())["state"], "error")
         self.assertIsNone(self.tmux.owner)
 
+    def test_preflight_probes_and_records_each_configured_executable(self):
+        calls = []
+        def observed(harness, binary=None):
+            calls.append((harness, binary))
+            if binary is None:
+                # The PATH default: absent for grok, another release for codex.
+                return ({"harness": harness, "status": "unavailable"} if harness == "grok" else
+                        {**supported(harness), "version": {"value": "path " + harness + " 1.0"}})
+            return {**supported(harness, binary), "version": {"value": "custom " + binary}}
+        job = self.job([{"name": "alpha", "harness": "codex", "binary": "/opt/custom/codex"},
+                        {"name": "beta", "harness": "grok", "binary": "/opt/custom/grok"},
+                        {"name": "gamma", "harness": "codex"},
+                        {"name": "delta", "harness": "codex", "binary": "/opt/custom/codex"}], doctor=observed)
+        # A valid executable outside PATH passes; each distinct executable is probed once.
+        self.assertEqual(sorted(calls, key=str), sorted([("codex", "/opt/custom/codex"), ("grok", "/opt/custom/grok"),
+                                                         ("codex", None)], key=str))
+        participants = {row["name"]: row for row in json.loads((job / "config.json").read_text())["participants"]}
+        self.assertEqual((participants["alpha"]["binary"], participants["alpha"]["version"]),
+                         ("/opt/custom/codex", "custom /opt/custom/codex"))
+        self.assertEqual((participants["beta"]["binary"], participants["beta"]["version"]),
+                         ("/opt/custom/grok", "custom /opt/custom/grok"))
+        self.assertEqual(participants["delta"]["version"], "custom /opt/custom/codex")
+        self.assertEqual((participants["gamma"]["binary"], participants["gamma"]["version"]),
+                         ("/opt/codex/bin/codex", "path codex 1.0"))
+        preflight = json.loads((job / "preflight.json").read_text())
+        self.assertEqual(preflight["participants"]["alpha"]["binary"], "/opt/custom/codex")
+
+    def test_preflight_names_an_unavailable_configured_executable(self):
+        def observed(harness, binary=None):
+            return {"harness": harness, "status": "unavailable"} if binary else supported(harness)
+        with self.assertRaisesRegex(ValueError, r"codex \(/opt/missing/codex\): unavailable"):
+            self.job([{"name": "alpha", "harness": "codex", "binary": "/opt/missing/codex"},
+                      {"name": "beta", "harness": "codex"}], doctor=observed)
+        self.assertFalse((self.folder / "job" / "run").exists())
+
     def test_reserved_window_names_are_refused(self):
         with self.assertRaisesRegex(ValueError, "reserved"):
             self.job([{"name": "broker", "harness": "codex"}, {"name": "beta", "harness": "codex"}])
@@ -404,12 +487,16 @@ class LauncherTests(unittest.TestCase):
         job = self.job([{"name": "alpha", "harness": "claude"}, {"name": "beta", "harness": "codex"}],
                        phase_timeout=45)
         settings = json.loads((job / "workspaces" / "alpha" / ".claude" / "settings.local.json").read_text())
-        self.assertEqual(set(settings["hooks"]), {"PreToolUse"})
+        self.assertEqual(set(settings["hooks"]), {"PreToolUse", "Notification"})
         entry = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(entry["matcher"], "mcp__xordination__.*")
         hook = entry["hooks"][0]
         self.assertIn("observe-claude --run " + str(job / "run") + " --participant alpha", hook["command"])
         self.assertGreater(hook["timeout"], 2 * 45)
+        # Permission prompts are observed as evidence; the same passive observer never answers them.
+        notification = settings["hooks"]["Notification"][0]
+        self.assertEqual(notification["matcher"], "permission_prompt")
+        self.assertEqual(notification["hooks"][0]["command"], hook["command"])
         self.assertFalse((job / "workspaces" / "beta" / ".claude").exists())
 
     def test_claude_readiness_waits_for_channel_registration(self):

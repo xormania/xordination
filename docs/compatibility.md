@@ -31,12 +31,14 @@ For three supported harness types, use one parameterized scenario for the six cr
 
 | Level | Passing evidence | Insufficient evidence |
 | --- | --- | --- |
-| Package | Installed correct version, console entry point, writable durable-state location | Checkout exists |
+| Package | Installed correct version, console entry point on `PATH` attributable to that installation, writable durable-state location | Checkout exists |
 | Service | Shared broker state and authenticated participant operation work | Listening port alone |
 | Adapter | Required installed native methods and session identity observations succeed | Executable/version label alone |
 | Communication | Intended native session handles a fresh exchange with correlated receipt/reply evidence | Queue insertion, MCP handshake, or channel registration alone |
 
 A report returns each level separately. Communication readiness does not establish application-work completion or useful model reasoning.
+
+`xordination readiness` produces this report without starting native sessions; see the [README](../README.md#readiness-report). Its adapter level combines the installed `doctor` capability with native session identity observed in supplied passing evidence. Its communication level is `unverified` unless a retained operator-native verification report is supplied whose source, configuration and participant executable/version fingerprints match the current package and `doctor` observations.
 
 ## Protocol and lifecycle limits
 

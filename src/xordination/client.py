@@ -20,7 +20,8 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def _opener(endpoint):
+def broker_opener(endpoint):
+    """Validate a broker endpoint; loopback requests never use ambient proxies."""
     parsed = urlsplit(endpoint)
     if (parsed.scheme not in {"http", "https"} or not parsed.hostname
             or parsed.username or parsed.password or parsed.query or parsed.fragment):
@@ -33,24 +34,27 @@ def _opener(endpoint):
     return build_opener(ProxyHandler({}), NoRedirect()) if local else build_opener(NoRedirect())
 
 
-def health(endpoint, timeout=5):
-    """Read the unauthenticated service health document; no credential is sent."""
-    opener = _opener(endpoint)
+def health(endpoint, timeout=10):
+    """Unauthenticated liveness; a listening port alone is not service readiness."""
+    opener = broker_opener(endpoint)
     try:
         with opener.open(endpoint.rstrip("/") + "/health", timeout=timeout) as response:
-            result = json.load(response)
-    except (URLError, TimeoutError, OSError, HTTPException):
-        raise BrokerError("connection_error", "Broker health is unavailable") from None
-    except ValueError:
-        result = None
-    if not isinstance(result, dict):
-        raise BrokerError("invalid_response", "Broker returned an invalid response")
-    return result
+            value = json.load(response)
+    except HTTPError as exc:
+        raise BrokerError("http_error", "Broker health returned HTTP " + str(exc.code)) from None
+    except (OSError, TimeoutError) as exc:
+        raise BrokerError("connection_error", str(exc.reason) if isinstance(exc, URLError)
+                          else "Broker health check failed") from None
+    except (ValueError, HTTPException):
+        raise BrokerError("invalid_response", "Broker health returned an invalid response") from None
+    if not isinstance(value, dict) or value.get("ok") is not True or value.get("service") != "xordination":
+        raise BrokerError("invalid_response", "Endpoint did not report a healthy Xordination broker")
+    return value
 
 
 class Client:
     def __init__(self, endpoint, token, timeout=40):
-        opener = _opener(endpoint)
+        opener = broker_opener(endpoint)
         if not isinstance(token, str) or not token:
             raise ValueError("A participant token is required")
         self.endpoint = endpoint.rstrip("/")

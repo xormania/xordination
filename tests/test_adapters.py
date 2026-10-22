@@ -3,7 +3,9 @@
 import asyncio
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,10 +17,10 @@ from xordination.adapters import (BrokerReconnect, CapabilityError, ClaudeChanne
                                  claude_hook, doctor, run_adapter, run_claude)
 from xordination.client import BrokerError, Client
 from xordination.mcp import _Server
-from xordination.rpc import RPC, RPCError
+from xordination.rpc import MARKER, RPC, RPCError
 from xordination.store import StoreError
 from xordination.trace import Trace, redact
-from native_fixtures import MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
+from native_fixtures import FAMILY_NATIVE, MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
 
 def crash_after_reading(script, methods, receipts):
@@ -257,6 +259,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         finished = [params for op, params in self.client.calls if op == "finish"]
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0]["outcome"], "uncertain")
+        self.assertNotIn("retry_safe", finished[0])
         self.assertFalse(any(op == "retry" for op, _ in self.client.calls))
 
     async def test_codex_start_preserves_native_configuration(self):
@@ -450,6 +453,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.deliver(msg)
         finished = next(params for op, params in self.client.calls if op == "finish")
         self.assertEqual(finished["outcome"], "failed")
+        self.assertIs(finished["retry_safe"], True)
         self.assertEqual(methods, ["_x.ai/interject"])
 
     async def test_grok_late_completion_cannot_clear_newer_activity(self):
@@ -725,6 +729,213 @@ for line in sys.stdin:
         finally:
             process.terminate()
             await process.wait()
+
+    def lock_held(self, path):
+        import fcntl
+        with open(path, "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
+
+    async def spawn_family(self, adapter, mode="polite"):
+        # The lock is released only when the detached grandchild exits, which
+        # avoids judging liveness by a PID that may be a zombie or reused.
+        lock = str(Path(self.temporary.name) / ("family-" + mode + ".lock"))
+        await adapter.spawn([sys.executable, "-u", "-c", FAMILY_NATIVE, lock, mode], jsonrpc=False)
+        self.assertEqual((await adapter.rpc.request("fixture/held", {}, timeout=10))["held"], "held")
+        self.assertTrue(self.lock_held(lock))
+        return lock
+
+    async def until_released(self, lock):
+        async def poll():
+            while self.lock_held(lock):
+                await asyncio.sleep(.02)
+        await asyncio.wait_for(poll(), 5)
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_adapter_stop_ends_detached_native_descendants(self):
+        for mode in ("polite", "stubborn"):
+            with self.subTest(mode=mode):
+                adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+                lock = await self.spawn_family(adapter, mode)
+                adapter.rpc.stop_grace = .5
+                await adapter.close()
+                await self.until_released(lock)
+                self.assertIsNone(adapter.rpc.group)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "member scan reads /proc")
+    async def test_reaped_leader_never_signals_a_reused_group_id(self):
+        leader = await asyncio.create_subprocess_exec(sys.executable, "-c", "pass", start_new_session=True,
+                                                      stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        await leader.wait()
+        # A foreign group now holds the ID the reaped leader had; stand in by pointing the RPC at it.
+        foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True, env={**os.environ, MARKER: "foreign"})
+        self.addCleanup(foreign.wait)
+        self.addCleanup(foreign.kill)
+        rpc = RPC(leader, lambda *args: None, lambda *args: None, jsonrpc=False, family="family-a")
+        rpc.group = foreign.pid
+        rpc.stop_grace = .2
+        await rpc.close()
+        self.assertIsNone(foreign.poll())
+        self.assertIsNone(rpc.group)
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_native_crash_leaves_no_detached_descendants_after_adapter_cleanup(self):
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        lock = await self.spawn_family(adapter)
+        with self.assertRaises(ConnectionError):
+            await adapter.rpc.request("fixture/crash", {})
+        await adapter.rpc.process.wait()
+        self.assertTrue(self.lock_held(lock), "The crashed native's grandchild outlives its parent")
+        await adapter.close()
+        await self.until_released(lock)
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_adapter_failure_after_spawn_stops_native_family(self):
+        adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
+        locks = []
+        async def start():
+            locks.append(await self.spawn_family(adapter))
+            raise RuntimeError("adapter failed after native launch")
+        adapter.start = start
+        with self.assertRaisesRegex(RuntimeError, "after native launch"):
+            await adapter.run()
+        await self.until_released(locks[0])
+        self.assertTrue(any(op == "stop" for op, _ in self.client.calls))
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_adapter_termination_signal_stops_native_family(self):
+        # The native's own session no longer receives the terminal's signals;
+        # SIGTERM to the adapter must run the same cleanup instead of orphaning it.
+        lock = str(Path(self.temporary.name) / "signalled.lock")
+        script = (
+            "import asyncio,sys\n"
+            "from xordination.adapters import CodexAdapter, supervise\n"
+            "class Client:\n"
+            "    def call(self, operation, **params):\n"
+            "        return {}\n"
+            "adapter = CodexAdapter(Client(), sys.executable, '.')\n"
+            "async def start():\n"
+            "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'polite'], jsonrpc=False)\n"
+            "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
+            "    print('ready', flush=True)\n"
+            "adapter.start = start\n"
+            "sys.exit(asyncio.run(supervise(adapter)))\n")
+        import xordination
+        # Import the package under test from wherever this run imported it.
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
+        child = subprocess.Popen([sys.executable, "-c", script, FAMILY_NATIVE, lock], cwd=self.temporary.name,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            ready = await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)
+            self.assertEqual(ready, b"ready\n")
+            self.assertTrue(self.lock_held(lock))
+            child.terminate()
+            self.assertEqual(await asyncio.wait_for(asyncio.to_thread(child.wait), 10), 128 + 15)
+            await self.until_released(lock)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_termination_stops_native_family_before_blocked_settlement(self):
+        # A pending attempt's broker finish can block for the client timeout; the
+        # family must not wait for it, or a SIGKILL escalation orphans it.
+        lock = str(Path(self.temporary.name) / "settling.lock")
+        record = Path(self.temporary.name) / "finish.json"
+        script = (
+            "import asyncio,json,sys,time\n"
+            "from xordination.adapters import CodexAdapter, supervise\n"
+            "class Client:\n"
+            "    def call(self, operation, **params):\n"
+            "        if operation == 'finish':\n"
+            "            with open(sys.argv[3], 'w') as handle:\n"
+            "                json.dump(params, handle)\n"
+            "            time.sleep(30)\n"
+            "        return {}\n"
+            "adapter = CodexAdapter(Client(), sys.executable, '.')\n"
+            "async def start():\n"
+            "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'polite'], jsonrpc=False)\n"
+            "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
+            "    adapter.pending_attempts['attempt-1'] = {'id': 'message-1', 'attempt_id': 'attempt-1'}\n"
+            "    print('ready', flush=True)\n"
+            "adapter.start = start\n"
+            "sys.exit(asyncio.run(supervise(adapter)))\n")
+        import xordination
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
+        child = subprocess.Popen([sys.executable, "-c", script, FAMILY_NATIVE, lock, str(record)],
+                                 cwd=self.temporary.name, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        try:
+            ready = await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)
+            self.assertEqual(ready, b"ready\n")
+            self.assertTrue(self.lock_held(lock))
+            child.terminate()
+            await self.until_released(lock)
+            async def settled():
+                while not record.exists() or not record.read_text():
+                    await asyncio.sleep(.02)
+            await asyncio.wait_for(settled(), 5)
+            # Settlement is still attempted after the stop, and only as uncertain.
+            finish = json.loads(record.read_text())
+            self.assertEqual((finish["attempt_id"], finish["outcome"]), ("attempt-1", "uncertain"))
+            self.assertIsNone(child.poll(), "The adapter is still blocked in settlement")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_termination_during_cleanup_still_kills_stubborn_family(self):
+        # The broker stopped the adapter, so cleanup is already in its grace
+        # period when SIGTERM arrives; the signal must not cut it short.
+        lock = str(Path(self.temporary.name) / "cleanup.lock")
+        script = (
+            "import asyncio,sys\n"
+            "from xordination.adapters import CodexAdapter, supervise\n"
+            "class Client:\n"
+            "    def call(self, operation, **params):\n"
+            "        return {'stopped': True} if operation == 'claim' else {}\n"
+            "adapter = CodexAdapter(Client(), sys.executable, '.')\n"
+            "async def start():\n"
+            "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'stubborn'], jsonrpc=False)\n"
+            "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
+            "    adapter.rpc.stop_grace = 1.5\n"
+            "    send = adapter.rpc.send\n"
+            "    def sent(group, kill):\n"
+            "        send(group, kill)\n"
+            "        print('killed' if kill else 'terminated', flush=True)\n"
+            "    adapter.rpc.send = sent\n"
+            "adapter.start = start\n"
+            "sys.exit(asyncio.run(supervise(adapter)))\n")
+        import xordination
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
+        child = subprocess.Popen([sys.executable, "-c", script, FAMILY_NATIVE, lock], cwd=self.temporary.name,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            line = await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)
+            self.assertEqual(line, b"terminated\n")
+            self.assertTrue(self.lock_held(lock), "The grandchild ignores SIGTERM")
+            child.terminate()
+            self.assertEqual(await asyncio.wait_for(asyncio.to_thread(child.wait), 10), 128 + 15)
+            # Checked at the supervisor's return, not after a later reprieve.
+            self.assertFalse(self.lock_held(lock), "supervise returned while the family survived")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
 
 
 class ProbeAndChannelTests(unittest.TestCase):

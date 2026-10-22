@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 from . import __version__
 
 MAX_REQUEST_BYTES = 262144
-OPERATIONS = {"peers", "send", "inbox", "wait", "ack", "status", "retry",
-              "bind", "claim", "finish", "stop", "recover", "identity"}
+OPERATIONS = {"peers", "send", "inbox", "wait", "ack", "status", "retry", "cancel",
+              "bind", "claim", "finish", "observe", "stop", "recover", "identity"}
 
 
 class OwnershipLock:

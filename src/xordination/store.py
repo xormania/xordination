@@ -159,6 +159,10 @@ class Store:
     MAX_PAGE_SIZE = 100
     MAX_PENDING = 1000
     CLAIM_SECONDS = 60
+    # Only acknowledgement kinds mean the recipient acknowledged. Native
+    # insertion is a receipt too, but a weaker one.
+    ACK_KINDS = ("client_ack", "native_ack")
+    OBSERVED_KINDS = ("native_insertion", "native_ack")
 
     def __init__(self, path, *, recover_claims=False):
         self.path = str(path)
@@ -300,6 +304,10 @@ class Store:
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL REFERENCES messages(id),
                 previous_generation TEXT NOT NULL, generation TEXT NOT NULL, observed REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cancellations (
+                message_id TEXT PRIMARY KEY REFERENCES messages(id), participant TEXT NOT NULL,
+                generation TEXT NOT NULL, previous_state TEXT NOT NULL, reason TEXT, observed REAL NOT NULL
+            );
             -- Added without a schema version change: older brokers ignore it and
             -- this one creates it on open. Kept outside the caller-controlled
             -- capabilities so its size budget can never roll back a fence.
@@ -310,6 +318,9 @@ class Store:
             PRAGMA user_version=1;
         """)
         with self._transaction():
+            # Additive schema-1 extension: earlier brokers ignore this column.
+            if not any(row["name"] == "retry_safe" for row in self._db.execute("PRAGMA table_info(attempts)")):
+                self._db.execute("ALTER TABLE attempts ADD COLUMN retry_safe INTEGER")
             self._db.execute("INSERT OR IGNORE INTO settings VALUES ('cursor_secret', ?)", (secrets.token_hex(32),))
             self._cursor_secret = bytes.fromhex(self._db.execute("SELECT value FROM settings WHERE name='cursor_secret'").fetchone()[0])
             self._reconcile(restart=recover_claims)
@@ -465,8 +476,8 @@ class Store:
     def _fence(principal):
         # A binding whose native conversation changed (for example Claude /clear)
         # keeps its token, but the new conversation must not read, send,
-        # acknowledge or retry as the old one. identity, status (with content
-        # withheld), finish (late evidence only), bind and stop stay available.
+        # acknowledge, observe, retry or cancel as the old one. identity, status
+        # (with content withheld), finish (late evidence only), bind and stop stay available.
         if principal["native_identity_source"] == "conflict":
             _fail("replacement_required", "The native session changed; communication is fenced until explicit participant replacement")
 
@@ -530,7 +541,7 @@ class Store:
                 if to not in (reference["sender"], reference["recipient"]):
                     _fail("invalid_reply", "A direct reply must address a participant in the referenced exchange")
             pending = self._db.execute("""SELECT COUNT(*) FROM messages m WHERE space=? AND recipient=?
-                AND state!='expired' AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id)""", (principal["space"], to)).fetchone()[0]
+                AND state NOT IN ('expired','cancelled') AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id)""", (principal["space"], to)).fetchone()[0]
             if pending >= self.MAX_PENDING:
                 _fail("queue_full", "Recipient pending-message limit reached")
             identifier = uuid.uuid4().hex
@@ -545,7 +556,8 @@ class Store:
             return result
 
     def _message(self, row, withheld=False):
-        received = self._db.execute("SELECT COUNT(*) FROM receipts WHERE message_id=?", (row["id"],)).fetchone()[0]
+        received, acknowledged = self._db.execute("SELECT COUNT(*),COUNT(CASE WHEN kind IN (?,?) THEN 1 END) FROM receipts WHERE message_id=?",
+                                                  (*self.ACK_KINDS, row["id"])).fetchone()
         result = {"schema_version": 1, "id": row["id"], "message_id": row["id"], "sequence": row["sequence"], "space": row["space"],
                 "from": row["sender"], "sender": row["sender"], "from_generation": row["sender_generation"],
                 "to": row["recipient"], "requested_to": row["requested_to"], "requested_generation": row["requested_generation"],
@@ -553,7 +565,7 @@ class Store:
                 "body": row["body"], "key": row["idempotency_key"], "metadata": json.loads(row["metadata"]),
                 "reply_to": row["reply_to"], "created_at": row["created"], "expires_at": row["expires"],
                 "expired": bool(row["expires"] is not None and row["expires"] <= time.time()),
-                "state": row["state"], "accepted": True, "acknowledged": bool(received)}
+                "state": row["state"], "accepted": True, "received": bool(received), "acknowledged": bool(acknowledged)}
         if withheld:
             result.update(body=None, metadata=None, content_withheld="native_identity_conflict")
         return result
@@ -596,15 +608,26 @@ class Store:
             self._fence(principal)
             self._reconcile()
             sequence, resync = self._read_cursor(cursor, principal)
-            query = "SELECT m.* FROM messages m WHERE space=? AND recipient=? AND delivery_generation=? AND sequence>?"
-            if unacknowledged:
-                query += " AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id)"
-            rows = self._db.execute(query + " ORDER BY sequence LIMIT ?", (principal["space"], principal["participant"], principal["generation"], sequence, limit + 1)).fetchall()
+            # One fixed filter serves both queries; the flag selects the
+            # unacknowledged view. Native insertion alone is not the
+            # recipient's acknowledgement.
+            visible = """FROM messages m WHERE space=? AND recipient=? AND delivery_generation=? AND sequence>?
+                AND (?=0 OR NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id AND r.kind IN (?,?)))"""
+            arguments = (principal["space"], principal["participant"], principal["generation"], sequence, int(unacknowledged), *self.ACK_KINDS)
+            # Cancellation stops delivery, so a cancelled body never reaches
+            # the recipient through inbox or wait. The state is terminal.
+            rows = self._db.execute(f"SELECT m.* {visible} AND m.state!='cancelled' ORDER BY sequence LIMIT ?", (*arguments, limit + 1)).fetchall()
             page = rows[:limit]
+            has_more = len(rows) > limit
             position = page[-1]["sequence"] if page else sequence
+            if not has_more:
+                # Advance past trailing cancelled rows so the cursor reflects
+                # everything already disposed of.
+                skipped = self._db.execute(f"SELECT MAX(m.sequence) {visible} AND m.state='cancelled'", arguments).fetchone()[0]
+                position = max(position, skipped or 0)
             following = self._cursor(principal, position)
             return {"messages": [self._message(row) for row in page], "cursor": following, "next_cursor": following,
-                    "resume_cursor": following, "has_more": len(rows) > limit, "resync_required": resync,
+                    "resume_cursor": following, "has_more": has_more, "resync_required": resync,
                     "visibility_epoch": principal["visibility_epoch"], "position": position}
 
     @staticmethod
@@ -622,14 +645,54 @@ class Store:
             _fail("forbidden", "The message is not authorized for this participant binding")
         return message
 
-    def ack(self, ctx, message_id):
+    def _own_attempt(self, attempt_id, message, principal):
+        _identifier(attempt_id, "attempt_id")
+        attempt = self._db.execute("SELECT * FROM attempts WHERE id=? AND message_id=?", (attempt_id, message["id"])).fetchone()
+        if attempt is None or attempt["generation"] != principal["generation"]:
+            _fail("forbidden", "The attempt does not belong to this message and recipient generation")
+        return attempt
+
+    def ack(self, ctx, message_id, attempt_id=None):
+        """Record the client's acknowledgement; it never proves native ingestion."""
         with self._transaction():
             principal = self._context(ctx)
             self._fence(principal)
             message = self._get_message(message_id, principal, recipient_only=True)
-            self._db.execute("""INSERT OR IGNORE INTO receipts(id,message_id,generation,observer,kind,native_id,observed)
-                VALUES (?,?,?,?, 'client_ack',?,?)""", (uuid.uuid4().hex, message_id, principal["generation"], principal["participant"], principal["native_id"], time.time()))
+            if attempt_id is not None:
+                self._own_attempt(attempt_id, message, principal)
+            self._db.execute("""INSERT OR IGNORE INTO receipts(id,message_id,generation,observer,kind,attempt_id,native_id,observed)
+                VALUES (?,?,?,?, 'client_ack',?,?,?)""", (uuid.uuid4().hex, message_id, principal["generation"], principal["participant"], attempt_id, principal["native_id"], time.time()))
             return {"message_id": message_id, "acknowledged": True, "receipt": self._receipt(self._db.execute("SELECT * FROM receipts WHERE message_id=? AND generation=? AND kind='client_ack'", (message_id, principal["generation"])).fetchone()), "state": message["state"]}
+
+    def observe(self, ctx, message_id, attempt_id, kind, evidence):
+        """Record an adapter's independent native observation of one attempt.
+
+        ``native_insertion`` means content was seen entering the bound native
+        session; ``native_ack`` means a correlated native agent acknowledgement.
+        Neither changes the attempt's recorded submission outcome.
+        """
+        if kind not in self.OBSERVED_KINDS:
+            _fail("invalid_argument", "kind must be native_insertion or native_ack")
+        if not isinstance(evidence, dict) or not evidence:
+            _fail("invalid_argument", "evidence must be a nonempty object describing the observation")
+        evidence_json = _json(evidence, label="receipt evidence")
+        with self._transaction():
+            principal = self._context(ctx)
+            # A receipt from the changed native conversation would suppress
+            # retry for content it may never have held.
+            self._fence(principal)
+            message = self._get_message(message_id, principal, recipient_only=True)
+            attempt = self._own_attempt(attempt_id, message, principal)
+            if principal["native_id"] is None or attempt["native_id"] != principal["native_id"]:
+                _fail("native_identity_required", "Native observations require the attempt's bound native session identity")
+            if attempt["state"] == "failed":
+                _fail("attempt_failed", "A definitively failed attempt cannot carry native receipt evidence")
+            self._db.execute("""INSERT OR IGNORE INTO receipts(id,message_id,generation,observer,kind,attempt_id,native_id,evidence,observed)
+                VALUES (?,?,?,?,?,?,?,?,?)""", (uuid.uuid4().hex, message_id, principal["generation"], principal["participant"], kind,
+                                               attempt_id, principal["native_id"], evidence_json, time.time()))
+            receipt = self._db.execute("SELECT * FROM receipts WHERE message_id=? AND generation=? AND observer=? AND kind=?",
+                                       (message_id, principal["generation"], principal["participant"], kind)).fetchone()
+            return {"message_id": message_id, "received": True, "receipt": self._receipt(receipt), "state": message["state"]}
 
     @staticmethod
     def _receipt(row):
@@ -675,11 +738,15 @@ class Store:
             result["replies"] = [self._message(row, withheld) for row in rows("replies", """FROM messages WHERE reply_to=? AND space=?
                 AND (sender=? OR (recipient=? AND delivery_generation=?))""", (message_id, principal["space"], principal["participant"],
                 principal["participant"], principal["generation"]), "sequence")]
+            # Kinds cover every receipt, including any a limit omits.
+            result["receipt_kinds"] = [row[0] for row in self._db.execute(
+                "SELECT DISTINCT kind FROM receipts WHERE message_id=? ORDER BY kind", (message_id,))]
             result["recoveries"] = [dict(row) for row in rows("recoveries", "FROM recoveries WHERE message_id=?", (message_id,), "sequence")]
+            result["cancellation"] = self._cancellation(message_id, withheld)
             result["uncertain"] = message["state"] == "uncertain" or self._db.execute("""SELECT EXISTS(SELECT 1 FROM attempts a
                 WHERE a.message_id=? AND (a.state='uncertain' OR EXISTS(SELECT 1 FROM attempt_evidence e
                 WHERE e.attempt_id=a.id AND e.outcome='uncertain')))""", (message_id,)).fetchone()[0] == 1
-            result["unresolved_uncertainty"] = message["state"] == "uncertain" and not result["acknowledged"]
+            result["unresolved_uncertainty"] = message["state"] == "uncertain" and not result["received"]
             if limit is not None:
                 result["limit"] = limit
                 result["totals"] = totals
@@ -691,7 +758,50 @@ class Store:
     def _attempt(row):
         return {"id": row["id"], "attempt_id": row["id"], "message_id": row["message_id"], "generation": row["generation"],
                 "native_id": row["native_id"], "state": row["state"], "claimed_at": row["claimed"],
-                "lease_until": row["lease_until"], "finished_at": row["finished"], "detail": json.loads(row["detail"]) if row["detail"] else None}
+                "lease_until": row["lease_until"], "finished_at": row["finished"], "detail": json.loads(row["detail"]) if row["detail"] else None,
+                "retry_safe": None if row["retry_safe"] is None else bool(row["retry_safe"])}
+
+    def _cancellation(self, message_id, withheld=False):
+        row = self._db.execute("SELECT * FROM cancellations WHERE message_id=?", (message_id,)).fetchone()
+        if row is None:
+            return None
+        # Only a failure affirmatively reported retry-safe proves nothing
+        # reached the native session; unknown or unsafe failures may have.
+        submitted = self._db.execute("""SELECT 1 FROM attempts WHERE message_id=? AND (state IN ('submitted','uncertain')
+            OR (state='failed' AND (retry_safe IS NULL OR retry_safe=0)))""", (message_id,)).fetchone()
+        return {"participant": row["participant"], "generation": row["generation"], "previous_state": row["previous_state"],
+                # The reason is sender-written content, withheld like body and metadata.
+                "reason": None if withheld else row["reason"], "cancelled_at": row["observed"],
+                # Cancellation cannot retract content a native session may already hold.
+                "may_have_been_submitted": submitted is not None}
+
+    def cancel(self, ctx, message_id, reason=None):
+        """Sender-authorized terminal stop of further delivery; history is retained."""
+        if reason is not None and (not isinstance(reason, str) or not reason or len(reason.encode()) > 1000):
+            _fail("invalid_argument", "reason must be a nonempty string of at most 1000 bytes")
+        with self._transaction():
+            principal = self._context(ctx)
+            self._fence(principal)
+            self._reconcile()
+            message = self._get_message(message_id, principal)
+            if message["sender"] != principal["participant"]:
+                _fail("forbidden", "Only the authenticated sender can cancel a pending delivery")
+            if message["state"] != "cancelled":
+                if self._db.execute("SELECT 1 FROM receipts WHERE message_id=?", (message_id,)).fetchone():
+                    _fail("already_received", "A received message has no pending delivery to cancel")
+                if message["state"] == "expired":
+                    _fail("expired", "Expiry already stopped delivery of this message")
+                if message["state"] == "claimed":
+                    _fail("in_flight", "A claimed attempt is in flight; cancel after its outcome is recorded")
+                if message["state"] == "submitted":
+                    _fail("already_submitted", "The native session accepted this message; cancellation cannot retract it")
+                self._db.execute("INSERT INTO cancellations(message_id,participant,generation,previous_state,reason,observed) VALUES (?,?,?,?,?,?)",
+                                 (message_id, principal["participant"], principal["generation"], message["state"], reason, time.time()))
+                self._db.execute("UPDATE messages SET state='cancelled' WHERE id=?", (message_id,))
+            result = self._message(self._db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone())
+            result["cancellation"] = self._cancellation(message_id)
+            result["idempotent_replay"] = message["state"] == "cancelled"
+            return result
 
     def retry(self, ctx, message_id):
         with self._transaction():
@@ -703,6 +813,8 @@ class Store:
                 _fail("forbidden", "Only the authenticated sender can authorize a delivery retry")
             if self._db.execute("SELECT 1 FROM receipts WHERE message_id=?", (message_id,)).fetchone():
                 _fail("already_received", "A receipt suppresses further native submission")
+            if message["state"] == "cancelled":
+                _fail("cancelled", "A cancelled message cannot be retried")
             if message["state"] not in ("uncertain", "failed"):
                 _fail("retry_ineligible", "Only an uncertain or definitively failed delivery may be retried")
             if message["expires"] is not None and message["expires"] <= time.time():
@@ -729,9 +841,14 @@ class Store:
             attempt = self._db.execute("SELECT * FROM attempts WHERE id=?", (identifier,)).fetchone()
             return {"message": self._message(message), "attempt": self._attempt(attempt), "attempt_id": identifier}
 
-    def finish(self, ctx, message_id, attempt_id, outcome, detail=None):
+    def finish(self, ctx, message_id, attempt_id, outcome, detail=None, retry_safe=None):
+        """Settle an attempt. A definite failure may state whether replay is
+        safe: true when evidence shows nothing reached the native session,
+        false when a retry could duplicate effects, None when not established."""
         if outcome not in ("submitted", "uncertain", "failed"):
             _fail("invalid_argument", "outcome must be submitted, uncertain, or failed")
+        if retry_safe is not None and (type(retry_safe) is not bool or outcome != "failed"):
+            _fail("invalid_argument", "retry_safe is a boolean reported only with a failed outcome")
         _identifier(attempt_id, "attempt_id")
         detail_json = _json(detail, label="attempt detail") if detail is not None else None
         stale = False
@@ -751,7 +868,8 @@ class Store:
                      message["state"] not in ("claimed", "submitted", "uncertain"))
             self._db.execute("INSERT INTO attempt_evidence(attempt_id,generation,outcome,detail,observed,late) VALUES (?,?,?,?,?,?)", (attempt_id, principal["generation"], outcome, detail_json, time.time(), int(stale)))
             if not stale:
-                self._db.execute("UPDATE attempts SET state=?,finished=?,detail=? WHERE id=?", (outcome, time.time(), detail_json, attempt_id))
+                self._db.execute("UPDATE attempts SET state=?,finished=?,detail=?,retry_safe=? WHERE id=?",
+                                 (outcome, time.time(), detail_json, None if retry_safe is None else int(retry_safe), attempt_id))
                 self._db.execute("UPDATE messages SET state=? WHERE id=?", (outcome, message_id))
                 result = {"message_id": message_id, "attempt_id": attempt_id, "state": outcome}
         if stale:
@@ -820,6 +938,8 @@ class Store:
                 _fail("already_received", "Receipt-bearing messages cannot be transferred as pending work")
             if message["expires"] is not None and message["expires"] <= time.time():
                 _fail("expired", "Expired messages cannot be transferred as pending work")
+            if message["state"] == "cancelled":
+                _fail("cancelled", "Cancelled messages cannot be transferred as pending work")
             self._db.execute("INSERT INTO recoveries(message_id,previous_generation,generation,observed) VALUES (?,?,?,?)", (message_id, message["delivery_generation"], principal["generation"], time.time()))
             state = "uncertain" if message["state"] in ("claimed", "submitted") else message["state"]
             self._db.execute("UPDATE messages SET delivery_generation=?,state=? WHERE id=?", (principal["generation"], state, message_id))
@@ -827,3 +947,52 @@ class Store:
             epoch = principal["visibility_epoch"] + 1
             return {"message": self._message(self._db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()),
                     "recovered": True, "visibility_epoch": epoch, "retry_required": state in ("uncertain", "failed")}
+
+    def space_view(self, space):
+        """Bounded local operator summary of one space; it changes no state.
+
+        Counts cover messages without any receipt, except per-state totals.
+        ``recovery`` counts messages bound to a generation that is no longer the
+        participant's active binding; they need explicit disposition.
+        """
+        _identifier(space, "space")
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                if not self._db.execute("SELECT 1 FROM spaces WHERE name=?", (space,)).fetchone():
+                    _fail("unknown_space", "The space does not exist")
+                participants = {}
+                for row in self._db.execute("""SELECT b.*,p.visibility_epoch FROM participants p
+                        JOIN bindings b ON b.generation=p.generation WHERE p.space=? ORDER BY p.participant""", (space,)):
+                    entry = self._public_binding(row)
+                    entry.update(visibility_epoch=row["visibility_epoch"], generations=[], states={}, pending=0, uncertain=0,
+                                 waiting=dict.fromkeys(("delivery", "in_flight", "receipt", "explicit_retry", "recovery"), 0))
+                    participants[row["participant"]] = entry
+                for row in self._db.execute("SELECT * FROM bindings WHERE space=? ORDER BY created,generation", (space,)):
+                    participants[row["participant"]]["generations"].append(
+                        {"generation": row["generation"], "active": bool(row["active"]), "native_id": row["native_id"],
+                         "created_at": row["created"], "stopped_at": row["stopped"]})
+                for row in self._db.execute("""SELECT m.recipient,m.state,m.delivery_generation=p.generation AND b.active AS current,
+                        EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id) AS received,COUNT(*) AS count
+                        FROM messages m JOIN participants p ON p.space=m.space AND p.participant=m.recipient
+                        JOIN bindings b ON b.generation=p.generation WHERE m.space=? GROUP BY 1,2,3,4""", (space,)):
+                    entry, state, count = participants[row["recipient"]], row["state"], row["count"]
+                    entry["states"][state] = entry["states"].get(state, 0) + count
+                    if row["received"] or state in ("expired", "cancelled"):
+                        continue
+                    entry["pending"] += count
+                    if state == "uncertain":
+                        entry["uncertain"] += count
+                    waiting = "recovery" if not row["current"] else {
+                        "queued": "delivery", "claimed": "in_flight", "submitted": "receipt"}.get(state, "explicit_retry")
+                    entry["waiting"][waiting] += count
+            finally:
+                self._db.execute("COMMIT")
+        waiting = {}
+        for entry in participants.values():
+            for name, count in entry["waiting"].items():
+                waiting[name] = waiting.get(name, 0) + count
+        return {"space": space, "participants": list(participants.values()),
+                "pending": sum(entry["pending"] for entry in participants.values()),
+                "uncertain": sum(entry["uncertain"] for entry in participants.values()),
+                "waiting": waiting, "observed_at": time.time(), "native_communication_verified": False}

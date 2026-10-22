@@ -89,6 +89,9 @@ def parser():
     join.add_argument("--harness", choices=("external", "codex", "claude", "grok"), default="external")
     join.add_argument("--replace", action="store_true")
     join.add_argument("--output", help="Create a private connection descriptor; refuse overwrite")
+    view = sub.add_parser("view", help="Summarize a space's participants, generations and pending delivery")
+    view.add_argument("--state", required=True)
+    view.add_argument("--space", required=True)
     for name in ("stdio", "adapter", "call", "claude-hook"):
         command = sub.add_parser(name)
         if name == "adapter":
@@ -104,12 +107,23 @@ def parser():
             command.add_argument("--channel", action="store_true")
         elif name == "call":
             command.add_argument("operation", choices=("peers", "send", "inbox", "wait", "ack",
-                                 "status", "retry", "claim", "finish", "recover", "stop"))
+                                 "status", "retry", "cancel", "claim", "finish", "observe",
+                                 "recover", "stop"))
             command.add_argument("--params", default="{}", help="JSON operation parameters")
         if name in ("stdio", "adapter"):
             command.add_argument("--trace", help="Append a redacted protocol-frame trace to this file (created 0600)")
         command.add_argument("--endpoint", default="http://127.0.0.1:8765")
         command.add_argument("--token-env", default="XORDINATION_TOKEN")
+    readiness = sub.add_parser("readiness", help="Report package, service, adapter and communication "
+                               "readiness separately without starting native sessions")
+    readiness.add_argument("--state", help="Durable state location to check; never created or opened")
+    readiness.add_argument("--endpoint", help="Broker endpoint for the service level")
+    readiness.add_argument("--token-env", help="Participant token variable (default XORDINATION_TOKEN, if set)")
+    readiness.add_argument("--harness", action="append", choices=("codex", "claude", "grok"), default=[],
+                           help="Probe installed adapter capabilities; repeatable")
+    readiness.add_argument("--binary", help="Explicit executable for a single --harness")
+    readiness.add_argument("--evidence", action="append", default=[],
+                           help="Retained operator_native verification report; repeatable")
     doctor = sub.add_parser("doctor", help="Observe installed harness capabilities without model calls")
     doctor.add_argument("--harness", choices=("codex", "claude", "grok"))
     doctor.add_argument("--binary")
@@ -172,11 +186,15 @@ def diagnostics_bundle(args):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if args.command in {"serve", "space", "join"}:
+        if args.command in {"serve", "space", "join", "view"}:
             from .store import Store
+            if args.command == "view" and not Path(args.state).expanduser().is_file():
+                raise ValueError("No broker state exists at " + args.state)
             store = Store(args.state)
             try:
-                if args.command == "space":
+                if args.command == "view":
+                    write_json(store.space_view(args.space))
+                elif args.command == "space":
                     write_json(store.create_space(args.space))
                 elif args.command == "join":
                     issue_binding(store, args)
@@ -193,6 +211,16 @@ def main(argv=None):
             return 0
         if args.command == "diagnostics":
             return diagnostics_bundle(args)
+        if args.command == "readiness":
+            from .readiness import report
+            if args.binary and len(set(args.harness)) != 1:
+                raise ValueError("--binary requires exactly one --harness")
+            # An explicitly named variable must exist; the default is used only when present.
+            token = (token_from_env(args.token_env) if args.token_env
+                     else os.environ.get("XORDINATION_TOKEN") or None)
+            write_json(report(state=args.state, endpoint=args.endpoint, token=token,
+                              harnesses=args.harness, binary=args.binary, evidence=args.evidence))
+            return 0
         token = token_from_env(args.token_env)
         if args.command == "stdio":
             from .mcp import run_stdio
