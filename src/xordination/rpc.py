@@ -8,6 +8,66 @@ messages or responses. This transport never attaches to or kills foreign PIDs.
 import asyncio
 import inspect
 import json
+import os
+import signal
+
+# A native launched in its own session leads a process group whose ID is its
+# PID, so descendants that do not detach themselves are stopped with it.
+FAMILY = {"start_new_session": True} if os.name == "posix" else {}
+# Each family inherits a random marker. A group ID is reused once its leader is
+# reaped and its members exit, so on Linux members are signalled one at a time,
+# only while /proc shows them in the group and carrying the marker.
+MARKER = "XORDINATION_FAMILY"
+PROC = os.path.isdir("/proc/self")
+
+
+def _member(pid, group, needle):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as file:
+            stat = file.read()
+        state, _, pgrp = stat[stat.rindex(b")") + 2:].split()[:3]
+        if state == b"Z" or int(pgrp) != group:
+            return False
+        with open(f"/proc/{pid}/environ", "rb") as file:
+            return needle in file.read().split(b"\0")
+    except (OSError, ValueError):
+        return False
+
+
+def _members(group, marker):
+    needle = f"{MARKER}={marker}".encode()
+    try:
+        pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return []
+    return [pid for pid in pids if _member(pid, group, needle)]
+
+
+def _signal_members(group, marker, number):
+    needle = f"{MARKER}={marker}".encode()
+    for pid in _members(group, marker):
+        try:
+            # A pidfd pins the process, so the re-check and the signal see the same one.
+            handle = os.pidfd_open(pid)
+        except OSError:
+            continue
+        try:
+            if _member(pid, group, needle):
+                signal.pidfd_send_signal(handle, number)
+        except OSError:
+            pass
+        finally:
+            os.close(handle)
+
+
+def _occupied(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 
 class RPCError(RuntimeError):
@@ -18,8 +78,16 @@ class RPCError(RuntimeError):
 
 
 class RPC:
-    def __init__(self, process, request_handler, notification_handler, *, jsonrpc=True, owned=True):
+    stop_grace = 5
+
+    def __init__(self, process, request_handler, notification_handler, *, jsonrpc=True, owned=True,
+                 family=False):
         self.process = process
+        # Set only for a process started with FAMILY and a marker; cleared once
+        # stopped so cleanup runs at most once.
+        self.group = process.pid if owned and family and FAMILY else None
+        self.marker = family if isinstance(family, str) else None
+        self.scan = bool(PROC and self.marker and hasattr(os, "pidfd_open"))
         self.request_handler = request_handler
         self.notification_handler = notification_handler
         self.jsonrpc = jsonrpc
@@ -30,6 +98,7 @@ class RPC:
         self.write_lock = asyncio.Lock()
         self.dead = asyncio.Event()
         self.failure = None
+        self.stopping = None
         self.reader = asyncio.create_task(self.read())
 
     def packet(self, **fields):
@@ -113,16 +182,74 @@ class RPC:
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        if self.owned and self.process.returncode is None:
-            try:
-                self.process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), 5)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        if self.owned:
+            await self.stop()
         if not self.reader.done():
             self.reader.cancel()
         await asyncio.gather(self.reader, return_exceptions=True)
+
+    def occupied(self, group):
+        if self.scan:
+            return bool(_members(group, self.marker))
+        # Without a scan the group is probed only while the unreaped leader holds its ID.
+        return self.process.returncode is None and _occupied(group)
+
+    def send(self, group, kill):
+        number = signal.SIGKILL if kill else signal.SIGTERM
+        if group is not None:
+            if self.scan:
+                _signal_members(group, self.marker, number)
+            elif self.process.returncode is None:
+                try:
+                    os.killpg(group, number)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        if self.process.returncode is None:
+            try:
+                self.process.send_signal(number)
+            except ProcessLookupError:
+                pass
+
+    async def stop(self):
+        """Terminate, then kill, the owned native and its process group.
+
+        On Linux, members are found in /proc by group and inherited marker and
+        signalled through a pidfd, so a reused group ID or PID is never hit,
+        including after a crashed leader was reaped. Elsewhere the group is
+        signalled only while the unreaped leader still holds its ID.
+
+        The stop runs once, as its own task, so cancelling a caller neither
+        interrupts nor repeats it; a later stop() waits for the same task.
+        """
+        if self.stopping is None:
+            self.stopping = asyncio.ensure_future(self._stop())
+        await asyncio.shield(self.stopping)
+
+    async def _stop(self):
+        group = self.group
+        if group is None and self.process.returncode is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.stop_grace
+            self.send(group, kill=False)
+            try:
+                await asyncio.wait_for(self.process.wait(), self.stop_grace)
+            except asyncio.TimeoutError:
+                pass
+            while group is not None and self.occupied(group) and loop.time() < deadline:
+                await asyncio.sleep(.05)
+            if self.process.returncode is None or (group is not None and self.occupied(group)):
+                self.send(group, kill=True)
+                await self.process.wait()
+                # Killed members are gone from the scan once they have exited.
+                deadline = loop.time() + 1
+                while group is not None and self.occupied(group) and loop.time() < deadline:
+                    await asyncio.sleep(.01)
+        except asyncio.CancelledError:
+            # Only loop shutdown reaches here; never leave the family on a grace period.
+            self.send(group, kill=True)
+            raise
+        finally:
+            # The handle is dropped only once escalation is done.
+            self.group = None

@@ -192,6 +192,15 @@ class LiveNativeBusyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report["cases"][0]["phases"]["native_ack"])
         self.assertTrue(report["cases"][0]["phases"]["native_reply"])
         self.assert_busy_gate(frozen, artifacts)
+        # Submission during held work and its later handling are separate observations. The
+        # fixture handles after release in a later native turn, which the report must not hide.
+        busy = report["cases"][0]["busy"]
+        self.assertEqual((busy["submission_during_work"], busy["handling"], busy["handled_while_held"], busy["in_turn"]),
+                         ("observed", "observed", False, "no"))
+        self.assertEqual(busy["submitted_monotonic_ns"], artifacts["submitted"]["monotonic_ns"])
+        self.assertLess(busy["submitted_monotonic_ns"], busy["handled_monotonic_ns"])
+        waits = [event for event in artifacts["native_events"] if event["tool"] == "xordination_wait"]
+        self.assertTrue(waits and all(event["turn_id"].startswith("fixture-turn-") for event in waits))
 
     async def test_idle_roundtrip_completes_before_busy_prime_in_mixed_matrix(self):
         dispatch, report, frozen, artifacts = await self.exercise_busy(scenarios=("idle", "busy"))
@@ -223,6 +232,8 @@ class LiveNativeBusyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(event["tool"] == "xordination_send" and event["arguments"].get("body") == frozen["cases"][0]["body"]
                              for event in artifacts["native_events"]))
         self.assertIn("required_case_unexercised", report["cases"][0]["failures"])
+        busy = report["cases"][0]["busy"]
+        self.assertEqual((busy["submission_during_work"], busy["handling"], busy["in_turn"]), ("failed", "unknown", "unknown"))
 
 
 if __name__ == "__main__":

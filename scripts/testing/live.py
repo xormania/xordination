@@ -11,8 +11,11 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,8 +39,18 @@ INITIAL_PROMPT = (
     "controller message and execute only the listed acceptance xordination_send or "
     "xordination_wait calls. Busy priming holds your wait request until the controller "
     "has observed native challenge submission, then releases it; this is the "
-    "operator's test instruction and grants no other permission."
+    "operator's test instruction and grants no other permission. A recall challenge asks for "
+    "the memo from an earlier acceptance message of the same case; answer it from your own "
+    "session context."
 )
+# Operator-selected cases; context is opt-in and never part of the default matrix.
+SCENARIOS = {"idle", "busy", "context"}
+APPROVAL_METHODS = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                    "item/permissions/requestApproval", "session/request_permission"}
+# Native configuration the run's harness inherits; hashed only, never copied or read for credentials.
+NATIVE_CONFIG = {"codex": [("CODEX_HOME", ".codex", "config.toml")],
+                 "claude": [("CLAUDE_CONFIG_DIR", ".claude", "settings.json")],
+                 "grok": []}
 
 
 def encoded(value):
@@ -92,6 +105,110 @@ def source_hash():
     return source_sha256(ROOT / "src" / "xordination", runner_hash())
 
 
+def bounded_output(argv, limit=1024 * 1024, timeout=60):
+    """A read-only local probe; failures are recorded, never raised into the run."""
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=ROOT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"status": "unavailable", "detail": type(error).__name__}
+    return {"status": "recorded", "returncode": result.returncode, "bytes": len(result.stdout),
+            "sha256": hashlib.sha256(result.stdout).hexdigest(), "stdout": result.stdout[:limit]}
+
+
+def checkout_identity():
+    head = bounded_output(["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD"], timeout=10)
+    if head["status"] != "recorded" or head["returncode"]:
+        return {"commit": "unavailable", "dirty": "unknown"}
+    status = bounded_output(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=normal"], timeout=10)
+    dirty = (bool(status["stdout"].strip()) if status["status"] == "recorded" and not status["returncode"]
+             else "unknown")
+    return {"commit": head["stdout"].decode(errors="replace").strip(), "dirty": dirty}
+
+
+def harness_manager_status():
+    """The image's harness manager records versions, provenance and integrity when present."""
+    executable = shutil.which("harnesses")
+    if not executable:
+        return {"status": "unavailable", "detail": "harnesses command not on PATH"}
+    result = bounded_output([executable, "status"])
+    if result["status"] == "recorded":
+        output = result.pop("stdout")
+        try:
+            result["output"] = json.loads(output) if result["bytes"] <= 1024 * 1024 else None
+        except (ValueError, UnicodeError, RecursionError):
+            result["output"] = None
+        if result["output"] is None:
+            result["text"] = output[:65536].decode(errors="replace")
+    return {"executable": executable, **result}
+
+
+def file_fingerprint(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as error:
+        return "unreadable:" + type(error).__name__
+
+
+def harness_fingerprint(participant):
+    """Settings and inherited native configuration, by content hash; no credential file is read."""
+    files = {}
+    for variable, default, name in NATIVE_CONFIG[participant["harness"]]:
+        home = Path(os.environ[variable]) if os.environ.get(variable) else Path.home() / default
+        if not home.is_absolute():
+            # The native CLI resolves it from its workspace/--project cwd, not from where prepare runs.
+            raise ValueError(variable + " must be an absolute path so its fingerprint names the file the "
+                             "native harness reads")
+        path = home / name
+        files[str(path)] = file_fingerprint(path)
+    value = {"settings": {key: participant.get(key) for key in ("harness", "model", "reasoning")},
+             "prompt_sha256": hashlib.sha256(INITIAL_PROMPT.encode()).hexdigest(),
+             "native_config_files": files if NATIVE_CONFIG[participant["harness"]] else "unlisted"}
+    return {**value, "sha256": digest(value)}
+
+
+def environment_record(config, probes=None):
+    """Run identity for reproduction; each value is an observation or explicitly absent."""
+    image = os.environ.get("XORDINATION_IMAGE_DIGEST")
+    if image is not None and not re.fullmatch(r"(?:[A-Za-z0-9._/:-]{1,400}@)?sha256:[0-9a-f]{64}", image):
+        raise ValueError("XORDINATION_IMAGE_DIGEST must be sha256:<hex> or name@sha256:<hex>")
+    return {"source": checkout_identity(),
+            "python": {"implementation": platform.python_implementation(), "version": platform.python_version(),
+                       "executable": sys.executable},
+            "os": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(),
+                   "platform": platform.platform()},
+            "image_digest": image or "unsupplied",
+            "harness_manager": harness_manager_status(),
+            "harness_fingerprints": {p["name"]: harness_fingerprint(p) for p in config["participants"]},
+            "capability_probes": probes if probes is not None else "unrecorded"}
+
+
+def case_messages(run_id, run_nonce, case):
+    """The exact challenge/reply intent of one prepared case, rebuilt again before every use."""
+    case_id = case["case_id"]
+    reply = "Xordination acceptance reply " + ":".join((run_nonce, case_id, case["nonce"]))
+    challenge = {"acceptance_run": run_id, "run_nonce": run_nonce, "case_id": case_id, "nonce": case["nonce"],
+                 "task": "Acknowledge this message, then reply with the exact reply text.", "reply": reply}
+    if case["scenario"] == "context":
+        challenge.update(memo=case["memo"], retain="Keep this memo in your session context; a later "
+                                                   "acceptance message of this case asks for it.")
+    metadata = {"acceptance_run": run_id, "case_id": case_id, "run_nonce": run_nonce}
+    result = {"body": json.dumps(challenge, sort_keys=True, separators=(",", ":")), "reply": reply,
+              "key": "acceptance-" + case_id, "metadata": metadata}
+    if case["scenario"] == "context":
+        # The recall challenge omits the memo: only the earlier message in this session holds it.
+        prefix = "Xordination acceptance recall " + ":".join((run_nonce, case_id, case["recall_nonce"])) + ":"
+        recall = {"acceptance_run": run_id, "run_nonce": run_nonce, "case_id": case_id,
+                  "nonce": case["recall_nonce"], "phase": "recall", "reply_prefix": prefix,
+                  "task": "Acknowledge this message, then reply with reply_prefix followed immediately by "
+                          "the memo of your earlier acceptance message in this case."}
+        result["recall"] = {"body": json.dumps(recall, sort_keys=True, separators=(",", ":")),
+                            "reply": prefix + case["memo"], "key": "acceptance-recall-" + case_id,
+                            "metadata": {**metadata, "phase": "recall"}}
+    return result
+
+
 def validate_config(config):
     if set(config) - {"participants", "pairs", "scenarios"}:
         raise ValueError("Unknown acceptance configuration input")
@@ -124,14 +241,34 @@ def validate_config(config):
         raise ValueError("Required directed pairs must be explicit, distinct and known")
     scenarios = config.get("scenarios", ["idle"])
     if (not isinstance(scenarios, list) or not scenarios or
-            len(set(scenarios)) != len(scenarios) or set(scenarios) - {"idle", "busy"}):
-        raise ValueError("Choose distinct idle/busy scenarios")
+            len(set(scenarios)) != len(scenarios) or set(scenarios) - SCENARIOS):
+        raise ValueError("Choose distinct idle/busy/context scenarios")
     return {"participants": participants, "pairs": pairs, "scenarios": scenarios}
 
 
-def prepare(config, output):
+def probe_harnesses(config, doctor):
+    """The installed doctor result for each required participant's own executable; no model call.
+
+    Each distinct harness and configured `binary` is probed once: a configured executable may
+    lie outside PATH or differ from the harness's PATH default, and its own observation is the
+    one that describes that participant.
+    """
+    required = {name for pair in config["pairs"] for name in pair}
+    observed, probes = {}, {}
+    for participant in config["participants"]:
+        if participant["name"] not in required:
+            continue
+        key = (participant["harness"], participant.get("binary"))
+        if key not in observed:
+            observed[key] = doctor(key[0], binary=key[1]) if key[1] else doctor(key[0])
+        probes[participant["name"]] = observed[key]
+    return probes
+
+
+def prepare(config, output, probes=None):
     from xordination.store import Store
     config = validate_config(config)
+    environment = environment_record(config, probes)  # Before any run state; a bad digest refuses.
     output = Path(output)
     output.mkdir(mode=0o700)  # Exclusive ownership; never reuse a run directory.
     (output / "native").mkdir(mode=0o700)
@@ -139,8 +276,8 @@ def prepare(config, output):
     run_id, run_nonce = uuid.uuid4().hex, uuid.uuid4().hex
     draft = {"schema_version": 1, "evidence_mode": "operator_native", "run_id": run_id,
              "run_nonce": run_nonce, "config": config, "config_sha256": digest(config),
-             "source_sha256": source_hash(), "runner_sha256": runner_hash(), "created_at": time.time(), "generations": {},
-             "space": "acceptance-" + run_id, "cases": []}
+             "source_sha256": source_hash(), "runner_sha256": runner_hash(), "created_at": time.time(),
+             "generations": {}, "space": "acceptance-" + run_id, "cases": [], "environment": environment}
     store = Store(output / "broker.sqlite3")
     try:
         store.create_space(draft["space"])
@@ -154,17 +291,11 @@ def prepare(config, output):
         store.close()
     for scenario in config["scenarios"]:
         for sender, recipient in config["pairs"]:
-            case_id, nonce = uuid.uuid4().hex, uuid.uuid4().hex
-            reply = "Xordination acceptance reply " + ":".join((run_nonce, case_id, nonce))
-            body = json.dumps({"acceptance_run": run_id, "run_nonce": run_nonce,
-                               "case_id": case_id, "nonce": nonce,
-                               "task": "Acknowledge this message, then reply with the exact reply text.",
-                               "reply": reply}, sort_keys=True, separators=(",", ":"))
-            draft["cases"].append({"case_id": case_id, "scenario": scenario, "sender": sender,
-                                   "recipient": recipient, "nonce": nonce, "body": body,
-                                   "reply": reply, "key": "acceptance-" + case_id,
-                                   "metadata": {"acceptance_run": run_id, "case_id": case_id,
-                                                "run_nonce": run_nonce}})
+            case = {"case_id": uuid.uuid4().hex, "scenario": scenario, "sender": sender,
+                    "recipient": recipient, "nonce": uuid.uuid4().hex}
+            if scenario == "context":
+                case.update(memo=uuid.uuid4().hex, recall_nonce=uuid.uuid4().hex)
+            draft["cases"].append({**case, **case_messages(run_id, run_nonce, case)})
     write_new(output / "prepared.json", draft)
     return {"run_id": run_id, "output": str(output.resolve()), "required_cases": len(draft["cases"]),
             "next": "Start the broker and operator-selected native participants, then capture bindings."}
@@ -226,23 +357,25 @@ def checked_draft(directory):
         signature = (case["scenario"], case["sender"], case["recipient"])
         if signature not in required or signature in seen:
             raise ValueError("Prepared run has missing/duplicate required cases")
-        if (not re.fullmatch(r"[0-9a-f]{32}", case["case_id"]) or not re.fullmatch(r"[0-9a-f]{32}", case["nonce"])
-                or case["case_id"] in identifiers or case["nonce"] in nonces):
+        fresh = [case["nonce"]] + ([case.get("memo"), case.get("recall_nonce")] if case["scenario"] == "context" else [])
+        if (not re.fullmatch(r"[0-9a-f]{32}", case["case_id"]) or case["case_id"] in identifiers or
+                any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value) or value in nonces
+                    for value in fresh) or len(set(fresh)) != len(fresh)):
             raise ValueError("Prepared case IDs/nonces must be unique and fresh")
-        reply = "Xordination acceptance reply " + ":".join((draft["run_nonce"], case["case_id"], case["nonce"]))
-        body = json.dumps({"acceptance_run": draft["run_id"], "run_nonce": draft["run_nonce"],
-                          "case_id": case["case_id"], "nonce": case["nonce"],
-                          "task": "Acknowledge this message, then reply with the exact reply text.", "reply": reply},
-                         sort_keys=True, separators=(",", ":"))
-        metadata = {"acceptance_run": draft["run_id"], "case_id": case["case_id"], "run_nonce": draft["run_nonce"]}
-        if case["reply"] != reply or case["body"] != body or case["metadata"] != metadata or case["key"] != "acceptance-" + case["case_id"]:
+        expected = case_messages(draft["run_id"], draft["run_nonce"], case)
+        if any(case.get(key) != value for key, value in expected.items()) or ("recall" in case) != ("recall" in expected):
             raise ValueError("Prepared case challenge/reply intent changed")
         seen.add(signature)
         identifiers.add(case["case_id"])
-        nonces.add(case["nonce"])
+        nonces.update(fresh)
     if seen != required:
         raise ValueError("Prepared run has missing/duplicate required cases")
     return draft
+
+
+def send_task_arguments(frozen, case, intent):
+    return {"to": case["recipient"], "to_generation": frozen["bindings"][case["recipient"]]["generation"],
+            "body": intent["body"], "key": intent["key"], "metadata": intent["metadata"]}
 
 
 def capture(directory):
@@ -257,10 +390,9 @@ def capture(directory):
     write_new(directory / "frozen.sha256.json", {"sha256": digest(frozen)})
     tasks = {}
     for case in frozen["cases"]:
-        params = {"to": case["recipient"], "to_generation": frozen["bindings"][case["recipient"]]["generation"],
-                  "body": case["body"], "key": case["key"], "metadata": case["metadata"]}
-        tasks.setdefault(case["sender"], []).append({"scenario": case["scenario"], "tool": "xordination_send",
-                                                    "arguments": params})
+        for intent in [case] + ([case["recall"]] if "recall" in case else []):
+            tasks.setdefault(case["sender"], []).append({"scenario": case["scenario"], "tool": "xordination_send",
+                                                        "arguments": send_task_arguments(frozen, case, intent)})
     write_new(directory / "tasks.json", tasks)
     return {"run_id": frozen["run_id"], "required_cases": len(frozen["cases"]),
             "next": "Send the operator's tasks to source native sessions; retain receipt/reply capture."}
@@ -455,42 +587,51 @@ def send_tasks(directory, phase_timeout=30, cancelled=None, idle_timeout=None):
     if idle_timeout is not None and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, (int, float))
                                      or not math.isfinite(idle_timeout) or idle_timeout <= 0):
         raise ValueError("Idle timeout must be finite and positive")
-    # Reconstruct required tasks from the frozen manifest rather than trusting edited tasks.json.
-    tasks = {}
-    for case in frozen["cases"]:
-        if case["scenario"] == "busy":
-            continue
-        tasks.setdefault(case["sender"], []).append({"scenario": case["scenario"], "tool": "xordination_send",
-            "arguments": {"to": case["recipient"], "to_generation": frozen["bindings"][case["recipient"]]["generation"],
-                          "body": case["body"], "key": case["key"], "metadata": case["metadata"]}})
     connection = load(directory / "controller.connection.json")
     client = Client(os.environ.get("XORDINATION_ENDPOINT", "http://127.0.0.1:8765"), connection["token"])
     messages = []
-    for name, work in tasks.items():
-        message = client.call("send", to=name, to_generation=frozen["bindings"][name]["generation"],
-            key="acceptance-tasks-" + frozen["run_id"] + "-" + name,
-            body=json.dumps({"acceptance_run": frozen["run_id"], "run_nonce": frozen["run_nonce"],
-                             "instruction": "Execute these exact acceptance tasks in your native session.",
-                             "tasks": work}, sort_keys=True),
-            metadata={"acceptance_run": frozen["run_id"], "phase": "operator_tasks"})
-        messages.append({"participant": name, "message_id": message["id"]})
-    idle_cases = {case["case_id"] for case in frozen["cases"] if case["scenario"] == "idle"}
-    if idle_cases and any(case["scenario"] == "busy" for case in frozen["cases"]):
+    def dispatch(scenarios, key, recall=False):
+        # Reconstruct required tasks from the frozen manifest rather than trusting edited tasks.json.
+        tasks = {}
+        for case in frozen["cases"]:
+            if case["scenario"] in scenarios:
+                tasks.setdefault(case["sender"], []).append({"scenario": case["scenario"], "tool": "xordination_send",
+                    "arguments": send_task_arguments(frozen, case, case["recall"] if recall else case)})
+        for name, work in tasks.items():
+            message = client.call("send", to=name, to_generation=frozen["bindings"][name]["generation"],
+                key=key + "-" + frozen["run_id"] + "-" + name,
+                body=json.dumps({"acceptance_run": frozen["run_id"], "run_nonce": frozen["run_nonce"],
+                                 "instruction": "Execute these exact acceptance tasks in your native session.",
+                                 "tasks": work}, sort_keys=True),
+                metadata={"acceptance_run": frozen["run_id"], "phase": "operator_tasks"})
+            messages.append({"participant": name, "message_id": message["id"]})
+    def settle(stage, scenarios, complete):
+        # Earlier round trips (model turns and native approvals included) must finish before
+        # dependent cases start; that is a whole-matrix budget, not one held phase.
+        case_ids = sorted(case["case_id"] for case in frozen["cases"] if case["scenario"] in scenarios)
         try:
-            def idle_complete():
-                report = verify(directory, retain=False)
-                return all(case["status"] == "pass" for case in report["cases"] if case["case_id"] in idle_cases)
-            # Every idle round trip (model turns and native approvals included) must finish
-            # before busy priming; that is a whole-matrix budget, not one held phase.
-            wait_until(idle_complete, idle_timeout or phase_timeout, cancelled)
-            write_new(directory / "idle-complete.json", {"run_id": frozen["run_id"], "case_ids": sorted(idle_cases),
-                                                       "monotonic_ns": time.monotonic_ns()})
+            wait_until(lambda: all(complete(case) for case in verify(directory, retain=False)["cases"]
+                                   if case["case_id"] in case_ids), idle_timeout or phase_timeout, cancelled)
         except TimeoutError:
-            failure = {"run_id": frozen["run_id"], "stage": "idle", "reason": "idle_completion_timeout",
-                       "case_ids": sorted(idle_cases), "monotonic_ns": time.monotonic_ns()}
-            write_new(directory / "idle-failed.json", failure)
-            return {"run_id": frozen["run_id"], "status": "fail", "tasks_dispatched": messages, "failure": failure,
-                    "busy_submissions": [], "next": "Required idle exchanges did not finish; busy cases remain unexercised."}
+            failure = {"run_id": frozen["run_id"], "stage": stage, "reason": stage.replace("-", "_") + "_completion_timeout",
+                       "case_ids": case_ids, "monotonic_ns": time.monotonic_ns()}
+            write_new(directory / (stage + "-failed.json"), failure)
+            return failure
+        write_new(directory / (stage + "-complete.json"), {"run_id": frozen["run_id"], "case_ids": case_ids,
+                                                          "monotonic_ns": time.monotonic_ns()})
+    present = {case["scenario"] for case in frozen["cases"]}
+    dispatch({"idle", "context"}, "acceptance-tasks")
+    failure = None
+    if "context" in present:
+        # The recall challenge goes out only after the earlier exchange completed in the same sessions.
+        failure = settle("context-earlier", {"context"}, earlier_complete)
+        if not failure:
+            dispatch({"context"}, "acceptance-recall-tasks", recall=True)
+    if not failure and "busy" in present and present & {"idle", "context"}:
+        failure = settle("idle", {"idle", "context"}, lambda case: case["status"] == "pass")
+    if failure:
+        return {"run_id": frozen["run_id"], "status": "fail", "tasks_dispatched": messages, "failure": failure,
+                "busy_submissions": [], "next": "Required earlier exchanges did not finish; dependent cases remain unexercised."}
     def send_task(case):
         name = case["sender"]
         message = client.call("send", to=name, to_generation=frozen["bindings"][name]["generation"],
@@ -562,7 +703,83 @@ def grok_observation(params):
     return (params.get("sessionId"), update.get("toolCallId"), name, arguments)
 
 
-def record_native(directory, participant, native_id, call_id, tool, arguments, origin):
+def earlier_complete(case):
+    """Every phase of a case except its later recall exchange."""
+    return all(value for phase, value in case["phases"].items()
+               if not phase.startswith("recall_") and phase != "context_order")
+
+
+def append_capture(path, event):
+    # A single owned adapter writes Codex/Grok; separate Claude hooks need an OS lock.
+    import fcntl
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "ab") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        event["sequence"] = os.fstat(stream.fileno()).st_size
+        stream.write(encoded(event) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def bounded_label(value):
+    return value if isinstance(value, str) and value and len(value) <= 500 else None
+
+
+def record_approval(directory, participant, native_id, kind, origin, request_id=None, outcome=None):
+    """A native approval wait is evidence: its request identity and timing, never its content."""
+    directory = Path(directory)
+    draft = checked_draft(directory)
+    if participant not in {p["name"] for p in draft["config"]["participants"]} or kind not in {"wait", "resolved"}:
+        raise ValueError("Approval observation omitted participant/kind")
+    event = {"run_id": draft["run_id"], "run_nonce": draft["run_nonce"], "participant": participant,
+             "native_id": bounded_label(native_id), "kind": kind, "origin": origin,
+             "request_id": bounded_label(request_id), "outcome": bounded_label(outcome),
+             "time": time.time(), "monotonic_ns": time.monotonic_ns()}
+    append_capture(directory / "native" / (participant + ".approvals.jsonl"), event)
+
+
+def approval_outcome(result):
+    if not isinstance(result, dict):
+        return "unknown"
+    if isinstance(result.get("decision"), str):
+        return result["decision"]
+    if "permissions" in result:
+        return "granted" if result["permissions"] else "declined"
+    outcome = result.get("outcome")
+    if isinstance(outcome, dict) and isinstance(outcome.get("outcome"), str):
+        return outcome["outcome"]
+    return "unknown"
+
+
+def record_session(directory, participant, native_id, source, model, reasoning):
+    """Effective settings only as the native side reported them; absent values stay unobserved."""
+    directory = Path(directory)
+    draft = checked_draft(directory)
+    if participant not in {p["name"] for p in draft["config"]["participants"]} or not bounded_label(native_id):
+        raise ValueError("Native session observation omitted participant/session")
+    path = directory / "native" / (participant + ".session.json")
+    if path.exists():
+        return  # One owned adapter starts one native session; the first report is retained.
+    write_new(path, {"run_id": draft["run_id"], "run_nonce": draft["run_nonce"], "participant": participant,
+                     "native_id": native_id, "source": source, "time": time.time(),
+                     "observed_model": bounded_label(model) or "unobserved",
+                     "observed_reasoning": bounded_label(reasoning) or "unobserved"})
+
+
+def session_settings(result, harness):
+    """(native_id, source, model, reasoning) exposed by the native session-start response."""
+    if not isinstance(result, dict):
+        return None, None, None, None
+    if harness == "codex":
+        thread = result.get("thread")
+        return (thread.get("id") if isinstance(thread, dict) else None, "codex/thread/start.response",
+                result.get("model"), result.get("reasoningEffort"))
+    models = result.get("models")
+    return (result.get("sessionId"), "grok/session/new.response",
+            models.get("currentModelId") if isinstance(models, dict) else None, None)
+
+
+def record_native(directory, participant, native_id, call_id, tool, arguments, origin, turn_id=None):
     """Record only this run's communication inputs, not native transcripts/credentials."""
     directory = Path(directory)
     draft = checked_draft(directory)
@@ -571,7 +788,8 @@ def record_native(directory, participant, native_id, call_id, tool, arguments, o
             not isinstance(call_id, str) or not call_id or not isinstance(arguments, dict)):
         raise ValueError("Native observation omitted participant/session/call/input")
     if tool == "xordination_send":
-        if arguments.get("body") not in {case["reply"] for case in draft["cases"]} | {case["body"] for case in draft["cases"]}:
+        intents = draft["cases"] + [case["recall"] for case in draft["cases"] if "recall" in case]
+        if arguments.get("body") not in {intent["reply"] for intent in intents} | {intent["body"] for intent in intents}:
             return  # Do not retain unrelated project content.
     elif tool == "xordination_wait":
         if not active_gate(directory, participant, arguments):
@@ -587,16 +805,9 @@ def record_native(directory, participant, native_id, call_id, tool, arguments, o
              "participant": participant, "native_id": native_id, "call_id": call_id,
              "tool": tool, "arguments": arguments, "origin": origin,
              "time": time.time(), "monotonic_ns": time.monotonic_ns()}
-    # A single owned adapter writes Codex/Grok; separate Claude hooks need an OS lock.
-    import fcntl
-    descriptor = os.open(directory / "native" / (participant + ".jsonl"),
-                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(descriptor, "ab") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        event["sequence"] = os.fstat(stream.fileno()).st_size
-        stream.write(encoded(event) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    if bounded_label(turn_id):
+        event["turn_id"] = turn_id  # Native turn identity, when the wire exposes it.
+    append_capture(directory / "native" / (participant + ".jsonl"), event)
 
 
 def native_events(directory, frozen):
@@ -695,12 +906,18 @@ def native_events(directory, frozen):
 
 
 def controlled_busy(directory, frozen, case, message, attempts, events):
+    """True when evidence establishes held submission, False when it contradicts or failed, None when absent."""
     path = directory / "gates" / case["case_id"]
     if (path / "failed.json").exists():
         return False
     try:
         arm, ready, native_ready, submitted, released, closed = [load(path / (name + ".json")) for name in
                                                    ("armed", "ready", "native-ready", "submitted", "released", "closed")]
+    except FileNotFoundError:
+        return None  # Missing timing evidence remains unknown; it still cannot pass.
+    except (OSError, ValueError):
+        return False
+    try:
         binding = frozen["bindings"][case["recipient"]]
         expected = {"run_id": frozen["run_id"], "case_id": case["case_id"], "participant": case["recipient"],
                     "generation": binding["generation"], "native_id": binding["native_id"]}
@@ -737,6 +954,103 @@ def controlled_busy(directory, frozen, case, message, attempts, events):
         return False
 
 
+def busy_timing(directory, case, events, held, ack):
+    """Submission during held work, later handling and in-turn handling are separate claims.
+
+    Timing that was not observed is "unknown", never a negative result; the pass verdict
+    still requires the controlled_busy phase.
+    """
+    path = directory / "gates" / case["case_id"]
+    def artifact(name):
+        try:
+            value = load(path / (name + ".json"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+    submitted, released, native_ready = artifact("submitted"), artifact("released"), artifact("native-ready")
+    wait = next((event for event in events if native_ready and event["participant"] == case["recipient"] and
+                 event["tool"] == "xordination_wait" and event["call_id"] == native_ready.get("native_call_id")), None)
+    held_until = released.get("monotonic_ns") if held is True and released else None
+    return {"submission_during_work": {True: "observed", False: "failed", None: "unknown"}[held],
+            "submitted_monotonic_ns": submitted.get("monotonic_ns", "unknown") if submitted else "unknown",
+            "handling": "observed" if ack else "unknown",
+            "handled_monotonic_ns": ack["monotonic_ns"] if ack else "unknown",
+            "handled_while_held": ack["monotonic_ns"] < held_until if ack and held_until else "unknown",
+            # Same native turn as the held work, only when the wire exposed both turn identities.
+            "in_turn": ("yes" if wait["turn_id"] == ack["turn_id"] else "no")
+                       if ack and wait and wait.get("turn_id") and ack.get("turn_id") else "unknown"}
+
+
+def capture_lines(directory, name, suffix, artifacts, errors, kind):
+    path = directory / "native" / (name + suffix)
+    if not path.exists():
+        return None
+    try:
+        raw = read_capture(path, MAX_ARTIFACT)
+    except OSError:
+        errors.append(kind + "_invalid:" + name)
+        return None
+    if len(raw) > MAX_ARTIFACT:
+        errors.append(kind + "_limit:" + name)
+        return None
+    artifacts.append({"path": "native/" + name + suffix, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+    return raw
+
+
+def required_bindings(frozen):
+    required = {case[role] for case in frozen["cases"] for role in ("sender", "recipient")}
+    return {name: binding for name, binding in frozen["bindings"].items() if name in required}
+
+
+def approval_events(directory, frozen):
+    """Approval waits observed in the native sessions; their absence is not evidence of none."""
+    events, artifacts, errors = [], [], []
+    for name, binding in required_bindings(frozen).items():
+        raw = capture_lines(directory, name, ".approvals.jsonl", artifacts, errors, "approval_capture")
+        offset = 0
+        for line in (raw or b"").splitlines(keepends=True):
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError, RecursionError):
+                event = None
+            if (not isinstance(event, dict) or event.get("participant") != name or
+                    event.get("run_id") != frozen["run_id"] or event.get("run_nonce") != frozen["run_nonce"] or
+                    event.get("native_id") not in (None, binding["native_id"]) or
+                    event.get("kind") not in {"wait", "resolved"} or event.get("sequence") != offset):
+                errors.append("approval_capture_invalid:" + name)
+                break
+            events.append({key: event.get(key) for key in ("participant", "native_id", "kind", "origin",
+                                                            "request_id", "outcome", "time", "monotonic_ns")})
+            offset += len(line)
+    return events, artifacts, errors
+
+
+def observed_settings(directory, frozen):
+    """Requested settings beside what the native session reported; never inferred from a request."""
+    settings, artifacts, errors = {}, [], []
+    participants = {p["name"]: p for p in frozen["config"]["participants"]}
+    for name, binding in required_bindings(frozen).items():
+        entry = {"requested_model": participants[name].get("model") or "native_default",
+                 "requested_reasoning": participants[name].get("reasoning") or "native_default",
+                 "observed_model": "unobserved", "observed_reasoning": "unobserved", "source": None}
+        raw = capture_lines(directory, name, ".session.json", artifacts, errors, "native_session")
+        if raw is not None:
+            try:
+                observation = json.loads(raw)
+                if (observation.get("participant") != name or observation.get("run_id") != frozen["run_id"] or
+                        observation.get("run_nonce") != frozen["run_nonce"] or
+                        observation.get("native_id") != binding["native_id"]):
+                    errors.append("native_session_identity:" + name)
+                else:
+                    entry.update({key: bounded_label(observation.get(key)) or "unobserved"
+                                  for key in ("observed_model", "observed_reasoning")},
+                                 source=bounded_label(observation.get("source")))
+            except (ValueError, UnicodeError, RecursionError, AttributeError):
+                errors.append("native_session_invalid:" + name)
+        settings[name] = entry
+    return settings, artifacts, errors
+
+
 def verify(directory, retain=True):
     directory = Path(directory)
     frozen = load(directory / "frozen.json")
@@ -746,10 +1060,63 @@ def verify(directory, retain=True):
     if any(frozen.get(key) != draft.get(key) for key in draft):
         raise ValueError("Frozen manifest differs from prepared configuration")
     events, artifacts, errors = native_events(directory, frozen)
+    approvals, approval_artifacts, approval_errors = approval_events(directory, frozen)
+    settings, setting_artifacts, setting_errors = observed_settings(directory, frozen)
+    artifacts, errors = artifacts + approval_artifacts + setting_artifacts, errors + approval_errors + setting_errors
     cases = []
     def matching(name, tool, arguments):
         return [event for event in events if event["participant"] == name and event["tool"] == tool and
                 event["arguments"] == arguments]
+    def exchange(connection, case, intent):
+        """Both legs of one challenge; no message unless it was accepted exactly once."""
+        sender, recipient = case["sender"], case["recipient"]
+        source, target = frozen["bindings"][sender], frozen["bindings"][recipient]
+        rows = connection.execute("SELECT * FROM messages WHERE space=? AND sender=? AND idempotency_key=?",
+                                  (frozen["space"], sender, intent["key"])).fetchall()
+        phases = {key: False for key in ("accepted", "native_submitted", "broker_receipt", "reply",
+                                         "native_send", "native_ack", "native_reply", "reply_native_submitted",
+                                         "reply_broker_receipt", "reply_native_ack")}
+        marks = {"ack": None, "reply": None}  # The recipient's first correlated native handling events.
+        if len(rows) != 1:
+            return phases, None, [], marks
+        message = rows[0]
+        phases["accepted"] = (message["sender_generation"] == source["generation"] and
+            message["recipient"] == recipient and message["original_generation"] == target["generation"] and
+            message["delivery_generation"] == target["generation"] and message["body"] == intent["body"] and
+            json.loads(message["metadata"]) == intent["metadata"] and message["reply_to"] is None)
+        send_args = {"to": recipient, "to_generation": target["generation"], "body": intent["body"],
+                     "key": intent["key"], "metadata": intent["metadata"]}
+        phases["native_send"] = bool(matching(sender, "xordination_send", send_args))
+        attempts = connection.execute("SELECT * FROM attempts WHERE message_id=?", (message["id"],)).fetchall()
+        phases["native_submitted"] = any(attempt["generation"] == target["generation"] and
+            attempt["native_id"] == target["native_id"] and attempt["state"] == "submitted"
+            for attempt in attempts)
+        phases["broker_receipt"] = connection.execute("""SELECT 1 FROM receipts WHERE message_id=?
+            AND generation=? AND observer=? AND native_id=? AND kind='client_ack'""",
+            (message["id"], target["generation"], recipient, target["native_id"])).fetchone() is not None
+        acks = matching(recipient, "xordination_ack", {"message_id": message["id"]})
+        phases["native_ack"] = bool(acks)
+        marks["ack"] = min(acks, key=lambda event: event["sequence"], default=None)
+        replies = connection.execute("SELECT * FROM messages WHERE reply_to=?", (message["id"],)).fetchall()
+        for reply in replies:
+            if (reply["sender"] == recipient and reply["sender_generation"] == target["generation"] and
+                    reply["recipient"] == sender and reply["original_generation"] == source["generation"] and
+                    reply["delivery_generation"] == source["generation"] and reply["body"] == intent["reply"]):
+                phases["reply"] = True
+                sent = [event for event in events if event["participant"] == recipient and
+                        event["tool"] == "xordination_send" and
+                        send_intent(event["arguments"]) == json.loads(reply["intent"]) and
+                        event["arguments"].get("key") == reply["idempotency_key"]]
+                phases["native_reply"] = bool(sent)
+                marks["reply"] = min(sent, key=lambda event: event["sequence"], default=None)
+                phases["reply_native_submitted"] = connection.execute("""SELECT 1 FROM attempts WHERE
+                    message_id=? AND generation=? AND native_id=? AND state='submitted'""",
+                    (reply["id"], source["generation"], source["native_id"])).fetchone() is not None
+                phases["reply_broker_receipt"] = connection.execute("""SELECT 1 FROM receipts WHERE
+                    message_id=? AND generation=? AND observer=? AND native_id=? AND kind='client_ack'""",
+                    (reply["id"], source["generation"], sender, source["native_id"])).fetchone() is not None
+                phases["reply_native_ack"] = bool(matching(sender, "xordination_ack", {"message_id": reply["id"]}))
+        return phases, message, attempts, marks
     with readonly(directory / "broker.sqlite3") as connection:
         try:
             if bindings(connection, draft) != frozen["bindings"]:
@@ -757,56 +1124,33 @@ def verify(directory, retain=True):
         except ValueError:
             errors.append("native_binding_changed")
         for case in frozen["cases"]:
-            failures = []
-            sender, recipient = case["sender"], case["recipient"]
-            source, target = frozen["bindings"][sender], frozen["bindings"][recipient]
-            rows = connection.execute("SELECT * FROM messages WHERE space=? AND sender=? AND idempotency_key=?",
-                                      (frozen["space"], sender, case["key"])).fetchall()
-            phases = {key: False for key in ("accepted", "native_submitted", "broker_receipt", "reply",
-                                             "native_send", "native_ack", "native_reply", "reply_native_submitted",
-                                             "reply_broker_receipt", "reply_native_ack")}
-            if len(rows) != 1:
-                failures.append("required_case_unexercised")
+            phases, message, attempts, marks = exchange(connection, case, case)
+            result = {"case_id": case["case_id"], "sender": case["sender"], "recipient": case["recipient"],
+                      "scenario": case["scenario"]}
+            if case["scenario"] == "busy":
+                # A recorded gate failure is explicit even when it stopped the challenge being sent.
+                held = (controlled_busy(directory, frozen, case, message, attempts, events) if message is not None
+                        else False if (directory / "gates" / case["case_id"] / "failed.json").exists() else None)
+                if message is not None:
+                    phases["controlled_busy"] = held is True
+                result["busy"] = busy_timing(directory, case, events, held, marks["ack"] if phases["broker_receipt"] else None)
+            recall = None
+            if case["scenario"] == "context":
+                recall_phases, recall, _, recall_marks = exchange(connection, case, case["recall"])
+                phases.update(("recall_" + key, value) for key, value in recall_phases.items())
+                # The earlier exchange was handled, and answered, in this session before the recall.
+                phases["context_order"] = bool(
+                    marks["ack"] and marks["reply"] and recall_marks["ack"] and
+                    marks["ack"]["sequence"] < recall_marks["ack"]["sequence"] and
+                    marks["reply"]["sequence"] < recall_marks["ack"]["sequence"])
+            if message is None:
+                failures = ["required_case_unexercised"]
             else:
-                message = rows[0]
-                phases["accepted"] = (message["sender_generation"] == source["generation"] and
-                    message["recipient"] == recipient and message["original_generation"] == target["generation"] and
-                    message["delivery_generation"] == target["generation"] and message["body"] == case["body"] and
-                    json.loads(message["metadata"]) == case["metadata"] and message["reply_to"] is None)
-                send_args = {"to": recipient, "to_generation": target["generation"], "body": case["body"],
-                             "key": case["key"], "metadata": case["metadata"]}
-                phases["native_send"] = bool(matching(sender, "xordination_send", send_args))
-                attempts = connection.execute("SELECT * FROM attempts WHERE message_id=?", (message["id"],)).fetchall()
-                phases["native_submitted"] = any(attempt["generation"] == target["generation"] and
-                    attempt["native_id"] == target["native_id"] and attempt["state"] == "submitted"
-                    for attempt in attempts)
-                if case["scenario"] == "busy":
-                    phases["controlled_busy"] = controlled_busy(directory, frozen, case, message, attempts, events)
-                phases["broker_receipt"] = connection.execute("""SELECT 1 FROM receipts WHERE message_id=?
-                    AND generation=? AND observer=? AND native_id=? AND kind='client_ack'""",
-                    (message["id"], target["generation"], recipient, target["native_id"])).fetchone() is not None
-                phases["native_ack"] = bool(matching(recipient, "xordination_ack", {"message_id": message["id"]}))
-                replies = connection.execute("SELECT * FROM messages WHERE reply_to=?", (message["id"],)).fetchall()
-                for reply in replies:
-                    if (reply["sender"] == recipient and reply["sender_generation"] == target["generation"] and
-                            reply["recipient"] == sender and reply["original_generation"] == source["generation"] and
-                            reply["delivery_generation"] == source["generation"] and reply["body"] == case["reply"]):
-                        phases["reply"] = True
-                        phases["native_reply"] = any(event["participant"] == recipient and
-                            event["tool"] == "xordination_send" and
-                            send_intent(event["arguments"]) == json.loads(reply["intent"]) and
-                            event["arguments"].get("key") == reply["idempotency_key"] for event in events)
-                        phases["reply_native_submitted"] = connection.execute("""SELECT 1 FROM attempts WHERE
-                            message_id=? AND generation=? AND native_id=? AND state='submitted'""",
-                            (reply["id"], source["generation"], source["native_id"])).fetchone() is not None
-                        phases["reply_broker_receipt"] = connection.execute("""SELECT 1 FROM receipts WHERE
-                            message_id=? AND generation=? AND observer=? AND native_id=? AND kind='client_ack'""",
-                            (reply["id"], source["generation"], sender, source["native_id"])).fetchone() is not None
-                        phases["reply_native_ack"] = bool(matching(sender, "xordination_ack", {"message_id": reply["id"]}))
-                failures.extend("missing_" + phase for phase, value in phases.items() if not value)
-            cases.append({"case_id": case["case_id"], "sender": sender, "recipient": recipient,
-                          "scenario": case["scenario"], "status": "fail" if failures else "pass",
-                          "phases": phases, "failures": failures})
+                failures = ["missing_" + phase for phase, value in phases.items() if not value and
+                            (recall is not None or not phase.startswith("recall_") and phase != "context_order")]
+                if case["scenario"] == "context" and recall is None:
+                    failures.append("recall_unexercised")
+            cases.append({**result, "status": "fail" if failures else "pass", "phases": phases, "failures": failures})
     report = {"schema_version": 1, "run_id": frozen["run_id"], "evidence_mode": "operator_native",
               "config_sha256": frozen["config_sha256"], "source_sha256": frozen["source_sha256"],
               "runner_sha256": frozen.get("runner_sha256"),
@@ -814,9 +1158,15 @@ def verify(directory, retain=True):
               "required_cases": len(cases), "passed_cases": sum(case["status"] == "pass" for case in cases),
               "cases": cases, "errors": sorted(set(errors)), "native_artifacts": artifacts,
               "configured_participants": frozen["config"]["participants"],
+              "environment": frozen.get("environment", "unrecorded"), "native_settings": settings,
+              "approval_waits": approvals,
               "evidence_boundary": "Run-local observer capture, not authenticated against hostile local file editing. "
-                  "Busy means exact native submission observed while a run-local native wait request was held. "
+                  "Busy means exact native submission observed while a run-local native wait request was held; "
+                  "handling and in-turn handling are reported separately and remain unknown without evidence. "
                   "No token-generation interruption or simultaneous model computation claim. "
+                  "Retained context means a recall reply carried a memo sent only in an earlier message to the "
+                  "same native session; broker tools could re-read it, so it is not a private-memory proof. "
+                  "Effective model/reasoning are native session-start reports, otherwise unobserved. "
                   "Configured versions/settings are operator observations, not independently certified."}
     # Each verification is retained separately; failed evidence cannot be overwritten by a rerun.
     if retain:
@@ -862,16 +1212,45 @@ def observed_adapter(directory, name, client, binary, project):
     participant = next((row for row in draft["config"]["participants"] if row["name"] == name), None)
     if not participant or participant["harness"] == "claude":
         raise ValueError("Choose a configured Codex/Grok participant; Claude uses its native PreToolUse hook")
-    def recorder(native, call, tool, args, origin):
-        return record_native(directory, name, native, call, tool, args, origin)
+    def recorder(native, call, tool, args, origin, turn=None):
+        return record_native(directory, name, native, call, tool, args, origin, turn)
+    async def approval(method, params, request, prefix):
+        """Record the wait and its end around the inherited operator prompt; never answer it."""
+        tool = params.get("toolCall")
+        call = params.get("itemId") or (tool.get("toolCallId") if isinstance(tool, dict) else None)
+        native = params.get("threadId", params.get("sessionId"))
+        passive_observe(directory, name, lambda: record_approval(directory, name, native, "wait",
+                                                                 prefix + method, call))
+        outcome = "error"
+        try:
+            result = await request(method, params)
+            outcome = approval_outcome(result)
+            return result
+        finally:
+            passive_observe(directory, name, lambda: record_approval(directory, name, native, "resolved",
+                                                                     prefix + method, call, outcome))
+    def observe_session(rpc, method):
+        original = rpc.request
+        async def request(called, params, **options):
+            result = await original(called, params, **options)
+            if called == method:
+                passive_observe(directory, name, lambda: record_session(
+                    directory, name, *session_settings(result, participant["harness"])))
+            return result
+        rpc.request = request  # This owned RPC only; concurrent adapters keep their own settings.
     class ObservedCodex(CodexAdapter):
+        async def spawn(self, *args, **kwargs):
+            await super().spawn(*args, **kwargs)
+            observe_session(self.rpc, "thread/start")
         async def request(self, method, params):
+            if method in APPROVAL_METHODS:
+                return await approval(method, params, super().request, "codex/")
             if method == "item/tool/call" and tool_name(params.get("tool")):
                 arguments = params.get("arguments", {})
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
                 passive_observe(directory, name, lambda: recorder(params.get("threadId"), params.get("callId"),
-                                tool_name(params["tool"]), arguments, "codex/item/tool/call"))
+                                tool_name(params["tool"]), arguments, "codex/item/tool/call", params.get("turnId")))
                 if tool_name(params["tool"]) == "xordination_wait":
                     cancelled = threading.Event()
                     try:
@@ -890,8 +1269,13 @@ def observed_adapter(directory, name, client, binary, project):
                         recorder(*observation, "grok/session/update")
                 passive_observe(directory, name, observe)
             return await super().notification(method, params)
+        async def request(self, method, params):
+            if method in APPROVAL_METHODS:
+                return await approval(method, params, super().request, "grok/")
+            return await super().request(method, params)
         async def spawn(self, *args, **kwargs):
             await super().spawn(*args, **kwargs)
+            observe_session(self.rpc, "session/new")
             original_request = self.rpc.request
             async def request(method, params, **options):
                 if method == "session/new":
@@ -962,7 +1346,13 @@ def main(argv=None):
     if args.command == "observe-claude":
         def observe():
             packet = json.load(sys.stdin)
-            if packet.get("hook_event_name") == "PreToolUse" and tool_name(packet.get("tool_name")):
+            event = packet.get("hook_event_name")
+            if event == "PermissionRequest" or (event == "Notification" and
+                                                packet.get("notification_type") == "permission_prompt"):
+                # Claude shows the prompt in its own terminal; record that the session waits.
+                record_approval(args.run, args.participant, packet.get("session_id"), "wait",
+                                "claude/" + event, packet.get("tool_use_id"))
+            if event == "PreToolUse" and tool_name(packet.get("tool_name")):
                 tool, arguments = tool_name(packet["tool_name"]), packet.get("tool_input")
                 record_native(args.run, args.participant, packet.get("session_id"), packet.get("tool_use_id"),
                               tool, arguments, "claude/PreToolUse")
@@ -973,7 +1363,9 @@ def main(argv=None):
         return 0  # Empty output/zero exit preserves Claude's original permission/tool flow.
     try:
         if args.command == "prepare":
-            result = prepare(load(args.config), args.output)
+            from xordination.adapters import doctor
+            config = validate_config(load(args.config))
+            result = prepare(config, args.output, probe_harnesses(config, doctor))
         elif args.command == "capture":
             result = capture(args.run)
         elif args.command == "verify":
