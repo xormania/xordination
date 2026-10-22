@@ -256,6 +256,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         finished = [params for op, params in self.client.calls if op == "finish"]
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0]["outcome"], "uncertain")
+        self.assertNotIn("retry_safe", finished[0])
         self.assertFalse(any(op == "retry" for op, _ in self.client.calls))
 
     async def test_codex_start_preserves_native_configuration(self):
@@ -449,6 +450,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.deliver(msg)
         finished = next(params for op, params in self.client.calls if op == "finish")
         self.assertEqual(finished["outcome"], "failed")
+        self.assertIs(finished["retry_safe"], True)
         self.assertEqual(methods, ["_x.ai/interject"])
 
     async def test_grok_late_completion_cannot_clear_newer_activity(self):

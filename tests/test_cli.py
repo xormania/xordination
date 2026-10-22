@@ -131,5 +131,34 @@ class BootstrapSafety(unittest.TestCase):
                 self.assertEqual(before, after)
 
 
+class OperatorView(unittest.TestCase):
+    def test_view_summarizes_space_without_credentials_or_creating_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = str(Path(folder) / "state.sqlite")
+            missing = str(Path(folder) / "missing.sqlite")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(2, main(["view", "--state", missing, "--space", "project"]))
+            self.assertFalse(Path(missing).exists())
+            store = Store(state)
+            try:
+                store.create_space("project")
+                one = store.join("project", "one")
+                two = store.join("project", "two")
+                store.send(store.authenticate(one["token"]), "two", "private body", "key")
+            finally:
+                store.close()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, main(["view", "--state", state, "--space", "project"]))
+            view = json.loads(output.getvalue())
+            self.assertEqual(["one", "two"], [entry["participant"] for entry in view["participants"]])
+            self.assertEqual({"queued": 1}, view["participants"][1]["states"])
+            self.assertEqual(1, view["waiting"]["delivery"])
+            for secret in (one["token"], two["token"], "private body"):
+                self.assertNotIn(secret, output.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(2, main(["view", "--state", state, "--space", "unknown"]))
+
+
 if __name__ == "__main__":
     unittest.main()

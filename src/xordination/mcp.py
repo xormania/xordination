@@ -62,6 +62,8 @@ TOOLS = [
      "inputSchema": _object({"message_id": _IDENT, "limit": _INBOX["limit"]}, ("message_id",))},
     {"name": "xordination_retry", "description": "Explicitly retry an eligible uncertain delivery. The recipient may already have acted on it.",
      "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
+    {"name": "xordination_cancel", "description": "Stop further delivery of your unreceived message; content already submitted cannot be retracted.",
+     "inputSchema": _object({"message_id": _IDENT, "reason": {"type": "string", "minLength": 1, "maxLength": 1000}}, ("message_id",))},
 ]
 _TOOL_MAP = {tool["name"]: tool for tool in TOOLS}
 
