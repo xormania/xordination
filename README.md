@@ -82,6 +82,8 @@ Use the MCP tool schemas for exact arguments. The sender comes from authenticate
 
 A peer message is attributed content. It carries no additional operator authority or tool permission. The broker never composes automatic replies.
 
+When a binding's harness reports a different native session behind the same credential (for example a Claude SessionStart hook after `/clear`), the broker fences that binding instead of replacing it. Its `native_identity_source` becomes `conflict` and `native_identity_conflict` records the observed identity. `peers`, `send`, `inbox`, `wait`, `ack`, `retry`, `claim` and `recover` are then refused with `replacement_required`. Operator diagnostics stay available: `identity` shows the conflict, and `status` reports delivery state with message `body` and `metadata` withheld (`content_withheld`). `finish` still records late evidence, as stale; `bind` with the original identity and `stop` also remain. Only an explicit `join --replace`, followed by recovery, moves pending work to a new generation.
+
 ## Limits and backpressure
 
 The initial limits are fixed in source; `xordination serve` and `xordination stdio` expose no options to change them. They are starting defaults, not measured capacity.
