@@ -655,7 +655,7 @@ class ProbeAndChannelTests(unittest.TestCase):
             self.assertEqual("replacement_required", fenced.exception.code)
             peer = next(row for row in store.peers(sender)["peers"] if row["participant"] == "recipient")
             self.assertEqual(("launch-session", "conflict"), (peer["native_id"], peer["native_identity_source"]))
-            self.assertEqual("cleared-session", peer["capabilities"]["native_identity_conflict"]["observed_native_id"])
+            self.assertEqual("cleared-session", peer["native_identity_conflict"]["observed_native_id"])
             # Fencing is not replacement: the same generation stays authenticated
             # and only an explicit join --replace plus recovery moves the message.
             self.assertEqual(joined["generation"], store.identity(context)["generation"])
