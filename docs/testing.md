@@ -92,7 +92,7 @@ python scripts/testing/live_tmux.py self-check   # Real tmux on a private socket
 python scripts/testing/live_tmux.py start --config /tmp/xordination-live-config.json
 ```
 
-`start` creates a fresh job directory under `$XDG_STATE_HOME/xordination/live-runs/` (default `~/.local/state/...`), outside any checkout, so native sessions do not load this repository's agent guidance. It runs `doctor` for each required harness without model calls and refuses before preparing credentials when any is not `supported`. Observed `--version` output fills a participant's absent `version`. The job holds `session.json`, `preflight.json`, the resolved `config.json`, the live run in `run/`, one workspace per participant in `workspaces/`, and redacted pane logs in `logs/`.
+`start` creates a fresh job directory under `$XDG_STATE_HOME/xordination/live-runs/` (default `~/.local/state/...`), outside any checkout, so native sessions do not load this repository's agent guidance. It runs `doctor` once for each distinct executable a required participant will run (its configured `binary`, or the harness's `PATH` default) without model calls, and refuses before preparing credentials when any is not `supported`. That executable's own observation fills the participant's absent `version` and `binary`, so a configured executable outside `PATH` is accepted and never recorded with another executable's version. The job holds `session.json`, `preflight.json`, the resolved `config.json`, the live run in `run/`, one workspace per participant in `workspaces/`, and redacted pane logs in `logs/`.
 
 The dashboard window supervises the run:
 

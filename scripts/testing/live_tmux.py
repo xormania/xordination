@@ -154,13 +154,20 @@ def preflight(config, doctor):
     names = required_names(config)
     if RESERVED & set(names):
         raise ValueError("Participant names dashboard/broker are reserved by the launcher")
-    observations = {}
+    # Probe each distinct executable a participant will run: a configured binary may lie
+    # outside PATH or differ from the harness's PATH default, and its own observation
+    # supplies that participant's recorded version and executable.
+    probes, observations = {}, {}
     for participant in config["participants"]:
-        if participant["name"] in names and participant["harness"] not in observations:
-            observations[participant["harness"]] = doctor(participant["harness"])
-    gaps = [harness + ": " + observation.get("status", "unknown") for harness, observation in observations.items()
-            if observation.get("status") != "supported"]
-    return {"harnesses": observations}, gaps
+        if participant["name"] not in names:
+            continue
+        key = (participant["harness"], participant.get("binary"))
+        if key not in probes:
+            probes[key] = doctor(key[0], binary=key[1]) if key[1] else doctor(key[0])
+        observations[participant["name"]] = probes[key]
+    gaps = [harness + (" (" + binary + ")" if binary else "") + ": " + observation.get("status", "unknown")
+            for (harness, binary), observation in probes.items() if observation.get("status") != "supported"]
+    return {"participants": observations}, gaps
 
 
 def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, reply_timeout=300, port=None,
@@ -192,7 +199,7 @@ def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, repl
         write_json(job / "session.json", record)
         raise ValueError(record["error"] + "; inspect " + str(job / "preflight.json"))
     for participant in config["participants"]:
-        probe = found["harnesses"].get(participant["harness"], {})
+        probe = found["participants"].get(participant["name"], {})
         observed = probe.get("version", {}).get("value")
         if "version" not in participant and observed:
             participant["version"] = observed[:500]  # Observed --version output, still an operator observation.
