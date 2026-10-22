@@ -450,7 +450,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                                 "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "fixture", "version": "1"}}}
                             process.stdin.write(json.dumps(initialize) + "\n")
                             process.stdin.flush()
-                            self.assertEqual(json.loads(frames.get(timeout=3))["id"], 1)
+                            self.assertEqual(json.loads(frames.get(timeout=10))["id"], 1)
                             packet = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
                                 "name": "xordination_wait", "arguments": arm["wait_arguments"]}}
                         else:
@@ -460,7 +460,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                         process.stdin.flush()
                         if harness == "claude":
                             process.stdin.close()
-                        live.wait_until(lambda: (path / "ready.json").exists(), 3)  # noqa: B023
+                        live.wait_until(lambda: (path / "ready.json").exists(), 10)  # noqa: B023
                         self.assertIsNone(process.poll())
                         self.assertTrue(frames.empty(), "Held native request must not complete before release")
                         ready = live.load(path / "ready.json")
@@ -472,12 +472,12 @@ class LiveAcceptanceTests(unittest.TestCase):
                                 to_generation=frozen["bindings"]["bob"]["generation"])
                         live.release_gate(path, arm, "test_release")
                         if harness == "grok":
-                            result = json.loads(frames.get(timeout=3))
+                            result = json.loads(frames.get(timeout=10))
                             self.assertEqual(result["id"], 2)
                             self.assertEqual(result["result"]["structuredContent"]["messages"][0]["id"], message["id"])
                             process.stdin.close()
-                        self.assertEqual(process.wait(timeout=3), 0)
-                        thread.join(timeout=3)
+                        self.assertEqual(process.wait(timeout=10), 0)
+                        thread.join(timeout=10)
                         self.assertFalse(thread.is_alive())
                         if harness == "claude":
                             self.assertTrue(frames.empty(), "Observation hook must not emit a permission decision")

@@ -157,6 +157,22 @@ class LauncherTests(unittest.TestCase):
         self.tmux.create(record)  # As start does before respawning the dashboard as supervisor.
         return Path(record["directory"])
 
+    def act_when(self, condition, action, timeout=60):
+        """Run action from a helper thread once condition holds; an expired deadline never triggers it."""
+        fired, done = threading.Event(), threading.Event()
+        self.addCleanup(done.set)  # Runs before the job folder is removed.
+
+        def watch():
+            deadline = time.monotonic() + timeout
+            while not done.is_set() and time.monotonic() < deadline:
+                if condition():
+                    action()
+                    fired.set()
+                    return
+                done.wait(.01)
+        threading.Thread(target=watch, daemon=True).start()
+        return fired
+
     def command(self, job, role):
         if role == "broker":
             return launcher.pane_command(job, role)
@@ -232,7 +248,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_missing_native_readiness_stops_before_capture_or_dispatch(self):
         job = self.job([{"name": "alpha", "harness": "codex"}, {"name": "beta", "harness": "codex"}],
-                       startup_timeout=1)
+                       startup_timeout=.2)
         def idle(job, role):
             return (launcher.pane_command(job, role) if role == "broker" else
                     [sys.executable, "-c", "import time; time.sleep(60)"])
@@ -263,7 +279,7 @@ class LauncherTests(unittest.TestCase):
         return Path(record["directory"])
 
     def test_failed_dispatch_finalizes_without_waiting_for_replies(self):
-        job = self.busy_job(phase_timeout=1, startup_timeout=30, reply_timeout=120)
+        job = self.busy_job(phase_timeout=.2, startup_timeout=30, reply_timeout=120)
         started = time.monotonic()
         self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
         self.assertLess(time.monotonic() - started, 60)  # Well inside the reply timeout.
@@ -281,15 +297,12 @@ class LauncherTests(unittest.TestCase):
 
     def test_stop_during_dispatch_cancels_the_held_phase(self):
         job = self.busy_job(phase_timeout=60, startup_timeout=30, reply_timeout=120)
-        def stop_once_armed():
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and not list((job / "run" / "gates").glob("*/armed.json")):
-                time.sleep(.05)
-            (job / "stop.request").touch()
-        threading.Thread(target=stop_once_armed, daemon=True).start()
+        stopped = self.act_when(lambda: list((job / "run" / "gates").glob("*/armed.json")),
+                                (job / "stop.request").touch)
         started = time.monotonic()
         self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
         self.assertLess(time.monotonic() - started, 45)  # Not the 60-second phase wait.
+        self.assertTrue(stopped.is_set())
         record = json.loads((job / "session.json").read_text())
         self.assertEqual(record["state"], "stopped")
         failed = [json.loads(path.read_text()) for path in (job / "run" / "gates").glob("*/failed.json")]
@@ -301,15 +314,12 @@ class LauncherTests(unittest.TestCase):
 
     def test_interrupt_during_busy_dispatch_is_an_operator_stop(self):
         job = self.busy_job(phase_timeout=60, startup_timeout=30, reply_timeout=120)
-        def interrupt_once_armed():
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and not list((job / "run" / "gates").glob("*/armed.json")):
-                time.sleep(.05)
-            os.kill(os.getpid(), signal.SIGINT)
-        threading.Thread(target=interrupt_once_armed, daemon=True).start()
+        interrupted = self.act_when(lambda: list((job / "run" / "gates").glob("*/armed.json")),
+                                    lambda: os.kill(os.getpid(), signal.SIGINT))
         started = time.monotonic()
         self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
         self.assertLess(time.monotonic() - started, 45)  # Not a further 60-second busy phase.
+        self.assertTrue(interrupted.is_set())
         record = json.loads((job / "session.json").read_text())
         self.assertEqual((record["state"], record.get("stopped")), ("stopped", True))
         self.assertIn("SIGINT", record["error"])
@@ -319,8 +329,9 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.tmux.panes, {})
 
     def test_idle_round_trips_use_the_reply_budget_not_the_busy_phase(self):
-        job = self.busy_job(phase_timeout=1, startup_timeout=30, reply_timeout=60)
-        with patch.dict(os.environ, {"XORDINATION_FIXTURE_REPLY_DELAY": "1.5"}):
+        job = self.busy_job(phase_timeout=.2, startup_timeout=30, reply_timeout=60)
+        # Each idle reply alone outlasts the busy phase, so only the reply budget can let idle pass.
+        with patch.dict(os.environ, {"XORDINATION_FIXTURE_REPLY_DELAY": ".5"}):
             self.assertEqual(launcher.supervise(job, self.tmux, command=self.command, poll=.05), 1)
         self.assertFalse((job / "run" / "idle-failed.json").exists())
         self.assertTrue((job / "run" / "idle-complete.json").exists())
@@ -334,10 +345,12 @@ class LauncherTests(unittest.TestCase):
             return (launcher.pane_command(job, role) if role == "broker" else
                     [sys.executable, "-c", "import time; time.sleep(60)"])
         before = signal.getsignal(signal.SIGTERM)
-        timer = threading.Timer(2, os.kill, (os.getpid(), signal.SIGTERM))
-        timer.start()
-        self.addCleanup(timer.cancel)
+        # Terminate only once the supervisor is waiting on the launched native windows.
+        terminated = self.act_when(
+            lambda: launcher.read_json(job / "session.json")["state"] == "waiting_for_native",
+            lambda: os.kill(os.getpid(), signal.SIGTERM))
         self.assertEqual(launcher.supervise(job, self.tmux, command=idle, poll=.05), 1)
+        self.assertTrue(terminated.is_set())
         record = json.loads((job / "session.json").read_text())
         self.assertEqual(record["state"], "stopped")
         self.assertIn("SIGTERM", record["error"])
