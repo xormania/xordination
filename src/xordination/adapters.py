@@ -12,7 +12,9 @@ import os
 from pathlib import Path
 import re
 import shlex
+import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,7 @@ import time
 import uuid
 
 from .client import BrokerError
-from .rpc import RPC, RPCError
+from .rpc import FAMILY, MARKER, RPC, RPCError
 
 
 class CapabilityError(ValueError):
@@ -224,6 +226,7 @@ class NativeAdapter:
         self.stderr_task = None
         self.tasks = set()
         self.pending_attempts = {}
+        self.cleanup = None
         self.permission_lock = asyncio.Lock()
         self.binding_lock = asyncio.Lock()
         self.activity_sequence = 0
@@ -283,10 +286,12 @@ class NativeAdapter:
         task.add_done_callback(self.tasks.discard)
 
     async def spawn(self, argv, *, jsonrpc=True, env=None):
+        marker = secrets.token_hex(16)
+        env = {**(os.environ if env is None else env), MARKER: marker}
         process = await asyncio.create_subprocess_exec(*argv, cwd=self.project, env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024)
-        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True)
+            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024, **FAMILY)
+        self.rpc = RPC(process, self.request, self.notification, jsonrpc=jsonrpc, owned=True, family=marker)
         async def stderr():
             while data := await process.stderr.readline():
                 sys.stderr.write(data.decode(errors="replace"))
@@ -348,9 +353,25 @@ class NativeAdapter:
             await self.close()
 
     async def close(self):
+        """Run cleanup once, to completion, even if the awaiting task is cancelled.
+
+        A termination signal can arrive after cleanup began; it must not
+        interrupt the family stop, so the cleanup runs as its own task and a
+        later close() waits for that same task.
+        """
+        if self.cleanup is None:
+            self.cleanup = asyncio.ensure_future(self._close())
+        await asyncio.shield(self.cleanup)
+
+    async def _close(self):
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        # Stop the native family before any broker call: each settlement can
+        # block for the client timeout, and a service manager that escalates to
+        # SIGKILL meanwhile would otherwise orphan the family.
+        if self.rpc:
+            await self.rpc.close()
         # Shutdown never waits out a broker outage; claims stay recoverable.
         self.reconnect.window = 0
         for message in list(self.pending_attempts.values()):
@@ -358,8 +379,6 @@ class NativeAdapter:
                 await self.finish(message, "uncertain", "adapter_shutdown", evidence="submission not settled")
             except Exception:
                 pass  # Broker expiry/restart handles an unsettled durable claim.
-        if self.rpc:
-            await self.rpc.close()
         if self.stderr_task:
             if not self.stderr_task.done():
                 self.stderr_task.cancel()
@@ -815,7 +834,8 @@ def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=No
             return process.poll() if process.poll() is not None else 0
         finally:
             # Only this Popen is owned. No PID discovery, terminal sweeping or
-            # process-group termination of independently launched harnesses.
+            # process-group termination of independently launched harnesses;
+            # the interactive native stays in the terminal's foreground group.
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -849,5 +869,37 @@ def run_adapter(harness, endpoint, token, project, *, binary=None, model=None, r
         return run_claude(client, executable, project, model=model, reasoning=reasoning, prompt=prompt)
     adapter = (CodexAdapter if harness == "codex" else GrokAdapter)(client, executable, project,
                    model=model, reasoning=reasoning, prompt=prompt)
-    asyncio.run(adapter.run())
+    return asyncio.run(supervise(adapter))
+
+
+async def supervise(adapter):
+    """Run an adapter so hangup or termination still stops its native family.
+
+    The native's own session no longer receives the terminal's signals, so the
+    adapter turns them into one cancellation that runs its normal cleanup.
+    """
+    loop, task, received = asyncio.get_running_loop(), asyncio.current_task(), []
+    def stop(number):
+        if not received:
+            received.append(number)
+            task.cancel()
+    installed = []
+    for number in (getattr(signal, "SIGHUP", None), signal.SIGTERM):
+        try:
+            loop.add_signal_handler(number, stop, number)
+            installed.append(number)
+        except (NotImplementedError, RuntimeError, TypeError, ValueError):
+            pass  # Non-POSIX or non-main-thread loops keep default handling.
+    try:
+        await adapter.run()
+    except asyncio.CancelledError:
+        if not received:
+            raise
+        # The signal may have interrupted cleanup already under way; wait for
+        # that cleanup, which is shielded, rather than return while it runs.
+        await adapter.close()
+        return 128 + int(received[0])
+    finally:
+        for number in installed:
+            loop.remove_signal_handler(number)
     return 0
