@@ -472,8 +472,7 @@ sys.stdin.buffer.read(1)
         path = Path(self.directory.name) / "newer.sqlite"
         with closing(sqlite3.connect(path)) as newer:
             newer.executescript("CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');")
-            newer.execute("PRAGMA user_version=%d" % (Store.SCHEMA_VERSION + 1))
-            newer.commit()
+            newer.execute(f"PRAGMA user_version={Store.SCHEMA_VERSION + 1}")
         original = path.read_bytes()
         self.assertCode("schema_version", Store, path)
         # Not even the journal mode may change: a rollback needs the exact file.
@@ -487,8 +486,8 @@ sys.stdin.buffer.read(1)
             "db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
             "db.execute('PRAGMA journal_mode=WAL')\n"
             "db.execute('PRAGMA wal_autocheckpoint=0')\n"
-            "db.executescript(\"CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');"
-            "PRAGMA user_version=\" + str(int(sys.argv[2])) + \";\")\n"
+            "db.executescript(\"CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');\")\n"
+            "db.execute('PRAGMA user_version=' + str(int(sys.argv[2])))\n"
             "os._exit(0)\n"), str(path), str(Store.SCHEMA_VERSION + 1)], check=True)
         files = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
         self.assertTrue(all(file.exists() for file in files))
