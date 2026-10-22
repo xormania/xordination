@@ -19,6 +19,7 @@ from xordination.client import BrokerError, Client
 from xordination.mcp import _Server
 from xordination.rpc import MARKER, RPC, RPCError
 from xordination.store import StoreError
+from xordination.trace import Trace, redact
 from native_fixtures import FAMILY_NATIVE, MOCK_CODEX, MOCK_GROK, MOCK_CODEX_COMPLETED_BEFORE_RESPONSE
 
 
@@ -502,6 +503,70 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.deliver(msg)
         self.assertIn(msg["attempt_id"], adapter.pending_attempts)
         self.assertFalse(any(op == "retry" for op, _ in self.client.calls))
+
+    async def test_native_trace_order_matches_both_wire_directions(self):
+        token, body = "native-token-52ab", "confidential native body 0c4e"
+        script = r"""
+import json, random, sys, threading, time
+received, sent = open(sys.argv[1], "w"), open(sys.argv[2], "w")
+lock, rng = threading.Lock(), random.Random(3)
+def write(row):
+    with lock:
+        line = json.dumps(row)
+        sys.stdout.write(line + "\n"); sys.stdout.flush()
+        sent.write(line + "\n"); sent.flush()
+def answer(row):
+    time.sleep(rng.uniform(0, .02))
+    write({"jsonrpc": "2.0", "id": row["id"], "result": {"echo": row["params"]}})
+for line in sys.stdin:
+    received.write(line); received.flush()
+    row = json.loads(line)
+    if row.get("method") == "fixture/ask":
+        write({"jsonrpc": "2.0", "id": "native-ask", "method": "item/tool/call",
+               "params": {"callId": "call-1", "arguments": {"body": row["params"]["body"]}}})
+        write({"jsonrpc": "2.0", "method": "turn/started", "params": {"turnId": "turn-1"}})
+    if "id" in row and "method" in row:
+        threading.Thread(target=answer, args=(row,)).start()
+"""
+        folder = Path(self.temporary.name)
+        received, sent, path = folder / "received", folder / "sent", folder / "native.trace"
+        answered = asyncio.Event()
+        async def request(method, params):
+            await asyncio.sleep(.005)
+            answered.set()
+            return {"token_echo": token, "body": body}
+        async def notification(method, params):
+            return None
+        process = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", script, str(received), str(sent),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        trace = Trace(path, "native-rpc", secrets=(token,))
+        rpc = RPC(process, request, notification, trace=trace)
+        try:
+            calls = [rpc.request("fixture/work", {"index": index, "body": body, "threadId": "thread-" + token})
+                     for index in range(16)]
+            calls += [rpc.notify("fixture/note", {"index": index}) for index in range(8)]
+            calls.append(rpc.request("fixture/ask", {"body": body}))
+            await asyncio.wait_for(asyncio.gather(*calls), 5)
+            await asyncio.wait_for(answered.wait(), 5)
+            await self.until(lambda: received.read_text().count("native-ask") == 1)
+        finally:
+            await rpc.close()
+            trace.close()
+        text = path.read_text()
+        records = [json.loads(line) for line in text.splitlines()]
+        self.assertNotIn(token, text)
+        self.assertNotIn(body, text)
+        self.assertEqual(list(range(1, len(records) + 1)), [record["seq"] for record in records])
+        def frames(direction):
+            return [record["frame"] for record in records if record["direction"] == direction]
+        # The native side's own logs are the wire; trace order must match both directions.
+        self.assertEqual([redact(json.loads(line), (token,)) for line in received.read_text().splitlines()],
+                         frames("out"))
+        self.assertEqual([redact(json.loads(line), (token,)) for line in sent.read_text().splitlines()],
+                         frames("in"))
+        answer = next(frame for frame in frames("out") if frame.get("id") == "native-ask")
+        self.assertEqual("<redacted 17 chars>", answer["result"]["token_echo"])
+        self.assertIn("thread-<redacted secret>", text)
 
     def broker_client(self, *, commit, before_retry=None):
         """The real store reached like the HTTP client: errors become BrokerError.

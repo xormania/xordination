@@ -61,7 +61,7 @@ Bounded wait is exercised by `tests/test_server.py` `test_long_wait_does_not_blo
 
 CI grants only read access to repository contents, uses GitHub-hosted runners, and does not publish images, install vendor CLIs, change settings, or invoke paid model sessions. Do not add coverage percentages, performance thresholds, or new CI lanes without a concrete question they answer.
 
-AC-15 wire/event ordering needs dedicated correlated evidence where concurrency affects native output. Until a live run exists, fake-native observations demonstrate implementation invariants only.
+AC-15 wire/event ordering is covered locally by the opt-in diagnostic trace: concurrent MCP stdio output and a scripted native RPC process are compared against the persisted trace sequence. Until a live run exists, fake-native observations demonstrate implementation invariants only; real vendor traces need their own correlated evidence.
 
 ## Before the first advertised compatible release
 

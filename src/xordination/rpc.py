@@ -81,8 +81,9 @@ class RPC:
     stop_grace = 5
 
     def __init__(self, process, request_handler, notification_handler, *, jsonrpc=True, owned=True,
-                 family=False):
+                 family=False, trace=None):
         self.process = process
+        self.trace = trace
         # Set only for a process started with FAMILY and a marker; cleared once
         # stopped so cleanup runs at most once.
         self.group = process.pid if owned and family and FAMILY else None
@@ -110,6 +111,9 @@ class RPC:
             if self.dead.is_set() or self.process.stdin.is_closing():
                 raise ConnectionError(self.failure or "Harness RPC closed")
             self.process.stdin.write(wire)
+            # Recorded under the write lock, so trace order is wire order.
+            if self.trace:
+                self.trace.record("out", packet)
             await self.process.stdin.drain()
 
     async def request(self, method, params, *, timeout=120, on_sent=None):
@@ -148,7 +152,14 @@ class RPC:
     async def read(self):
         try:
             while line := await self.process.stdout.readline():
-                packet = json.loads(line)
+                try:
+                    packet = json.loads(line)
+                except ValueError:
+                    if self.trace:
+                        self.trace.record("in", event="unparsable_frame")
+                    raise
+                if self.trace:
+                    self.trace.record("in", packet)
                 if not isinstance(packet, dict):
                     raise ValueError("Native protocol frame is not an object")
                 if "method" in packet:

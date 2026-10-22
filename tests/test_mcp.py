@@ -1,5 +1,10 @@
 import io
 import json
+import os
+from pathlib import Path
+import queue
+import random
+import tempfile
 import threading
 import time
 import unittest
@@ -7,6 +12,7 @@ from unittest.mock import patch
 
 from xordination.client import BrokerError
 from xordination.mcp import INSTRUCTIONS, MAX_LINE, TOOLS, ProtocolError, _Server, run_stdio
+from xordination.trace import redact
 
 
 INITIALIZE = {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -260,6 +266,81 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(1, sum(op == "claim" for op, _ in self.client.calls))
         self.assertTrue(self.server.stop.is_set())
 
+    def test_trace_order_matches_concurrent_wire_order_and_redacts(self):
+        token, body = "trace-token-7f3c", "confidential peer body 91d2"
+        lines = queue.Queue()
+
+        class Input:
+            def readline(self, limit):
+                return lines.get(timeout=10)
+
+        output = Output()
+        rng = random.Random(15)
+        claims = []
+
+        def handler(operation, params):
+            if operation == "identity":
+                return {"capabilities": {"channel_registered": True}}
+            if operation == "claim":
+                if len(claims) >= 3:
+                    return {}
+                claims.append(len(claims))
+                return {"message": {"id": f"m-{len(claims)}", "from": "peer", "body": body},
+                        "attempt_id": f"a-{len(claims)}"}
+            if operation == "finish":
+                return {}
+            time.sleep(rng.uniform(0, 0.03))
+            return {"id": "accepted-" + params["key"], "body": params["body"]}
+
+        self.client.handler = handler
+        idents = [f"call-{index}" for index in range(23)] + ["call-" + token]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mcp.trace"
+            with patch("xordination.mcp.Client", return_value=self.client), patch("sys.stdin", Input()), \
+                    patch("sys.stdout", output):
+                result = []
+                runner = threading.Thread(target=lambda: result.append(
+                    run_stdio("http://localhost:8765", token, channel=True, trace=str(path))))
+                runner.start()
+                lines.put("{broken}\n")
+                lines.put(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": INITIALIZE}) + "\n")
+                output.await_packet(lambda packet: packet.get("id") == 0)
+                lines.put(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+                for ident in idents:
+                    lines.put(json.dumps({"jsonrpc": "2.0", "id": ident, "method": "tools/call", "params": {
+                        "name": "xordination_send", "arguments": {"to": "peer", "body": body, "key": ident}}}) + "\n")
+                for ident in idents:
+                    output.await_packet(lambda packet, ident=ident: packet.get("id") == ident, timeout=5)
+                output.await_packet(lambda packet: packet.get("params", {}).get("meta", {}).get("message_id") == "m-3",
+                                    timeout=5)
+                lines.put("")
+                runner.join(10)
+            self.assertEqual([0], result)
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            text = path.read_text()
+        records = [json.loads(line) for line in text.splitlines()]
+        wire = output.packets()
+        self.assertIn(body, output.getvalue())
+        self.assertNotIn(body, text)
+        self.assertNotIn(token, text)
+        self.assertEqual(list(range(1, len(records) + 1)), [record["seq"] for record in records])
+        self.assertEqual(1, len({record["trace"] for record in records}))
+        # The persisted outbound sequence is exactly the frames as they reached stdout.
+        self.assertEqual([redact(packet, (token,)) for packet in wire],
+                         [record["frame"] for record in records if record["direction"] == "out"])
+        self.assertEqual(["unparsable_frame"], [record["event"] for record in records
+                                                 if record["direction"] == "in" and "frame" not in record])
+        position = {}
+        for record in records:
+            frame = record.get("frame", {})
+            position.setdefault((record["direction"], frame.get("id")), record["seq"])
+        for ident in [0] + [frame_id for frame_id in idents[:-1]] + ["call-<redacted secret>"]:
+            self.assertLess(position[("in", ident)], position[("out", ident)])
+        channel = [record["frame"]["params"] for record in records
+                   if record.get("frame", {}).get("method") == "notifications/claude/channel"]
+        self.assertEqual(["m-1", "m-2", "m-3"], [params["meta"]["message_id"] for params in channel])
+        self.assertTrue(all(params["content"].startswith("<redacted ") for params in channel))
+
     def test_ping_and_initialize_cannot_reuse_an_in_flight_request_id(self):
         self.initialize()
         entered, release = threading.Event(), threading.Event()
@@ -295,6 +376,37 @@ class MCPTests(unittest.TestCase):
         packets = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(-32700, packets[0]["error"]["code"])
         self.assertEqual("2025-06-18", packets[1]["result"]["protocolVersion"])
+
+    def test_traced_stdio_enforces_byte_limit_and_records_byte_frames(self):
+        token = "trace-bytes-token-4e1a"
+        frame = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping", "pad": "\U0001F600" * 300000}, ensure_ascii=False)
+        self.assertLess(len(frame), MAX_LINE)
+        self.assertGreater(len(frame.encode()), MAX_LINE)
+        follow = {"jsonrpc": "2.0", "id": "é-2", "method": "initialize", "params": INITIALIZE}
+        data = (frame + "\n{broken}\n" + json.dumps(follow, ensure_ascii=False) + "\n").encode()
+        stdin = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8")
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mcp.trace"
+            with patch("xordination.mcp.Client", return_value=self.client), patch("sys.stdin", stdin), \
+                    patch("sys.stdout", output):
+                self.assertEqual(0, run_stdio("http://localhost:8765", token, trace=str(path)))
+            # The bytes stream was read, not the text wrapper.
+            self.assertEqual(b"", stdin.buffer.read())
+            text = path.read_text(encoding="utf-8")
+        packets = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([-32700, -32700], [packet["error"]["code"] for packet in packets[:2]])
+        self.assertEqual("2025-06-18", packets[2]["result"]["protocolVersion"])
+        records = [json.loads(line) for line in text.splitlines()]
+        self.assertNotIn("\U0001F600", text)
+        self.assertNotIn(token, text)
+        inbound = [(record["event"], record.get("frame")) for record in records if record["direction"] == "in"]
+        # Byte frames are recorded as parsed packets; the oversized frame leaves only an event.
+        self.assertEqual([("oversized_frame", None), ("unparsable_frame", None), ("frame", redact(follow, (token,)))],
+                         inbound)
+        self.assertEqual("é-2", inbound[2][1]["id"])
+        self.assertEqual([redact(packet, (token,)) for packet in packets],
+                         [record["frame"] for record in records if record["direction"] == "out"])
 
     def test_stdio_parse_errors_recover_on_next_frame(self):
         input_lines = io.StringIO('{broken}\nNaN\n' + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": INITIALIZE}) + '\n')

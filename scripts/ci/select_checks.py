@@ -22,6 +22,8 @@ SOURCE_GROUPS = {
     # Public dispatch and subprocess entry points are explicit dependency edges.
     # The benchmark runs a separate broker process through cli.serve.
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
+    # Traces are written by the MCP frontend and native RPC and bundled by the CLI.
+    "trace.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
     # Lazily imported by CLI dispatch; end_to_end runs it in a separate client process.
     # It consumes the live.py verifier report; live_acceptance feeds a retained one through it.
     # live.py lazily imports its source fingerprint from here, so every live group depends on it.
