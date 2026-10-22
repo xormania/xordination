@@ -203,6 +203,7 @@ class SelectionTests(unittest.TestCase):
                                        "--github-output", str(output)])
                     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
                     self.assertEqual((fast, slow), (values["fast"], values["slow"]))
+                    self.assertEqual(json.loads((Path(folder) / "selection.json").read_text()), json.loads(values["selection"]))
 
     def test_full_runner_executes_unknown_failing_test(self):
         result = self.run_fixture_suite(selector.GROUPS, failing_unknown=True)

@@ -194,6 +194,8 @@ def main(argv=None):
                                 ("benchmark", result["benchmark"]),
                                 ("full", result["full"])):
                 stream.write(name + "=" + str(value).lower() + "\n")
+            # Later jobs restore the exact selection from this single-line output.
+            stream.write("selection=" + json.dumps(result, separators=(",", ":")) + "\n")
     print(json.dumps(result, indent=2))
     return 0
 
