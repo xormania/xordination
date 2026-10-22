@@ -1,5 +1,7 @@
 """CI may skip unrelated contracts only from a complete, understood change."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -23,35 +25,39 @@ benchmark_spec.loader.exec_module(benchmark)
 class SelectionTests(unittest.TestCase):
     def test_dependency_groups_and_packaging_inputs(self):
         cases = (
-            (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["src/xordination/trace.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["src/xordination/server.py"], {"adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["tests/test_store.py"], {"store"}, True, False),
-            (["docs/ci.md"], set(), True, False),
-            (["AGENTS.md"], set(), True, False),
-            (["README.md"], set(), True, True),
-            ([".dockerignore"], set(), True, True),
-            (["src/xordination/readiness.py"], {"cli", "end_to_end", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["MANIFEST.in"], set(selector.GROUPS), True, False),
-            (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["tests/test_behavior.py"], {"behavior"}, True, False),
-            (["tests/test_performance.py"], {"performance"}, True, False),
-            (["scripts/testing/benchmark.py"], {"performance"}, True, False),
-            (["scripts/testing/live.py"], {"live_acceptance", "live_native_busy", "live_tmux"}, True, False),
-            (["scripts/testing/live_tmux.py"], {"live_tmux"}, True, False),
-            (["tests/test_live_tmux.py"], {"live_tmux"}, True, False),
-            (["tests/test_live_native_busy.py"], {"live_native_busy"}, True, False),
-            (["tests/live_native_fixture.py"], {"live_native_busy"}, True, False),
+            (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, False),
+            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, True),
+            (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, False),
+            (["src/xordination/trace.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, False),
+            (["src/xordination/server.py"], {"adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, True),
+            (["tests/test_store.py"], {"store"}, False, False, False),
+            (["docs/ci.md"], set(), False, False, False),
+            (["AGENTS.md"], set(), False, False, False),
+            ([".gitignore"], set(), False, False, False),
+            ([".github/workflows/codeql.yml"], set(), False, False, False),
+            (["README.md"], set(), True, True, False),
+            ([".dockerignore"], set(), True, True, False),
+            (["src/xordination/readiness.py"], {"cli", "end_to_end", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, False),
+            (["MANIFEST.in"], set(), True, False, False),
+            (["pyproject.toml"], set(selector.GROUPS), True, True, True),
+            (["src/xordination/rpc.py", "tests/test_mcp.py"], {"adapters", "mcp", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True, False),
+            (["tests/test_behavior.py"], {"behavior"}, False, False, False),
+            # The benchmark measures product source with the head driver, not the contract tests.
+            (["tests/test_performance.py"], {"performance"}, False, False, False),
+            (["scripts/testing/benchmark.py"], {"performance"}, False, False, True),
+            (["scripts/testing/live.py"], {"live_acceptance", "live_native_busy", "live_tmux"}, False, False, False),
+            (["scripts/testing/live_tmux.py"], {"live_tmux"}, False, False, False),
+            (["tests/test_live_tmux.py"], {"live_tmux"}, False, False, False),
+            (["tests/test_live_native_busy.py"], {"live_native_busy"}, False, False, False),
+            (["tests/live_native_fixture.py"], {"live_native_busy"}, False, False, False),
         )
-        for paths, groups, package, image in cases:
+        for paths, groups, package, image, benchmark in cases:
             with self.subTest(paths=paths):
                 result = selector.classify_paths(paths)
                 self.assertEqual(set(result["groups"]), groups)
                 self.assertEqual(result["package"], package)
                 self.assertEqual(result["image"], image)
-                self.assertEqual(result["benchmark"], "performance" in groups)
+                self.assertEqual(result["benchmark"], benchmark)
                 # The image smoke installs the package artifact for its cross-profile client.
                 self.assertTrue(result["package"] or not result["image"])
 
@@ -117,7 +123,8 @@ class SelectionTests(unittest.TestCase):
             self.assertTrue(result["image"])
             self.assertTrue(selector.select_change(repo, "push", {"before": "f" * 40}, head)["full"])
 
-    def run_fixture_suite(self, groups, *, missing=None, empty=None, failing_unknown=False, replacement=None):
+    def run_fixture_suite(self, groups, *, missing=None, empty=None, failing_unknown=False, replacement=None,
+                          contents=None, args=()):
         with tempfile.TemporaryDirectory() as folder:
             repo = Path(folder)
             (repo / "tests").mkdir()
@@ -131,14 +138,71 @@ class SelectionTests(unittest.TestCase):
                     "import unittest\nclass NewContract(unittest.TestCase):\n    def test_new(self): self.fail('NEW_CONTRACT_EXECUTED')\n")
             if replacement:
                 (repo / "tests/test_mcp.py").write_text(replacement)
+            for name, text in (contents or {}).items():
+                (repo / "tests" / name).write_text(text)
             selection = repo / "selection.json"
             selection.write_text(json.dumps({"groups": list(groups)}))
             report = repo / "execution.json"
             result = subprocess.run([sys.executable, str(SCRIPTS / "run_contracts.py"), "--selection", str(selection),
-                                     "--report", str(report)], cwd=repo, stdout=subprocess.PIPE,
+                                     "--report", str(report), *args], cwd=repo, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, timeout=20)
             result.census = json.loads(report.read_text()) if report.is_file() else None
             return result
+
+    def test_fast_and_slow_tiers_partition_every_case_and_unknown_modules_are_slow(self):
+        self.assertEqual(set(selector.GROUPS), set(selector.FAST_GROUPS) | {name for shard in selector.SHARDS for name in shard})
+        self.assertFalse(set(selector.FAST_GROUPS) & {name for shard in selector.SHARDS for name in shard})
+        extra = {"test_new_security.py": "import unittest\nclass NewContract(unittest.TestCase):\n    def test_new(self): pass\n"}
+        census = {}
+        for tier in ("fast", "slow", "all"):
+            result = self.run_fixture_suite(selector.GROUPS, contents=extra, args=("--tier", tier))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            census[tier] = result.census
+        self.assertEqual(census["fast"]["collected"], len(selector.FAST_GROUPS))
+        self.assertEqual(census["slow"]["collected"], len(selector.GROUPS) - len(selector.FAST_GROUPS) + 1)
+        self.assertEqual(census["fast"]["collected"] + census["slow"]["collected"], census["all"]["collected"])
+        self.assertTrue(all(census[tier]["required_exercised"] for tier in census))
+
+    def test_parallel_shards_match_the_inline_census(self):
+        inline = self.run_fixture_suite(selector.GROUPS, args=("--tier", "slow"))
+        sharded = self.run_fixture_suite(selector.GROUPS, args=("--tier", "slow", "--parallel"))
+        self.assertEqual(sharded.returncode, 0, sharded.stdout + sharded.stderr)
+        for key in ("collected", "started", "executed", "not_run", "failures", "errors", "required_exercised"):
+            self.assertEqual(inline.census[key], sharded.census[key], key)
+        self.assertEqual([shard["modules"] for shard in sharded.census["shards"]],
+                         [["test_" + name for name in sorted(shard)] for shard in selector.SHARDS])
+
+    def test_first_failing_shard_stops_the_rest_and_their_cases_are_not_run(self):
+        slow = "import time, unittest\nclass Contract(unittest.TestCase):\n    def test_case(self): time.sleep(60)\n"
+        failing = "import unittest\nclass Contract(unittest.TestCase):\n    def test_case(self): self.fail('SHARD_FAILED')\n"
+        contents = {"test_adapters.py": failing, "test_live_tmux.py": slow, "test_behavior.py": slow}
+        result = self.run_fixture_suite(selector.GROUPS, contents=contents, args=("--tier", "slow", "--parallel"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHARD_FAILED", result.stdout)
+        self.assertIn("stopping the remaining shards", result.stdout)
+        self.assertEqual(["test_adapters.Contract.test_case"], result.census["failures"])
+        self.assertFalse(result.census["required_exercised"])
+        self.assertIn("test_live_tmux.Contract.test_case", result.census["not_run"])
+        self.assertIn("test_behavior.Contract.test_case", result.census["not_run"])
+        stopped = [shard for shard in result.census["shards"] if shard["result"] == "stopped after an earlier shard failed"]
+        self.assertEqual(2, len(stopped))
+        self.assertTrue(all(shard["duration_seconds"] < 30 for shard in stopped))
+
+    def test_selection_outputs_name_the_tiers_to_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for paths, fast, slow in ((["src/xordination/store.py"], "true", "true"),
+                                      (["tests/test_mcp.py"], "true", "false"),
+                                      (["tests/test_live_tmux.py"], "false", "true"),
+                                      (["docs/testing.md"], "false", "false")):
+                with self.subTest(paths=paths):
+                    output = Path(folder) / "output"
+                    output.write_text("")
+                    with patch.object(selector, "changed_paths", return_value=paths), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        selector.main(["--event", "push", "--selection-file", str(Path(folder) / "selection.json"),
+                                       "--github-output", str(output)])
+                    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                    self.assertEqual((fast, slow), (values["fast"], values["slow"]))
 
     def test_full_runner_executes_unknown_failing_test(self):
         result = self.run_fixture_suite(selector.GROUPS, failing_unknown=True)

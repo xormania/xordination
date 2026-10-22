@@ -10,6 +10,12 @@ import subprocess
 
 GROUPS = ("store", "adapters", "mcp", "server", "cli", "end_to_end", "ci_selection",
           "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux")
+# In-process contracts that finish in seconds run first; slower groups start only after they pass.
+FAST_GROUPS = ("store", "mcp", "server", "cli", "ci_selection")
+# Slow groups run as parallel shard processes balanced by measured duration. Test
+# modules outside GROUPS (only selected by a full run) join the last shard.
+SHARDS = (("adapters",), ("live_tmux", "live_native_busy"),
+          ("live_acceptance", "behavior", "end_to_end", "performance"))
 SOURCE_GROUPS = {
     "store.py": ("store", "adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
     "adapters.py": ("adapters", "cli", "behavior", "live_acceptance", "live_native_busy", "live_tmux"),
@@ -41,7 +47,11 @@ SCRIPT_GROUPS = {
     "scripts/testing/live.py": ("live_acceptance", "live_native_busy", "live_tmux"),
     "scripts/testing/live_tmux.py": ("live_tmux",),
 }
-BUILD_INPUTS = {"pyproject.toml", "MANIFEST.in"}
+# MANIFEST.in includes tests, docs and scripts by pattern, so editing their content cannot
+# change the archive; check_package still verifies every one is packaged when it runs.
+BUILD_INPUTS = {"pyproject.toml"}
+# Inputs no build, image or contract reads; their own workflow or the lint job covers them.
+INERT_INPUTS = {".gitignore", ".github/workflows/codeql.yml"}
 IMAGE_PACKAGE_INPUTS = {"README.md", "LICENSE", "NOTICE", "Dockerfile"}
 
 
@@ -54,7 +64,7 @@ def classify_paths(paths):
     """Union known dependencies; unrecognized paths may never silently skip work."""
     paths = sorted(set(paths))
     groups = set()
-    package = image = False
+    package = image = benchmark = False
     reasons = []
     for path in paths:
         if path.startswith("src/xordination/"):
@@ -63,23 +73,29 @@ def classify_paths(paths):
                 return full_selection("Unknown runtime input: " + path, paths)
             groups.update(SOURCE_GROUPS[name])
             package = image = True
+            benchmark = benchmark or "performance" in SOURCE_GROUPS[name]
             reasons.append("Runtime input: " + path)
         elif path in TEST_GROUPS:
             groups.update(TEST_GROUPS[path])
-            package = True
-            reasons.append("Test/source-archive input: " + path)
+            reasons.append("Test input: " + path)
         elif path in SCRIPT_GROUPS:
             groups.update(SCRIPT_GROUPS[path])
-            package = True
-            reasons.append("Testing driver/source-archive input: " + path)
+            # The benchmark comparison runs the head driver against both product sources.
+            benchmark = benchmark or path == "scripts/testing/benchmark.py"
+            reasons.append("Testing driver input: " + path)
         elif path.startswith("tests/"):
             return full_selection("New or shared test input: " + path, paths)
         elif path in BUILD_INPUTS:
-            # Manifest changes can alter which modules reach the installed archive.
+            # Project metadata changes interpreters, entry points and the installed package.
             groups.update(GROUPS)
+            package = image = benchmark = True
+            reasons.append("Build input: " + path)
+        elif path == "MANIFEST.in":
+            # Contracts run from the checkout; only the source archive can change.
             package = True
-            image = image or path == "pyproject.toml"
-            reasons.append("Build/source-archive input: " + path)
+            reasons.append("Source-archive input: " + path)
+        elif path in INERT_INPUTS:
+            reasons.append("Input with no build, image or contract effect: " + path)
         elif path in IMAGE_PACKAGE_INPUTS:
             package = image = True
             reasons.append("Package/image input: " + path)
@@ -88,14 +104,13 @@ def classify_paths(paths):
             package = image = True
             reasons.append("Image context input: " + path)
         elif (path.startswith("docs/") and path.endswith(".md")) or path == "AGENTS.md":
-            package = True
-            reasons.append("Documentation/source-archive input: " + path)
+            reasons.append("Documentation input: " + path)
         elif path.startswith("scripts/ci/") or path.startswith(".github/workflows/"):
             return full_selection("CI selection/execution input: " + path, paths)
         else:
             return full_selection("Unknown input: " + path, paths)
     return {"groups": [name for name in GROUPS if name in groups], "package": package,
-            "benchmark": "performance" in groups,
+            "benchmark": benchmark,
             "image": image, "full": groups == set(GROUPS), "paths": paths,
             "reasons": reasons or ["Complete tested diff is empty"]}
 
@@ -171,7 +186,10 @@ def main(argv=None):
     Path(args.selection_file).write_text(json.dumps(result, indent=2) + "\n")
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as stream:
+            fast = any(name in FAST_GROUPS for name in result["groups"])
+            slow = any(name not in FAST_GROUPS for name in result["groups"])
             for name, value in (("contracts", bool(result["groups"])),
+                                ("fast", fast), ("slow", slow),
                                 ("package", result["package"]), ("image", result["image"]),
                                 ("benchmark", result["benchmark"]),
                                 ("full", result["full"])):
