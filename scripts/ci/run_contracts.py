@@ -148,7 +148,7 @@ def run_shards(selection_path, tier, buckets):
                 part = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {}
                 for key in ("started_ids", "skipped", "failures", "errors", "expected_failures", "unexpected_successes"):
                     outcome[key] += part.get(key, [])
-                outcome["shards"].append({"modules": modules, "exit_code": code, "result": note,
+                outcome["shards"].append({"shard": number + 1, "modules": modules, "exit_code": code, "result": note,
                                           "duration_seconds": round(time.monotonic() - began, 3)})
                 if code != 0:
                     outcome["successful"] = False
@@ -156,6 +156,8 @@ def run_shards(selection_path, tier, buckets):
                         print(f"Shard {number + 1} failed; stopping the remaining shards.", flush=True)
                     stopped = True
             time.sleep(.05)
+    # Shards finish in any order; the census lists them in their fixed order.
+    outcome["shards"].sort(key=lambda shard: shard["shard"])
     outcome["duration_seconds"] = round(time.monotonic() - started, 6)
     return outcome
 
