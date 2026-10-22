@@ -59,8 +59,8 @@ TOOLS = [
      "inputSchema": _object({**_INBOX, "timeout": {"type": "number", "minimum": 0, "maximum": 30}})},
     {"name": "xordination_ack", "description": "Record your explicit receipt of a message; this is not assignment acceptance or work completion.",
      "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
-    {"name": "xordination_status", "description": "Inspect an authorized message's attempts, receipts, replies and unresolved uncertainty.",
-     "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
+    {"name": "xordination_status", "description": "Inspect an authorized message's attempts, receipts, replies and unresolved uncertainty. A limit keeps the newest entries of each list and reports totals.",
+     "inputSchema": _object({"message_id": _IDENT, "limit": _INBOX["limit"]}, ("message_id",))},
     {"name": "xordination_retry", "description": "Explicitly retry an eligible uncertain delivery. The recipient may already have acted on it.",
      "inputSchema": _object({"message_id": _IDENT}, ("message_id",))},
 ]
@@ -184,7 +184,12 @@ class _Server:
             return
         ident = packet["id"]
         if method in ("initialize", "ping"):
-            self._respond(packet, threading.Event())
+            with self.state_lock:
+                in_flight = ident in self.requests
+            if in_flight:
+                self.error(ident, -32600, "Request ID is already in flight")
+            else:
+                self._respond(packet, threading.Event())
             return
         is_wait = method == "tools/call" and params.get("name") == "xordination_wait"
         slots = self.wait_slots if is_wait else self.call_slots
@@ -349,15 +354,19 @@ def run_stdio(endpoint, token, channel=False, trace=None):
     """Serve MCP on stdin/stdout. Diagnostics never enter protocol stdout."""
     trace = open_trace(trace, "mcp-stdio", secrets=(token,))
     server = _Server(Client(endpoint, token), sys.stdout, channel=channel, trace=trace)
+    # Read raw bytes where available so MAX_LINE bounds the encoded frame, not decoded characters.
+    # The trace records parsed packets and events only, never raw frames, so bytes need no decoding here.
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
     try:
         while not server.stop.is_set():
-            line = sys.stdin.readline(MAX_LINE + 1)
+            line = stream.readline(MAX_LINE + 1)
             if not line:
                 break
             if len(line) > MAX_LINE:
                 # Discard the rest of this frame without retaining unbounded input.
-                while line and not line.endswith("\n"):
-                    line = sys.stdin.readline(MAX_LINE + 1)
+                newline = b"\n" if isinstance(line, bytes) else "\n"
+                while line and not line.endswith(newline):
+                    line = stream.readline(MAX_LINE + 1)
                 if trace:
                     trace.record("in", event="oversized_frame")
                 server.error(None, -32700, "JSON-RPC frame exceeds size limit")

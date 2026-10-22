@@ -78,6 +78,10 @@ class Client:
         except (URLError, TimeoutError) as exc:
             raise BrokerError("connection_error", str(exc.reason) if isinstance(exc, URLError)
                               else "Broker request timed out") from None
+        except (OSError, HTTPException) as exc:
+            # A broker that stops after accepting the connection closes it
+            # before or during its response; urllib does not wrap that loss.
+            raise BrokerError("connection_error", "Broker connection lost: " + type(exc).__name__) from None
         if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
             raise BrokerError("invalid_response", "Broker returned an invalid response")
         if not result["ok"]:

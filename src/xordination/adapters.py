@@ -19,11 +19,48 @@ import tempfile
 import time
 import uuid
 
+from .client import BrokerError
 from .rpc import RPC, RPCError
 
 
 class CapabilityError(ValueError):
     """The requested native delivery mode has not been established."""
+
+
+class BrokerReconnect:
+    """Bounded backoff across one broker outage for adapter-owned operations.
+
+    Only an unreachable or overloaded broker is retried. Authentication,
+    generation fencing and every other broker answer are returned at once, so
+    a replaced binding still loses authority on its next call.
+    """
+    TRANSIENT = frozenset({"connection_error", "unavailable", "backpressure"})
+
+    def __init__(self, window=60.0, initial=.2, maximum=5.0):
+        self.window, self.initial, self.maximum = window, initial, maximum
+        self.since = None
+        self.delay = initial
+
+    def failed(self, error):
+        """Return the next delay, or re-raise once the outage exceeds its window."""
+        if not isinstance(error, BrokerError) or error.code not in self.TRANSIENT or self.window <= 0:
+            raise error
+        now = time.monotonic()
+        if self.since is None:
+            self.since, self.delay = now, self.initial
+            print("Xordination broker unavailable (" + error.code + "); reconnecting for up to "
+                  + format(self.window, "g") + "s", file=sys.stderr, flush=True)
+        remaining = self.since + self.window - now
+        if remaining <= 0:
+            raise error
+        delay = min(self.delay, remaining)
+        self.delay = min(self.delay * 2, self.maximum)
+        return delay
+
+    def recovered(self):
+        if self.since is not None:
+            self.since = None
+            print("Xordination broker reconnected", file=sys.stderr, flush=True)
 
 
 def _binary(harness, binary=None):
@@ -196,9 +233,34 @@ class NativeAdapter:
         self.busy = False
         self.active_turn = None
         self.capabilities = {}
+        self.reconnect = BrokerReconnect()
+
+    async def call_once(self, operation, **params):
+        return await asyncio.to_thread(self.client.call, operation, **params)
 
     async def call(self, operation, **params):
-        return await asyncio.to_thread(self.client.call, operation, **params)
+        """An adapter-owned operation survives a bounded broker outage.
+
+        The native session stays up while the broker restarts. A claim whose
+        response was lost stays claimed until restart recovery or lease expiry
+        marks it uncertain; retrying claims only the next queued message. An
+        error raised after a retry carries ``after_retry`` because an earlier
+        request may have reached the broker.
+        """
+        retried = False
+        while True:
+            try:
+                result = await self.call_once(operation, **params)
+            except BrokerError as error:
+                error.after_retry = retried
+                delay = self.reconnect.failed(error)
+                if self.rpc and self.rpc.dead.is_set():
+                    raise
+                retried = True
+                await asyncio.sleep(delay)
+                continue
+            self.reconnect.recovered()
+            return result
 
     async def bind(self, **changes):
         async with self.binding_lock:
@@ -242,8 +304,20 @@ class NativeAdapter:
         attempt_id = message["attempt_id"]
         # Remove only after durable finish returns. A network failure leaves a
         # recoverable claim, never an implicit second native submission.
-        await self.call("finish", message_id=message["id"], attempt_id=attempt_id,
-                        outcome=outcome, detail={"native_id": self.session, "transport": transport, **details})
+        try:
+            await self.call("finish", message_id=message["id"], attempt_id=attempt_id,
+                            outcome=outcome, detail={"native_id": self.session, "transport": transport, **details})
+        except BrokerError as error:
+            # A retried finish whose first request committed before its
+            # response was lost is rejected as late evidence. Only this
+            # attempt's durable record of the same outcome, read with a still
+            # current credential, settles it; anything else stays an error.
+            if error.code != "stale_attempt" or not getattr(error, "after_retry", False):
+                raise
+            status = await self.call("status", message_id=message["id"])
+            if not any(row.get("id") == attempt_id and row.get("state") == outcome
+                       for row in status.get("attempts", [])):
+                raise
         self.pending_attempts.pop(attempt_id, None)
 
     async def refresh_delivery_state(self):
@@ -278,6 +352,8 @@ class NativeAdapter:
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        # Shutdown never waits out a broker outage; claims stay recoverable.
+        self.reconnect.window = 0
         for message in list(self.pending_attempts.values()):
             try:
                 await self.finish(message, "uncertain", "adapter_shutdown", evidence="submission not settled")
@@ -367,7 +443,8 @@ class CodexAdapter(NativeAdapter):
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be an object")
             try:
-                value = await self.call(tool.removeprefix("xordination_"), **args)
+                # Model tool calls are not retried; the model sees the failure.
+                value = await self.call_once(tool.removeprefix("xordination_"), **args)
                 return {"contentItems": [{"type": "inputText", "text": json.dumps(value)}], "success": True}
             except Exception as error:
                 return {"contentItems": [{"type": "inputText", "text": str(error)}], "success": False}
@@ -717,16 +794,26 @@ def run_claude(client, binary, project, *, model=None, reasoning=None, prompt=No
                 pass
             raise
         observed = ClaudeChannelLog(debug_log)
-        ready = False
+        reconnect = BrokerReconnect()
+        registered = ready = False
         try:
             while process.poll() is None:
-                identity = client.call("identity")
-                if identity.get("stopped") or identity.get("active") is False:
-                    break
-                if not ready and observed.poll():
-                    client.call("bind", native_id=session, capabilities={"channel_registered": True,
-                        "channel_registration_basis": "fresh native debug-log handler registration"})
-                    ready = True
+                try:
+                    identity = client.call("identity")
+                    if identity.get("stopped") or identity.get("active") is False:
+                        break
+                    # Registration is observed once; keep it across a failed bind.
+                    registered = registered or (not ready and observed.poll())
+                    if registered and not ready:
+                        client.call("bind", native_id=session, capabilities={"channel_registered": True,
+                            "channel_registration_basis": "fresh native debug-log handler registration"})
+                        ready = True
+                except BrokerError as error:
+                    # The supervised native session outlives a bounded broker
+                    # outage; fencing and other broker answers still end it.
+                    time.sleep(reconnect.failed(error))
+                    continue
+                reconnect.recovered()
                 time.sleep(.2)
             return process.poll() if process.poll() is not None else 0
         finally:

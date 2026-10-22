@@ -24,9 +24,10 @@ class SelectionTests(unittest.TestCase):
     def test_dependency_groups_and_packaging_inputs(self):
         cases = (
             (["src/xordination/mcp.py"], {"adapters", "mcp", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
-            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
+            (["src/xordination/cli.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["src/xordination/rpc.py"], {"adapters", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["src/xordination/trace.py"], {"adapters", "mcp", "server", "cli", "end_to_end", "behavior", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
+            (["src/xordination/server.py"], {"adapters", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"}, True, True),
             (["tests/test_store.py"], {"store"}, True, False),
             (["docs/ci.md"], set(), True, False),
             (["AGENTS.md"], set(), True, False),
@@ -178,7 +179,8 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(result.census["expected_failures"]), 1)
 
     def test_broker_performance_dependencies_select_measurement_and_behavior(self):
-        for source in ("store.py", "client.py", "server.py"):
+        # The benchmark also starts a separate broker through cli.serve.
+        for source in ("store.py", "client.py", "server.py", "cli.py"):
             with self.subTest(source=source):
                 selected = selector.classify_paths(["src/xordination/" + source])
                 self.assertTrue(selected["benchmark"])

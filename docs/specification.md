@@ -6,7 +6,7 @@
 - **Distribution:** Xorder
 - **Purpose:** Define a reusable communication service using the demonstrated capabilities of multi-harness-proof and explicit contracts for durable delivery, session lifecycle, and operator control.
 
-This document distinguishes **observed source behavior**, **historical live evidence**, and **proposed requirements**. Requirements below describe the proposed Xordination product; they do not claim that Xordination already implements them. xor's subsequent direction takes precedence. Implementation language and several deployment choices remain recommendations or open decisions.
+This document distinguishes **observed source behavior**, **historical live evidence**, and **proposed requirements**. Requirements below describe the proposed Xordination product; they do not claim that Xordination already implements them. xor's subsequent direction takes precedence. The owner has selected Python 3.10+ as the implementation language for now ([§14](#14-decisions-still-open)); several deployment choices remain recommendations or open decisions.
 
 ## 1. Product objective
 
@@ -121,7 +121,7 @@ Endpoint discovery should be deterministic from explicit project configuration o
 
 Container deployments persist the store outside the disposable container filesystem. Remote clients use the broker API rather than sharing the database file over a network filesystem.
 
-The language, SQLite driver, packaging method, and remote transport implementation remain open. These choices must preserve the contract rather than changing its guarantees.
+The implementation language is Python 3.10+ for now ([§14](#14-decisions-still-open)); the SQLite driver, packaging method, and remote transport implementation remain open. These choices must preserve the contract rather than changing its guarantees.
 
 ## 4. Identity, scope, and lifecycle
 
@@ -540,7 +540,7 @@ Each stage produces reviewable evidence. Passing an early stage does not establi
 
 | Decision | Current recommendation | Information needed |
 | --- | --- | --- |
-| Implementation language | Compare extracting Python components with a Rust implementation behind the same contract | Maintenance/distribution preference and cost of retaining behavior; no language selected by this document |
+| Implementation language | Selected for now by owner direction: Python 3.10+ with the standard library only at runtime, matching the initial implementation | Revisit only on owner direction; a different language would retain the same behavioral contracts and evidence baseline |
 | Runtime packaging | Native package plus optional sidecar image | Required OS/architecture matrix and runtime dependencies |
 | Durable backend | Single-broker SQLite first | Measured concurrency, operational requirements, migration approach |
 | Existing-session integration | Preserve attachment/resume as explicit adapter capabilities | Current native APIs and live evidence per harness/version |
