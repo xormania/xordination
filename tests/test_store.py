@@ -558,6 +558,140 @@ sys.stdin.buffer.read(1)
         self.assertTrue(identity["capabilities"]["channel_registered"])
         self.assertEqual("supported", identity["capabilities"]["native_idle_delivery"])
 
+    def test_changed_native_session_fences_delivery_without_replacement(self):
+        claimed_message = self.send("claimed")
+        queued = self.send("queued")
+        attempt = self.store.claim(self.b)["attempt_id"]
+        self.assertCode("replacement_required", self.store.bind, self.b, "cleared-session",
+                        {"identity_source": "claude/SessionStart"})
+        # The fence and its in-flight uncertainty were committed despite the refusal.
+        identity = self.store.identity(self.b)
+        self.assertEqual(("session-b", "conflict", True), (identity["native_id"], identity["native_identity_source"], identity["active"]))
+        self.assertEqual({"observed_native_id": "cleared-session", "identity_source": "claude/SessionStart"},
+                         {key: value for key, value in identity["native_identity_conflict"].items() if key != "observed_at"})
+        self.assertNotIn("native_identity_conflict", identity["capabilities"])
+        status = self.store.status(self.a, claimed_message["id"])
+        self.assertEqual(("uncertain", {"reason": "native_identity_changed"}), (status["state"], status["attempts"][0]["detail"]))
+        self.assertCode("stale_attempt", self.store.finish, self.b, claimed_message["id"], attempt, "submitted")
+        self.assertEqual("uncertain", self.store.status(self.a, claimed_message["id"])["state"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        self.store.retry(self.a, claimed_message["id"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        # Reporting the original identity again does not lift the fence.
+        self.assertEqual("conflict", self.store.bind(self.b, "session-b", {"channel_registered": True})["native_identity_source"])
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        self.assertEqual("queued", self.store.status(self.a, queued["id"])["state"])
+        replacement = self.store.authenticate(self.store.join("project", "b", harness="claude", replace=True)["token"])
+        self.assertEqual("unobserved", replacement["native_identity_source"])
+        self.assertIsNone(self.store.claim(replacement)["message"])
+
+    def test_native_identity_conflict_fences_every_session_bound_operation(self):
+        received = self.send("received")
+        outgoing = self.store.send(self.b, "a", "Sent before /clear", "outgoing")
+        attempt = self.store.claim(self.a)["attempt_id"]
+        self.store.finish(self.a, outgoing["id"], attempt, "uncertain")
+        self.assertCode("replacement_required", self.store.bind, self.b, "cleared-session",
+                        {"identity_source": "claude/SessionStart"})
+        # The changed native conversation must not read, send, acknowledge,
+        # retry, claim, recover or list peers with the old binding's token.
+        for name, operation in (
+                ("inbox", lambda: self.store.inbox(self.b)),
+                ("inbox_unacknowledged", lambda: self.store.inbox(self.b, unacknowledged=True)),
+                ("send", lambda: self.store.send(self.b, "a", "After /clear", "after-clear")),
+                ("send_replay", lambda: self.store.send(self.b, "a", "Sent before /clear", "outgoing")),
+                ("ack", lambda: self.store.ack(self.b, received["id"])),
+                ("retry", lambda: self.store.retry(self.b, outgoing["id"])),
+                ("claim", lambda: self.store.claim(self.b)),
+                ("recover", lambda: self.store.recover(self.b, received["id"])),
+                ("peers", lambda: self.store.peers(self.b))):
+            with self.subTest(operation=name):
+                self.assertCode("replacement_required", operation)
+        received_status = self.store.status(self.a, received["id"])
+        self.assertEqual(("queued", [], False), (received_status["state"], received_status["receipts"], received_status["acknowledged"]))
+        self.assertEqual("uncertain", self.store.status(self.a, outgoing["id"])["state"])
+        self.assertEqual([outgoing["id"]], [message["id"] for message in self.store.inbox(self.a)["messages"]])
+        # Operator diagnostics stay available: identity shows the conflict, and
+        # status reports delivery state without the peer content.
+        identity = self.store.identity(self.b)
+        self.assertEqual(("conflict", "cleared-session"),
+                         (identity["native_identity_source"], identity["native_identity_conflict"]["observed_native_id"]))
+        diagnostic = self.store.status(self.b, received["id"])
+        self.assertEqual(("queued", None, None, "native_identity_conflict"),
+                         (diagnostic["state"], diagnostic["body"], diagnostic["metadata"], diagnostic["content_withheld"]))
+        self.assertIsNone(self.store.status(self.b, outgoing["id"])["body"])
+        self.assertEqual("A question", self.store.status(self.a, received["id"])["body"])
+        # Re-reporting the original identity remains possible and does not lift the fence.
+        self.assertEqual("conflict", self.store.bind(self.b, "session-b", {"channel_registered": True})["native_identity_source"])
+        self.assertCode("replacement_required", self.store.inbox, self.b)
+        replacement = self.store.authenticate(self.store.join("project", "b", harness="claude", replace=True)["token"])
+        self.assertTrue(self.store.recover(replacement, received["id"])["recovered"])
+        self.assertEqual([received["id"]], [message["id"] for message in self.store.inbox(replacement)["messages"]])
+
+    def test_native_identity_conflict_fences_cancel_and_native_receipts_but_status_shows_cancellation(self):
+        pending = self.store.send(self.b, "a", "Still pending", "pending")
+        withdrawn = self.store.send(self.b, "a", "Withdrawn", "withdrawn")
+        self.store.cancel(self.b, withdrawn["id"], reason="superseded plan")
+        inbound = self.send("inbound")
+        attempt = self.store.claim(self.b)
+        self.assertEqual(inbound["id"], attempt["message"]["id"])
+        self.store.finish(self.b, inbound["id"], attempt["attempt_id"], "submitted")
+        self.assertCode("replacement_required", self.store.bind, self.b, "cleared-session",
+                        {"identity_source": "claude/SessionStart"})
+        for name, operation in (
+                ("cancel", lambda: self.store.cancel(self.b, pending["id"])),
+                ("cancel_replay", lambda: self.store.cancel(self.b, withdrawn["id"], reason="superseded plan")),
+                ("observe", lambda: self.store.observe(self.b, inbound["id"], attempt["attempt_id"], "native_insertion",
+                                                       {"native_event": "user_message"}))):
+            with self.subTest(operation=name):
+                self.assertCode("replacement_required", operation)
+        untouched = self.store.status(self.a, pending["id"])
+        self.assertEqual(("queued", None), (untouched["state"], untouched["cancellation"]))
+        self.assertEqual([], self.store.status(self.a, inbound["id"])["receipts"])
+        # The fenced binding still sees cancellation state, without the content.
+        diagnostic = self.store.status(self.b, withdrawn["id"])
+        self.assertEqual(("cancelled", None, None, "native_identity_conflict"),
+                         (diagnostic["state"], diagnostic["body"], diagnostic["metadata"], diagnostic["content_withheld"]))
+        self.assertEqual(("queued", None, False),
+                         (diagnostic["cancellation"]["previous_state"], diagnostic["cancellation"]["reason"],
+                          diagnostic["cancellation"]["may_have_been_submitted"]))
+        self.assertEqual("superseded plan", self.store.status(self.a, withdrawn["id"])["cancellation"]["reason"])
+        # Explicit replacement restores the sender's authority to cancel.
+        replacement = self.store.authenticate(self.store.join("project", "b", harness="claude", replace=True)["token"])
+        self.assertEqual("cancelled", self.store.cancel(replacement, pending["id"])["state"])
+
+    def test_native_identity_conflict_is_recorded_beside_full_capabilities(self):
+        message = self.send()
+        attempt = self.store.claim(self.b)["attempt_id"]
+        # Grow capabilities to the caller-controlled budget; the fence must still be recorded.
+        filler = "x" * 16300
+        self.store.bind(self.b, "session-b", {"filler": filler})
+        while True:
+            try:
+                self.store.bind(self.b, "session-b", {"filler": filler + "x"})
+            except StoreError as error:
+                self.assertEqual("limit_exceeded", error.code)
+                break
+            filler += "x"
+        self.assertCode("replacement_required", self.store.bind, self.b, "cleared-session",
+                        {"identity_source": "claude/SessionStart/" + "s" * 20000})
+        identity = self.store.identity(self.b)
+        self.assertEqual(("conflict", "cleared-session"),
+                         (identity["native_identity_source"], identity["native_identity_conflict"]["observed_native_id"]))
+        self.assertEqual(256, len(identity["native_identity_conflict"]["identity_source"]))
+        self.assertEqual(filler, identity["capabilities"]["filler"])
+        status = self.store.status(self.a, message["id"])
+        self.assertEqual(("uncertain", {"reason": "native_identity_changed"}), (status["state"], status["attempts"][0]["detail"]))
+        self.assertCode("stale_attempt", self.store.finish, self.b, message["id"], attempt, "submitted")
+        self.assertCode("replacement_required", self.store.claim, self.b)
+        # A non-string or unencodable source cannot fail the record, and the fence survives reopening.
+        self.assertCode("replacement_required", self.store.bind, self.b, "another-session", {"identity_source": "\ud800"})
+        self.assertCode("replacement_required", self.store.bind, self.b, "third-session", {"identity_source": {"nested": True}})
+        self.store.close()
+        self.store = Store(self.path)
+        conflict = self.store.identity(self.b)["native_identity_conflict"]
+        self.assertEqual(("third-session", None), (conflict["observed_native_id"], conflict["identity_source"]))
+        self.assertCode("replacement_required", self.store.claim, self.b)
+
     def test_limited_status_keeps_newest_entries_and_complete_uncertainty(self):
         message = self.send()
         first = self.store.claim(self.b)

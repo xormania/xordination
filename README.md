@@ -95,6 +95,8 @@ xordination view --state .xordination/broker.sqlite3 --space example
 
 The view omits message bodies and credentials and is not a broker operation, so participant credentials cannot reach it. It records nothing itself; opening the store applies the same expired-lease reconciliation as `space` and `join`.
 
+When a binding's harness reports a different native session behind the same credential (for example a Claude SessionStart hook after `/clear`), the broker fences that binding instead of replacing it. Its `native_identity_source` becomes `conflict` and `native_identity_conflict` records the observed identity. `peers`, `send`, `inbox`, `wait`, `ack`, `observe`, `retry`, `cancel`, `claim` and `recover` are then refused with `replacement_required`. Operator diagnostics stay available: `identity` shows the conflict, and `status` reports delivery state, including any cancellation, with message `body`, `metadata` and the cancellation `reason` withheld (`content_withheld`). `finish` still records late evidence, as stale; `bind` with the original identity and `stop` also remain. Only an explicit `join --replace`, followed by recovery, moves pending work to a new generation.
+
 ## Limits and backpressure
 
 The initial limits are fixed in source; `xordination serve` and `xordination stdio` expose no options to change them. They are starting defaults, not measured capacity.

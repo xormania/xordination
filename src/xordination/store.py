@@ -145,6 +145,14 @@ _OPEN_STATE = {}
 _OPEN_STATE_LOCK = threading.RLock()
 
 
+def _encodable(text):
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 class Store:
     SCHEMA_VERSION = 1
     MAX_BODY_BYTES = 65536
@@ -300,6 +308,13 @@ class Store:
                 message_id TEXT PRIMARY KEY REFERENCES messages(id), participant TEXT NOT NULL,
                 generation TEXT NOT NULL, previous_state TEXT NOT NULL, reason TEXT, observed REAL NOT NULL
             );
+            -- Added without a schema version change: older brokers ignore it and
+            -- this one creates it on open. Kept outside the caller-controlled
+            -- capabilities so its size budget can never roll back a fence.
+            CREATE TABLE IF NOT EXISTS native_identity_conflicts (
+                generation TEXT PRIMARY KEY REFERENCES bindings(generation),
+                observed_native_id TEXT NOT NULL, identity_source TEXT, observed REAL NOT NULL
+            );
             PRAGMA user_version=1;
         """)
         with self._transaction():
@@ -409,10 +424,13 @@ class Store:
         return result
 
     def _retire(self, generation):
+        self._db.execute("UPDATE bindings SET active=0,stopped=COALESCE(stopped,?) WHERE generation=?", (time.time(), generation))
+        self._unsettle_claims(generation, "binding_retired")
+
+    def _unsettle_claims(self, generation, reason):
         now = time.time()
-        self._db.execute("UPDATE bindings SET active=0,stopped=COALESCE(stopped,?) WHERE generation=?", (now, generation))
         for attempt in self._db.execute("SELECT * FROM attempts WHERE generation=? AND state='claimed'", (generation,)).fetchall():
-            detail = _json({"reason": "binding_retired"})
+            detail = _json({"reason": reason})
             self._db.execute("UPDATE attempts SET state='uncertain',finished=?,detail=? WHERE id=?", (now, detail, attempt["id"]))
             self._db.execute("INSERT INTO attempt_evidence(attempt_id,generation,outcome,detail,observed,late) VALUES (?,?, 'uncertain',?,?,0)", (attempt["id"], generation, detail, now))
             self._db.execute("UPDATE messages SET state='uncertain' WHERE id=? AND current_attempt=? AND state='claimed'", (attempt["message_id"], attempt["id"]))
@@ -442,15 +460,31 @@ class Store:
             _fail("unauthorized", "Authenticated broker context is required")
         return self._authenticate(ctx.get("_token"), allow_retired)
 
-    @staticmethod
-    def _public_binding(row):
+    def _public_binding(self, row):
+        conflict = None
+        if row["native_identity_source"] == "conflict":
+            observed = self._db.execute("SELECT * FROM native_identity_conflicts WHERE generation=?", (row["generation"],)).fetchone()
+            if observed is not None:
+                conflict = {"observed_native_id": observed["observed_native_id"], "identity_source": observed["identity_source"],
+                            "observed_at": observed["observed"]}
         return {"space": row["space"], "participant": row["participant"], "generation": row["generation"],
                 "harness": row["harness"], "native_id": row["native_id"], "native_identity_source": row["native_identity_source"],
+                "native_identity_conflict": conflict,
                 "capabilities": json.loads(row["capabilities"]), "active": bool(row["active"]), "created_at": row["created"]}
+
+    @staticmethod
+    def _fence(principal):
+        # A binding whose native conversation changed (for example Claude /clear)
+        # keeps its token, but the new conversation must not read, send,
+        # acknowledge, observe, retry or cancel as the old one. identity, status
+        # (with content withheld), finish (late evidence only), bind and stop stay available.
+        if principal["native_identity_source"] == "conflict":
+            _fail("replacement_required", "The native session changed; communication is fenced until explicit participant replacement")
 
     def peers(self, ctx):
         with self._transaction():
             principal = self._context(ctx)
+            self._fence(principal)
             self._reconcile()
             rows = self._db.execute("""SELECT b.* FROM bindings b JOIN participants p ON b.generation=p.generation
                 WHERE b.space=? ORDER BY b.participant""", (principal["space"],)).fetchall()
@@ -483,6 +517,7 @@ class Store:
                         "metadata": json.loads(metadata_json), "expires_in": expires_in}, limit=self.MAX_BODY_BYTES + 20000, label="message")
         with self._transaction():
             principal = self._context(ctx)
+            self._fence(principal)
             self._reconcile()
             original = self._db.execute("SELECT * FROM messages WHERE space=? AND sender=? AND idempotency_key=?", (principal["space"], principal["participant"], key)).fetchone()
             if original:
@@ -520,10 +555,10 @@ class Store:
             result["idempotent_replay"] = False
             return result
 
-    def _message(self, row):
+    def _message(self, row, withheld=False):
         received, acknowledged = self._db.execute("SELECT COUNT(*),COUNT(CASE WHEN kind IN (?,?) THEN 1 END) FROM receipts WHERE message_id=?",
                                                   (*self.ACK_KINDS, row["id"])).fetchone()
-        return {"schema_version": 1, "id": row["id"], "message_id": row["id"], "sequence": row["sequence"], "space": row["space"],
+        result = {"schema_version": 1, "id": row["id"], "message_id": row["id"], "sequence": row["sequence"], "space": row["space"],
                 "from": row["sender"], "sender": row["sender"], "from_generation": row["sender_generation"],
                 "to": row["recipient"], "requested_to": row["requested_to"], "requested_generation": row["requested_generation"],
                 "to_generation": row["original_generation"], "delivery_generation": row["delivery_generation"],
@@ -531,6 +566,9 @@ class Store:
                 "reply_to": row["reply_to"], "created_at": row["created"], "expires_at": row["expires"],
                 "expired": bool(row["expires"] is not None and row["expires"] <= time.time()),
                 "state": row["state"], "accepted": True, "received": bool(received), "acknowledged": bool(acknowledged)}
+        if withheld:
+            result.update(body=None, metadata=None, content_withheld="native_identity_conflict")
+        return result
 
     def _cursor(self, principal, sequence):
         payload = _json({"v": 1, "s": principal["space"], "p": principal["participant"], "g": principal["generation"],
@@ -567,6 +605,7 @@ class Store:
             _fail("invalid_argument", "unacknowledged must be a boolean")
         with self._transaction():
             principal = self._context(ctx)
+            self._fence(principal)
             self._reconcile()
             sequence, resync = self._read_cursor(cursor, principal)
             # One fixed filter serves both queries; the flag selects the
@@ -617,6 +656,7 @@ class Store:
         """Record the client's acknowledgement; it never proves native ingestion."""
         with self._transaction():
             principal = self._context(ctx)
+            self._fence(principal)
             message = self._get_message(message_id, principal, recipient_only=True)
             if attempt_id is not None:
                 self._own_attempt(attempt_id, message, principal)
@@ -638,6 +678,9 @@ class Store:
         evidence_json = _json(evidence, label="receipt evidence")
         with self._transaction():
             principal = self._context(ctx)
+            # A receipt from the changed native conversation would suppress
+            # retry for content it may never have held.
+            self._fence(principal)
             message = self._get_message(message_id, principal, recipient_only=True)
             attempt = self._own_attempt(attempt_id, message, principal)
             if principal["native_id"] is None or attempt["native_id"] != principal["native_id"]:
@@ -669,7 +712,10 @@ class Store:
             principal = self._context(ctx)
             self._reconcile()
             message = self._get_message(message_id, principal)
-            result = self._message(message)
+            # Delivery diagnostics stay readable for a fenced binding, but not
+            # the peer content the changed native conversation must not see.
+            withheld = principal["native_identity_source"] == "conflict"
+            result = self._message(message, withheld)
             totals = {}
 
             def rows(name, query, arguments, order):
@@ -689,14 +735,14 @@ class Store:
                     attempt["evidence_total"] = totals.pop("evidence")
             result["receipts"] = [self._receipt(row) for row in rows("receipts", "FROM receipts WHERE message_id=?", (message_id,), "observed,id")]
             # The same visibility rule as _visible(), applied before limiting.
-            result["replies"] = [self._message(row) for row in rows("replies", """FROM messages WHERE reply_to=? AND space=?
+            result["replies"] = [self._message(row, withheld) for row in rows("replies", """FROM messages WHERE reply_to=? AND space=?
                 AND (sender=? OR (recipient=? AND delivery_generation=?))""", (message_id, principal["space"], principal["participant"],
                 principal["participant"], principal["generation"]), "sequence")]
             # Kinds cover every receipt, including any a limit omits.
             result["receipt_kinds"] = [row[0] for row in self._db.execute(
                 "SELECT DISTINCT kind FROM receipts WHERE message_id=? ORDER BY kind", (message_id,))]
             result["recoveries"] = [dict(row) for row in rows("recoveries", "FROM recoveries WHERE message_id=?", (message_id,), "sequence")]
-            result["cancellation"] = self._cancellation(message_id)
+            result["cancellation"] = self._cancellation(message_id, withheld)
             result["uncertain"] = message["state"] == "uncertain" or self._db.execute("""SELECT EXISTS(SELECT 1 FROM attempts a
                 WHERE a.message_id=? AND (a.state='uncertain' OR EXISTS(SELECT 1 FROM attempt_evidence e
                 WHERE e.attempt_id=a.id AND e.outcome='uncertain')))""", (message_id,)).fetchone()[0] == 1
@@ -715,7 +761,7 @@ class Store:
                 "lease_until": row["lease_until"], "finished_at": row["finished"], "detail": json.loads(row["detail"]) if row["detail"] else None,
                 "retry_safe": None if row["retry_safe"] is None else bool(row["retry_safe"])}
 
-    def _cancellation(self, message_id):
+    def _cancellation(self, message_id, withheld=False):
         row = self._db.execute("SELECT * FROM cancellations WHERE message_id=?", (message_id,)).fetchone()
         if row is None:
             return None
@@ -724,7 +770,8 @@ class Store:
         submitted = self._db.execute("""SELECT 1 FROM attempts WHERE message_id=? AND (state IN ('submitted','uncertain')
             OR (state='failed' AND (retry_safe IS NULL OR retry_safe=0)))""", (message_id,)).fetchone()
         return {"participant": row["participant"], "generation": row["generation"], "previous_state": row["previous_state"],
-                "reason": row["reason"], "cancelled_at": row["observed"],
+                # The reason is sender-written content, withheld like body and metadata.
+                "reason": None if withheld else row["reason"], "cancelled_at": row["observed"],
                 # Cancellation cannot retract content a native session may already hold.
                 "may_have_been_submitted": submitted is not None}
 
@@ -734,6 +781,7 @@ class Store:
             _fail("invalid_argument", "reason must be a nonempty string of at most 1000 bytes")
         with self._transaction():
             principal = self._context(ctx)
+            self._fence(principal)
             self._reconcile()
             message = self._get_message(message_id, principal)
             if message["sender"] != principal["participant"]:
@@ -759,6 +807,7 @@ class Store:
         with self._transaction():
             principal = self._context(ctx)
             self._reconcile()
+            self._fence(principal)
             message = self._get_message(message_id, principal)
             if message["sender"] != principal["participant"]:
                 _fail("forbidden", "Only the authenticated sender can authorize a delivery retry")
@@ -777,6 +826,7 @@ class Store:
         with self._transaction():
             principal = self._context(ctx)
             self._reconcile()
+            self._fence(principal)
             message = self._db.execute("""SELECT m.* FROM messages m WHERE space=? AND recipient=? AND delivery_generation=?
                 AND state='queued' AND NOT EXISTS(SELECT 1 FROM receipts r WHERE r.message_id=m.id)
                 ORDER BY sequence LIMIT 1""", (principal["space"], principal["participant"], principal["generation"])).fetchone()
@@ -813,7 +863,8 @@ class Store:
                 ("submitted", "uncertain"), ("uncertain", "submitted"))
             stale = (not principal["active"] or principal["generation"] != principal["current_generation"] or
                      message["delivery_generation"] != principal["generation"] or message["current_attempt"] != attempt_id or
-                     attempt["native_id"] != principal["native_id"] or not eligible_transition or
+                     attempt["native_id"] != principal["native_id"] or principal["native_identity_source"] == "conflict" or
+                     not eligible_transition or
                      message["state"] not in ("claimed", "submitted", "uncertain"))
             self._db.execute("INSERT INTO attempt_evidence(attempt_id,generation,outcome,detail,observed,late) VALUES (?,?,?,?,?,?)", (attempt_id, principal["generation"], outcome, detail_json, time.time(), int(stale)))
             if not stale:
@@ -829,20 +880,42 @@ class Store:
         _identifier(native_id, "native_id")
         if capabilities is not None and not isinstance(capabilities, dict):
             _fail("invalid_argument", "capabilities must be an object")
+        changed = False
         with self._transaction():
             principal = self._context(ctx)
             merged_capabilities = json.loads(principal["capabilities"])
-            if capabilities is not None:
-                merged_capabilities.update(capabilities)
-            capability_json = _json(merged_capabilities, label="capabilities")
             if principal["native_id"] is not None and principal["native_id"] != native_id:
-                _fail("replacement_required", "Changing native session identity requires explicit participant replacement")
-            # Setting an identity while an unbound submission is in flight would
-            # invalidate its captured identity. Require the caller to settle it.
-            if principal["native_id"] is None and self._db.execute("SELECT 1 FROM attempts WHERE generation=? AND state='claimed'", (principal["generation"],)).fetchone():
-                _fail("binding_busy", "Settle in-flight attempts before establishing native identity")
-            self._db.execute("UPDATE bindings SET native_id=?,native_identity_source='adapter_reported',capabilities=COALESCE(?,capabilities) WHERE generation=?", (native_id, capability_json, principal["generation"]))
-            return self._public_binding(self._db.execute("SELECT * FROM bindings WHERE generation=?", (principal["generation"],)).fetchone())
+                # The harness reports a different native conversation (for example
+                # Claude /clear) behind the same live transport. Claims from here on
+                # could reach it under the old identity, so fence delivery durably
+                # and visibly before refusing. Only explicit replacement clears it.
+                # Recorded apart from the caller-controlled capabilities, and from
+                # bounded values only, so recording the fence cannot fail.
+                source = (capabilities or {}).get("identity_source")
+                source = source[:256] if isinstance(source, str) else None
+                if source is not None and not _encodable(source):
+                    source = None
+                self._db.execute("UPDATE bindings SET native_identity_source='conflict' WHERE generation=?", (principal["generation"],))
+                self._db.execute("""INSERT OR REPLACE INTO native_identity_conflicts(generation,observed_native_id,identity_source,observed)
+                    VALUES (?,?,?,?)""", (principal["generation"], native_id, source, time.time()))
+                self._unsettle_claims(principal["generation"], "native_identity_changed")
+                changed = True
+            else:
+                if capabilities is not None:
+                    merged_capabilities.update(capabilities)
+                capability_json = _json(merged_capabilities, label="capabilities")
+                # Setting an identity while an unbound submission is in flight would
+                # invalidate its captured identity. Require the caller to settle it.
+                if principal["native_id"] is None and self._db.execute("SELECT 1 FROM attempts WHERE generation=? AND state='claimed'", (principal["generation"],)).fetchone():
+                    _fail("binding_busy", "Settle in-flight attempts before establishing native identity")
+                # A fenced binding stays fenced even if the original identity is reported again.
+                self._db.execute("""UPDATE bindings SET native_id=?,capabilities=?,native_identity_source=CASE
+                    WHEN native_identity_source='conflict' THEN 'conflict' ELSE 'adapter_reported' END WHERE generation=?""",
+                                 (native_id, capability_json, principal["generation"]))
+                result = self._public_binding(self._db.execute("SELECT * FROM bindings WHERE generation=?", (principal["generation"],)).fetchone())
+        if changed:
+            _fail("replacement_required", "The native session changed; delivery is fenced until explicit participant replacement")
+        return result
 
     def stop(self, ctx):
         with self._transaction():
@@ -854,6 +927,7 @@ class Store:
         with self._transaction():
             principal = self._context(ctx)
             self._reconcile()
+            self._fence(principal)
             message = self._db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
             if message is None or message["space"] != principal["space"] or message["recipient"] != principal["participant"]:
                 _fail("forbidden", "Only the current recipient participant may recover a historical message")

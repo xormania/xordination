@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from helpers import observe_fsync
+from helpers import isolated_process_env, observe_fsync, owned_broker
 from xordination.cli import main
 from xordination.store import Store
 
@@ -103,6 +103,32 @@ class BootstrapSafety(unittest.TestCase):
                 self.assertEqual(store.authenticate(original["token"])["generation"], original["generation"])
             finally:
                 store.close()
+
+    def test_claude_hook_entry_point_refuses_retired_generation_without_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with owned_broker(Path(folder) / "state.sqlite") as (store, _, endpoint):
+                store.create_space("project")
+                sender = store.authenticate(store.join("project", "sender")["token"])
+                retired = store.join("project", "claude", harness="claude", native_id="old-session")
+                old_message = store.send(sender, "claude", "For the old generation", "old")
+                current = store.join("project", "claude", harness="claude", native_id="new-session", replace=True)
+                context = store.authenticate(current["token"])
+                store.bind(context, "new-session", {"channel_registered": True})
+                before = (store.identity(context), store.authenticate(retired["token"], allow_retired=True),
+                          store.status(sender, old_message["id"]))
+                packet = {"session_id": "cleared-session", "hook_event_name": "SessionStart", "source": "clear"}
+                result = subprocess.run(
+                    [sys.executable, "-m", "xordination", "claude-hook", "--endpoint", endpoint,
+                     "--token-env", "XORDINATION_TEST_TOKEN"],
+                    input=json.dumps(packet), capture_output=True, text=True, timeout=30, cwd=folder,
+                    env=isolated_process_env(folder, token=retired["token"]))
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("", result.stdout)  # No native hook decision or continuation override.
+                self.assertIn("superseded", result.stderr)
+                self.assertNotIn(retired["token"], result.stderr)
+                after = (store.identity(context), store.authenticate(retired["token"], allow_retired=True),
+                         store.status(sender, old_message["id"]))
+                self.assertEqual(before, after)
 
 
 class OperatorView(unittest.TestCase):

@@ -251,6 +251,56 @@ class BrokerIntegration(unittest.TestCase):
         self.assertEqual(("queued", [], []), (status["state"], status["attempts"], status["receipts"]))
         self.assertEqual([], self.one.call("inbox")["messages"])
 
+    def test_native_identity_conflict_fences_http_and_mcp_communication(self):
+        from xordination.mcp import _Server
+        self.two.call("bind", native_id="launch-session", capabilities={"channel_registered": True})
+        received = self.one.call("send", to="two", body="Old-generation body", key="received")
+        outgoing = self.two.call("send", to="one", body="Before /clear", key="outgoing")
+        attempt = self.one.call("claim")["attempt_id"]
+        self.one.call("finish", message_id=outgoing["id"], attempt_id=attempt, outcome="uncertain")
+        with self.assertRaises(BrokerError) as refused:
+            self.two.call("bind", native_id="cleared-session", capabilities={"identity_source": "claude/SessionStart"})
+        self.assertEqual("replacement_required", refused.exception.code)
+        for operation, params in (("inbox", {}), ("wait", {"timeout": 0}), ("send", {"to": "one", "body": "late", "key": "late"}),
+                                  ("ack", {"message_id": received["id"]}), ("retry", {"message_id": outgoing["id"]}),
+                                  ("claim", {}), ("recover", {"message_id": received["id"]}), ("peers", {})):
+            with self.subTest(transport="http", operation=operation):
+                with self.assertRaises(BrokerError) as caught:
+                    self.two.call(operation, **params)
+                self.assertEqual("replacement_required", caught.exception.code)
+        # The model-facing MCP tools reach the same fence through the real HTTP client.
+        written = []
+
+        class Output:
+            def write(self, wire):
+                written.append(wire)
+
+            def flush(self):
+                pass
+
+        mcp = _Server(Client(self.endpoint, self.two.token, timeout=5), Output(), error_output=io.StringIO())
+        self.addCleanup(mcp.close)
+        cancel = threading.Event()
+        mcp.dispatch("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    "clientInfo": {"name": "claude", "version": "fixture"}}, cancel)
+        for tool, arguments in (("inbox", {}), ("wait", {"timeout": 0}), ("send", {"to": "one", "body": "late", "key": "late"}),
+                                ("ack", {"message_id": received["id"]}), ("retry", {"message_id": outgoing["id"]}), ("peers", {})):
+            with self.subTest(transport="mcp", tool=tool):
+                result = mcp.dispatch("tools/call", {"name": "xordination_" + tool, "arguments": arguments}, cancel)
+                self.assertTrue(result["isError"])
+                self.assertEqual("replacement_required", json.loads(result["content"][0]["text"])["error"]["code"])
+        diagnostic = mcp.dispatch("tools/call", {"name": "xordination_status", "arguments": {"message_id": received["id"]}}, cancel)
+        self.assertFalse(diagnostic["isError"])
+        self.assertEqual(("queued", None, "native_identity_conflict"), tuple(diagnostic["structuredContent"][key]
+                                                                            for key in ("state", "body", "content_withheld")))
+        self.assertNotIn("Old-generation body", json.dumps(diagnostic))
+        identity = self.two.call("identity")
+        self.assertEqual("cleared-session", identity["native_identity_conflict"]["observed_native_id"])
+        status = self.one.call("status", message_id=received["id"])
+        self.assertEqual(("queued", []), (status["state"], status["receipts"]))
+        self.assertEqual("uncertain", self.one.call("status", message_id=outgoing["id"])["state"])
+        self.assertEqual([outgoing["id"]], [message["id"] for message in self.one.call("inbox")["messages"]])
+
     def test_second_broker_cannot_recover_first_brokers_claim(self):
         sent = self.one.call("send", to="two", body="work", key="lease")
         self.two.call("claim")
