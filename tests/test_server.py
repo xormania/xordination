@@ -184,6 +184,14 @@ class BrokerIntegration(unittest.TestCase):
             redirect.server_close()
             thread.join(timeout=2)
 
+    def test_loopback_client_ignores_ambient_proxies(self):
+        # An unreachable ambient proxy without a loopback bypass: a credential sent through it fails.
+        proxies = {"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+                   "no_proxy": "", "NO_PROXY": ""}
+        with patch.dict("os.environ", proxies):
+            client = Client(self.endpoint, self.one.token, timeout=15)
+            self.assertEqual(["one", "two"], sorted(row["participant"] for row in client.call("peers")["peers"]))
+
     def test_cancel_and_native_receipt_operations_are_authenticated_broker_calls(self):
         cancelled = self.one.call("send", to="two", body="no longer needed", key="cancel-1")
         with self.assertRaises(BrokerError) as caught:
