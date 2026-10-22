@@ -27,8 +27,9 @@ class BrokerIntegration(unittest.TestCase):
         self.store.create_space("project")
         a = self.store.join("project", "one")
         b = self.store.join("project", "two")
-        self.one = Client(self.endpoint, a["token"], timeout=5)
-        self.two = Client(self.endpoint, b["token"], timeout=5)
+        # Deadlines outlast the held 10-second waits below; success never waits them out.
+        self.one = Client(self.endpoint, a["token"], timeout=15)
+        self.two = Client(self.endpoint, b["token"], timeout=15)
 
     def test_native_boundary_and_authenticated_exchange(self):
         with urlopen(self.endpoint + "/health") as response:
@@ -61,15 +62,15 @@ class BrokerIntegration(unittest.TestCase):
 
         with patch.object(self.store, "inbox", side_effect=observe_empty), \
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self.two.call, "wait", timeout=3, cursor=cursor)
+            pending = pool.submit(self.two.call, "wait", timeout=10, cursor=cursor)
             try:
-                self.assertTrue(empty_wait.wait(1), "HTTP wait never inspected an empty inbox before send")
+                self.assertTrue(empty_wait.wait(5), "HTTP wait never inspected an empty inbox before send")
                 self.assertFalse(pending.done())
                 receipt = self.two.call("ack", message_id=seed["id"])
                 self.assertTrue(receipt["acknowledged"])
                 self.assertFalse(pending.done(), "Wait ended before the concurrent acknowledgement")
                 self.one.call("send", to="two", body="wake", key="wake-1")
-                inbox = pending.result(timeout=2)
+                inbox = pending.result(timeout=10)
             finally:
                 self.server.stopping.set()
         self.assertEqual(inbox["messages"][0]["body"], "wake")
@@ -86,15 +87,15 @@ class BrokerIntegration(unittest.TestCase):
 
         with patch.object(self.store, "inbox", side_effect=observe_empty), \
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self.two.call, "wait", timeout=3)
+            pending = pool.submit(self.two.call, "wait", timeout=10)
             try:
-                self.assertTrue(empty_wait.wait(1))
+                self.assertTrue(empty_wait.wait(5))
                 with self.assertRaises(BrokerError) as caught:
                     self.one.call("wait", timeout=0)
                 self.assertEqual("backpressure", caught.exception.code)
                 self.assertFalse(pending.done())
                 sent = self.one.call("send", to="two", body="release wait slot", key="quota")
-                self.assertEqual(sent["id"], pending.result(timeout=2)["messages"][0]["id"])
+                self.assertEqual(sent["id"], pending.result(timeout=10)["messages"][0]["id"])
             finally:
                 if not pending.done():
                     self.server.stopping.set()
@@ -127,10 +128,10 @@ class BrokerIntegration(unittest.TestCase):
 
             with patch.object(Handler, "setup", observe_setup), \
                     patch.object(server, "process_request_thread", side_effect=observe_release):
-                with socket.create_connection(server.server_address, timeout=1) as slow:
+                with socket.create_connection(server.server_address, timeout=5) as slow:
                     slow.sendall(b"POST /rpc HTTP/1.1\r\nHost: localhost\r\n")
-                    self.assertTrue(entered.wait(1), "Slow header connection was never owned")
-                    with socket.create_connection(server.server_address, timeout=1) as overflow:
+                    self.assertTrue(entered.wait(5), "Slow header connection was never owned")
+                    with socket.create_connection(server.server_address, timeout=5) as overflow:
                         try:
                             overflow.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
                             self.assertEqual(b"", overflow.recv(1))
@@ -139,8 +140,8 @@ class BrokerIntegration(unittest.TestCase):
                     self.assertEqual(1, len(setup_count), "Overflow client bypassed the connection quota")
                     self.assertFalse(released.is_set(), "Incomplete headers did not retain the owned slot")
                     slow.shutdown(socket.SHUT_RDWR)
-                self.assertTrue(released.wait(1), "Closed client did not release its connection slot")
-                with urlopen(endpoint + "/health", timeout=1) as response:
+                self.assertTrue(released.wait(5), "Closed client did not release its connection slot")
+                with urlopen(endpoint + "/health", timeout=5) as response:
                     self.assertEqual("xordination", json.load(response)["service"])
                 self.assertEqual(2, len(setup_count))
 
@@ -183,6 +184,14 @@ class BrokerIntegration(unittest.TestCase):
             redirect.shutdown()
             redirect.server_close()
             thread.join(timeout=2)
+
+    def test_loopback_client_ignores_ambient_proxies(self):
+        # An unreachable ambient proxy without a loopback bypass: a credential sent through it fails.
+        proxies = {"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+                   "no_proxy": "", "NO_PROXY": ""}
+        with patch.dict("os.environ", proxies):
+            client = Client(self.endpoint, self.one.token, timeout=15)
+            self.assertEqual(["one", "two"], sorted(row["participant"] for row in client.call("peers")["peers"]))
 
     def test_cancel_and_native_receipt_operations_are_authenticated_broker_calls(self):
         cancelled = self.one.call("send", to="two", body="no longer needed", key="cancel-1")

@@ -3,7 +3,8 @@ from http.client import HTTPException
 import ipaddress
 import json
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import (HTTPDefaultErrorHandler, HTTPErrorProcessor, HTTPHandler, HTTPRedirectHandler,
+                            OpenerDirector, ProxyHandler, Request, UnknownHandler, build_opener)
 from urllib.error import HTTPError, URLError
 
 
@@ -31,7 +32,22 @@ def broker_opener(endpoint):
         local = local or ipaddress.ip_address(parsed.hostname).is_loopback
     except ValueError:
         pass
+    if local and parsed.scheme == "http":
+        return _plain_loopback_opener()
     return build_opener(ProxyHandler({}), NoRedirect()) if local else build_opener(NoRedirect())
+
+
+def _plain_loopback_opener():
+    """The loopback HTTP opener without the TLS context build_opener creates for every opener.
+
+    Same handling as build_opener(ProxyHandler({}), NoRedirect()) for an http:// endpoint:
+    no proxies, refused redirects and the same HTTP error processing.
+    """
+    opener = OpenerDirector()
+    for handler in (ProxyHandler({}), UnknownHandler(), HTTPHandler(), HTTPDefaultErrorHandler(),
+                    NoRedirect(), HTTPErrorProcessor()):
+        opener.add_handler(handler)
+    return opener
 
 
 def health(endpoint, timeout=10):

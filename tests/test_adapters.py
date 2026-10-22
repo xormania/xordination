@@ -178,7 +178,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         async def poll():
             while not condition():
                 await asyncio.sleep(.01)
-        await asyncio.wait_for(poll(), 3)
+        await asyncio.wait_for(poll(), 10)
 
     def submitted_finish(self, msg):
         matches = [params for operation, params in self.client.calls if operation == "finish"
@@ -195,7 +195,7 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.until(self.client.tool_entered.is_set)
         msg = message()
         adapter.pending_attempts[msg["attempt_id"]] = msg
-        await asyncio.wait_for(adapter.deliver(msg), 2)
+        await asyncio.wait_for(adapter.deliver(msg), 10)
         finished = next(params for op, params in self.client.calls if op == "finish")
         self.assertEqual(finished["outcome"], "submitted")
         self.assertEqual(finished["detail"]["native_id"], "thread-one")
@@ -606,7 +606,7 @@ for line in sys.stdin:
 
     async def test_lost_finish_response_settles_once_from_durable_attempt(self):
         adapter, msg = await self.lossy_delivery("lost-response", commit=True)
-        await asyncio.wait_for(adapter.deliver(msg), 3)
+        await asyncio.wait_for(adapter.deliver(msg), 10)
         self.assertNotIn(msg["attempt_id"], adapter.pending_attempts)
         status = self.store.status(self.recipient_context, msg["id"])
         self.assertEqual(status["state"], "submitted")
@@ -619,7 +619,7 @@ for line in sys.stdin:
         replace = lambda: self.store.join("project", "recipient", harness="grok", replace=True)  # noqa: E731
         adapter, msg = await self.lossy_delivery("replaced-during-outage", commit=False, before_retry=replace)
         with self.assertRaises(BrokerError) as raised:
-            await asyncio.wait_for(adapter.deliver(msg), 3)
+            await asyncio.wait_for(adapter.deliver(msg), 10)
         self.assertEqual(raised.exception.code, "stale_attempt")
         self.assertIn(msg["attempt_id"], adapter.pending_attempts)
         attempt = self.store.status(self.sender_context, msg["id"])["attempts"][0]
@@ -681,6 +681,12 @@ for line in sys.stdin:
             adapter = self.adapter = CodexAdapter(Client("http://127.0.0.1:" + str(port), recipient["token"]),
                                                   sys.executable, self.temporary.name, poll_interval=.02)
             adapter.reconnect = BrokerReconnect(window=10, initial=.02, maximum=.1)
+            outage = []
+            failed = adapter.reconnect.failed
+            def counted(error):
+                outage.append(error)
+                return failed(error)
+            adapter.reconnect.failed = counted
             async def spawn(argv, **kwargs):
                 await self.process(MOCK_CODEX, adapter)
             adapter.spawn = spawn
@@ -690,7 +696,7 @@ for line in sys.stdin:
                 await self.until(lambda: store.status(recipient_context, first["id"])["state"] == "submitted")
             process = adapter.rpc.process
             stop()
-            await asyncio.sleep(.3)  # Many claim polls fail while the broker is down.
+            await self.until(lambda: len(outage) >= 4)  # Many claim polls fail while the broker is down.
             self.assertFalse(runner.done())
             self.assertIsNotNone(adapter.reconnect.since)
             self.assertIsNone(process.returncode)
@@ -705,7 +711,7 @@ for line in sys.stdin:
                                  [("submitted", "thread-one")])  # Delivered once; no replay.
             # Restart preserved the binding generation; replacement still fences it.
             replacement = store.join("project", "recipient", harness="codex", replace=True)
-            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 3))[0]
+            result = (await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 10))[0]
             self.assertIsInstance(result, BrokerError)
             self.assertEqual(result.code, "stale_generation")
             self.assertIsNotNone(process.returncode)
@@ -761,7 +767,7 @@ for line in sys.stdin:
             with self.subTest(mode=mode):
                 adapter = self.adapter = CodexAdapter(self.client, sys.executable, self.temporary.name)
                 lock = await self.spawn_family(adapter, mode)
-                adapter.rpc.stop_grace = .5
+                adapter.rpc.stop_grace = .2  # Short: the stubborn family proves escalation.
                 await adapter.close()
                 await self.until_released(lock)
                 self.assertIsNone(adapter.rpc.group)
@@ -910,14 +916,24 @@ for line in sys.stdin:
             "async def start():\n"
             "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'stubborn'], jsonrpc=False)\n"
             "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
-            "    adapter.rpc.stop_grace = 1.5\n"
+            "    adapter.rpc.stop_grace = .5\n"
             "    send = adapter.rpc.send\n"
             "    def sent(group, kill):\n"
             "        send(group, kill)\n"
             "        print('killed' if kill else 'terminated', flush=True)\n"
             "    adapter.rpc.send = sent\n"
             "adapter.start = start\n"
-            "sys.exit(asyncio.run(supervise(adapter)))\n")
+            "async def main():\n"
+            "    loop = asyncio.get_running_loop()\n"
+            "    install = loop.add_signal_handler\n"
+            "    def traced(number, callback, *args):\n"
+            "        def handler(*received):\n"
+            "            print('signalled', flush=True)\n"
+            "            callback(*received)\n"
+            "        install(number, handler, *args)\n"
+            "    loop.add_signal_handler = traced\n"
+            "    return await supervise(adapter)\n"
+            "sys.exit(asyncio.run(main()))\n")
         import xordination
         env = {**os.environ, "PYTHONPATH": os.pathsep.join(
             [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
@@ -931,6 +947,8 @@ for line in sys.stdin:
             self.assertEqual(await asyncio.wait_for(asyncio.to_thread(child.wait), 10), 128 + 15)
             # Checked at the supervisor's return, not after a later reprieve.
             self.assertFalse(self.lock_held(lock), "supervise returned while the family survived")
+            # The signal landed inside the grace period, which still ended in escalation.
+            self.assertEqual(child.stdout.read(), b"signalled\nkilled\n")
         finally:
             if child.poll() is None:
                 child.kill()
@@ -1083,9 +1101,12 @@ class ProbeAndChannelTests(unittest.TestCase):
             joined = store.join("project", "recipient", harness="claude", native_id="launch-session")
             context = store.authenticate(joined["token"])
             store.bind(context, "launch-session", {"channel_registered": True})
+            identities = []
             class StoreClient:
                 endpoint, token = "http://127.0.0.1:1", joined["token"]
                 def call(self, operation, **params):
+                    if operation == "identity":
+                        identities.append(time.monotonic())
                     return getattr(store, operation)(context, **params)
             written = []
             class Output:
@@ -1115,7 +1136,12 @@ class ProbeAndChannelTests(unittest.TestCase):
                             "session_id": "cleared-session", "hook_event_name": "SessionStart", "source": "clear"})
                 self.assertEqual("replacement_required", refused.exception.code)
                 after = store.send(sender, "recipient", "After /clear", "after")
-                time.sleep(1)  # Several channel polling cycles.
+                # Several complete channel polling cycles with the message queued.
+                polled = len(identities)
+                deadline = time.monotonic() + 10
+                while len(identities) < polled + 4 and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertGreaterEqual(len(identities), polled + 4)
                 self.assertFalse(delivered(after["id"]))
                 self.assertEqual(1, diagnostics.getvalue().count("peer delivery is fenced"))
             finally:

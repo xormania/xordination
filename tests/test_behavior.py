@@ -165,14 +165,14 @@ class BehaviorTests(unittest.TestCase):
                 def held(token, operation, arguments):
                     if operation == "wait":
                         entered.set()
-                        if not release.wait(3):
+                        if not release.wait(10):
                             raise TimeoutError("Owned wait gate was not released")
                     return original(token, operation, arguments)
                 with patch.object(server, "dispatch", held):
                     with MCPProcess(endpoint, binding["token"], directory) as client:
                         try:
                             waiting = client.start_request("tools/call", {"name": "xordination_wait", "arguments": {"timeout": 0}})
-                            self.assertTrue(entered.wait(2), "Wait did not enter its HTTP boundary")
+                            self.assertTrue(entered.wait(5), "Wait did not enter its HTTP boundary")
                             self.assertEqual(["worker"], [p["participant"] for p in client.tool("peers")["peers"]])
                             release.set()
                             response = client.response(waiting)

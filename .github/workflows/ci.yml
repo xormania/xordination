@@ -45,12 +45,7 @@ jobs:
           python-version: '3.12'
       - name: Install pinned lint tools
         run: |
-          python - <<'PY'
-          import pathlib, subprocess, sys, tomllib
-          config = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
-          dependencies = config['project']['optional-dependencies']['lint']
-          subprocess.run([sys.executable, '-m', 'pip', 'install', *dependencies], check=True)
-          PY
+          python scripts/ci/install.py lint
           ruff --version
           shellcheck --version
           actionlint --version
@@ -62,14 +57,18 @@ jobs:
         run: git ls-files -z -- '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
       - name: actionlint with ShellCheck on workflow run steps
         run: actionlint -shellcheck "$(command -v shellcheck)"
-  contracts:
-    name: Contracts and package (Python ${{ matrix.python }})
+  fast:
+    name: Fast contracts (Python 3.12)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ['3.10', '3.12', '3.14']
+    timeout-minutes: 5
+    outputs:
+      selection: ${{ steps.selection.outputs.selection }}
+      contracts: ${{ steps.selection.outputs.contracts }}
+      fast: ${{ steps.selection.outputs.fast }}
+      slow: ${{ steps.selection.outputs.slow }}
+      package: ${{ steps.selection.outputs.package }}
+      image: ${{ steps.selection.outputs.image }}
+      benchmark: ${{ steps.selection.outputs.benchmark }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -79,54 +78,88 @@ jobs:
         id: selection
         run: python scripts/ci/select_checks.py --selection-file "$RUNNER_TEMP/xordination-selection.json"
       - uses: actions/setup-python@v7
-        if: steps.selection.outputs.contracts == 'true' || (matrix.python == '3.12' && (steps.selection.outputs.package == 'true' || steps.selection.outputs.image == 'true'))
+        if: steps.selection.outputs.fast == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install measurement tools
+        if: steps.selection.outputs.fast == 'true'
+        run: python scripts/ci/install.py ci
+      - name: Fast contracts with canonical coverage
+        if: steps.selection.outputs.fast == 'true'
+        env:
+          PYTHONPATH: src
+        run: python scripts/ci/coverage_baseline.py --selection "$RUNNER_TEMP/xordination-selection.json" --tier fast --output "$RUNNER_TEMP/xordination-coverage-fast"
+      - name: Preserve fast coverage data
+        if: always() && steps.selection.outputs.fast == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-fast
+          path: ${{ runner.temp }}/xordination-coverage-fast/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Report selected checks
+        if: always()
+        run: python scripts/ci/report.py --selection "$RUNNER_TEMP/xordination-selection.json" "Fast contract execution census=$RUNNER_TEMP/xordination-coverage-fast/test-execution.json"
+  contracts:
+    name: Contracts (Python ${{ matrix.python }})
+    # Slower groups start only after lint and the fast contracts pass.
+    needs: [lint, fast]
+    if: needs.fast.outputs.contracts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    env:
+      SELECTION: ${{ needs.fast.outputs.selection }}
+      # The canonical interpreter already ran the fast tier; the others run every selected case.
+      TIER: ${{ matrix.python == '3.12' && 'slow' || 'all' }}
+      RUN: ${{ matrix.python != '3.12' || needs.fast.outputs.slow == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: env.RUN == 'true'
+        with:
+          persist-credentials: false
+      - name: Restore the selection published by the fast job
+        if: env.RUN == 'true'
+        run: printf '%s\n' "$SELECTION" > "$RUNNER_TEMP/xordination-selection.json"
+      - uses: actions/setup-python@v7
+        if: env.RUN == 'true'
         with:
           python-version: ${{ matrix.python }}
-          cache: ${{ matrix.python == '3.12' && (steps.selection.outputs.contracts == 'true' || steps.selection.outputs.package == 'true') && 'pip' || '' }}
+          cache: ${{ matrix.python == '3.12' && 'pip' || '' }}
           cache-dependency-path: pyproject.toml
-      - name: Install canonical build and measurement tools
-        if: matrix.python == '3.12' && (steps.selection.outputs.contracts == 'true' || steps.selection.outputs.package == 'true')
-        env:
-          XORDINATION_CONTRACTS: ${{ steps.selection.outputs.contracts }}
-        run: |
-          python - <<'PY'
-          import os, pathlib, subprocess, sys, tomllib
-          config = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
-          dependencies = config['build-system']['requires']
-          if os.environ['XORDINATION_CONTRACTS'] == 'true':
-              dependencies += config['project']['optional-dependencies']['ci']
-          subprocess.run([sys.executable, '-m', 'pip', 'install', *dependencies], check=True)
-          PY
+      - name: Install measurement tools
+        if: env.RUN == 'true' && matrix.python == '3.12'
+        run: python scripts/ci/install.py ci
       - name: Compile selected contract context
-        if: steps.selection.outputs.contracts == 'true'
+        if: env.RUN == 'true'
         run: python -m compileall -q src tests scripts/ci scripts/testing
-      - name: Selected contracts and canonical coverage
-        if: matrix.python == '3.12' && steps.selection.outputs.contracts == 'true'
+      - uses: actions/download-artifact@v7
+        if: env.RUN == 'true' && matrix.python == '3.12' && needs.fast.outputs.fast == 'true'
+        with:
+          name: coverage-fast
+          path: ${{ runner.temp }}/xordination-coverage-fast
+      - name: Slow contract shards and combined canonical coverage
+        if: env.RUN == 'true' && matrix.python == '3.12'
         env:
           PYTHONPATH: src
-        run: python scripts/ci/coverage_baseline.py --selection "$RUNNER_TEMP/xordination-selection.json" --output "$RUNNER_TEMP/xordination-coverage"
-      - name: Selected contracts
-        if: matrix.python != '3.12' && steps.selection.outputs.contracts == 'true'
+          FAST_DATA: ${{ needs.fast.outputs.fast == 'true' && format('{0}/xordination-coverage-fast/.coverage', runner.temp) || '' }}
+        run: python scripts/ci/coverage_baseline.py --selection "$RUNNER_TEMP/xordination-selection.json" --tier slow --parallel ${FAST_DATA:+--merge "$FAST_DATA"} --output "$RUNNER_TEMP/xordination-coverage"
+      - name: Contract shards
+        if: env.RUN == 'true' && matrix.python != '3.12'
         env:
           PYTHONPATH: src
         run: |
-          python scripts/ci/run_contracts.py --selection "$RUNNER_TEMP/xordination-selection.json" --report "$RUNNER_TEMP/xordination-test-execution.json"
+          python scripts/ci/run_contracts.py --selection "$RUNNER_TEMP/xordination-selection.json" --tier all --parallel --report "$RUNNER_TEMP/xordination-test-execution.json"
           python -m xordination --version
           python -m xordination --help
-      - name: Broker performance evidence (base and head, report-only timing)
-        id: benchmark
-        if: matrix.python == '3.12' && steps.selection.outputs.benchmark == 'true'
-        run: python scripts/ci/benchmark_compare.py --output "$RUNNER_TEMP/xordination-performance"
-      - name: Source archive to isolated installed package
-        if: matrix.python == '3.12' && steps.selection.outputs.package == 'true'
-        run: python scripts/ci/check_package.py
-      - name: Build and exercise durable nonroot broker image
-        if: matrix.python == '3.12' && steps.selection.outputs.image == 'true'
-        run: |
-          docker build --tag xordination-ci .
-          python scripts/ci/image_smoke.py --image xordination-ci
-      - name: Preserve selected coverage evidence
-        if: always() && matrix.python == '3.12' && steps.selection.outputs.contracts == 'true'
+      - name: Preserve combined coverage evidence
+        if: always() && env.RUN == 'true' && matrix.python == '3.12'
         uses: actions/upload-artifact@v7
         with:
           name: coverage-python-3.12
@@ -134,32 +167,74 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+      - name: Report contract execution
+        if: always() && env.RUN == 'true'
+        run: python scripts/ci/report.py "Contract execution census=$RUNNER_TEMP/xordination-test-execution.json" "Canonical contract execution census=$RUNNER_TEMP/xordination-coverage/test-execution.json"
+  package:
+    name: Package, image and performance
+    needs: [lint, fast]
+    if: needs.fast.outputs.package == 'true' || needs.fast.outputs.image == 'true' || needs.fast.outputs.benchmark == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Only the benchmark reads the base commit's product bytes.
+          fetch-depth: ${{ needs.fast.outputs.benchmark == 'true' && 0 || 1 }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install canonical build tools
+        if: needs.fast.outputs.package == 'true'
+        run: python scripts/ci/install.py build
+      - name: Source archive to isolated installed package
+        if: needs.fast.outputs.package == 'true'
+        run: python scripts/ci/check_package.py
+      # The image smoke's cross-profile client installs the wheel the package step left in dist/.
+      - name: Build and exercise durable nonroot broker image
+        if: needs.fast.outputs.image == 'true'
+        run: |
+          docker build --tag xordination-ci .
+          python scripts/ci/image_smoke.py --image xordination-ci
+      - name: Broker performance evidence (base and head, report-only timing)
+        id: benchmark
+        if: needs.fast.outputs.benchmark == 'true'
+        run: python scripts/ci/benchmark_compare.py --output "$RUNNER_TEMP/xordination-performance"
       - name: Preserve performance evidence
-        if: always() && matrix.python == '3.12' && steps.selection.outputs.benchmark == 'true' && steps.benchmark.outcome != 'skipped'
+        if: always() && needs.fast.outputs.benchmark == 'true' && steps.benchmark.outcome != 'skipped'
         uses: actions/upload-artifact@v7
         with:
           name: performance-python-3.12
           path: ${{ runner.temp }}/xordination-performance/
           if-no-files-found: error
           retention-days: 14
-      - name: Report selected checks
-        if: always()
+      - name: Report performance evidence
+        if: always() && needs.fast.outputs.benchmark == 'true'
+        run: python scripts/ci/report.py "Performance context=$RUNNER_TEMP/xordination-performance/ci-context.json" "Performance comparison=$RUNNER_TEMP/xordination-performance/comparison.json"
+  result:
+    name: CI result
+    # One stable check for rulesets: a selected job that failed, was cancelled or never ran fails it.
+    needs: [lint, fast, contracts, package]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every selected job passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          python - <<'PY'
-          import json, os, pathlib
-          selection = pathlib.Path(os.environ['RUNNER_TEMP']) / 'xordination-selection.json'
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as report:
-              if selection.is_file():
-                  report.write('Selected checks:\n\n```json\n' + json.dumps(json.loads(selection.read_text()), indent=2) + '\n```\n')
-              else:
-                  report.write('Selection failed before publishing a result; this job cannot authorize a skip.\n')
-              for name, filename in (
-                  ('Contract execution census', 'xordination-test-execution.json'),
-                  ('Canonical contract execution census', 'xordination-coverage/test-execution.json'),
-                  ('Performance context', 'xordination-performance/ci-context.json'),
-                  ('Performance comparison', 'xordination-performance/comparison.json'),
-              ):
-                  evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / filename
-                  if evidence.is_file():
-                      report.write('\n' + name + ':\n\n```json\n' + json.dumps(json.loads(evidence.read_text()), indent=2) + '\n```\n')
+          python3 - <<'PY'
+          import json, os, sys
+          results = {name: job['result'] for name, job in json.loads(os.environ['RESULTS']).items()}
+          print(json.dumps(results, indent=2))
+          outputs = json.loads(os.environ['RESULTS'])['fast'].get('outputs', {})
+          selected = {'lint': True, 'fast': True, 'contracts': outputs.get('contracts') == 'true',
+                      'package': any(outputs.get(name) == 'true' for name in ('package', 'image', 'benchmark'))}
+          bad = [name for name, result in results.items()
+                 if result != 'success' and not (result == 'skipped' and not selected[name])]
+          if bad:
+              sys.exit('Selected jobs did not pass: ' + ', '.join(bad))
           PY
