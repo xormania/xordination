@@ -71,7 +71,8 @@ package = importlib.import_module("xordination")
 version = importlib.metadata.version("xordination")
 assert package.__version__ == version
 for name in ("xordination", "xordination.adapters", "xordination.cli", "xordination.client",
-             "xordination.mcp", "xordination.rpc", "xordination.server", "xordination.store"):
+             "xordination.mcp", "xordination.readiness", "xordination.rpc", "xordination.server",
+             "xordination.store"):
     module = importlib.import_module(name)
     assert repo not in pathlib.Path(module.__file__).resolve().parents, name + " loaded checkout source"
 from xordination.store import Store
@@ -93,6 +94,14 @@ print(json.dumps({"version": version, "installed": package.__file__, "durable_op
         command = environment / ("Scripts/xordination.exe" if os.name == "nt" else "bin/xordination")
         version = subprocess.check_output([str(command), "--version"], cwd=staging, env=clean, text=True).strip()
         run([str(command), "--help"], cwd=staging, env=clean)
+        # Package readiness from the installation itself: identity, entry point on PATH, state location.
+        clean["PATH"] = str(command.parent) + os.pathsep + clean.get("PATH", "")
+        (staging / "state").mkdir()
+        package = json.loads(subprocess.check_output(
+            [str(command), "readiness", "--state", str(staging / "state" / "broker.sqlite3")],
+            cwd=staging, env=clean, text=True))["levels"]["package"]
+        if package["status"] != "passed" or Path(package["entry_point"]).resolve() != command.resolve():
+            raise ValueError("Installed package readiness did not pass: " + json.dumps(package))
         import shutil
         for artifact in (sources[0], built[0]):
             shutil.copy2(artifact, target / artifact.name)

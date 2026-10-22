@@ -134,8 +134,9 @@ class ProcessTmux:
         self.owner = None
 
 
-def supported(harness):
-    return {"harness": harness, "status": "supported", "version": {"value": "fixture " + harness + " 1.0"}}
+def supported(harness, binary=None):
+    return {"harness": harness, "status": "supported", "binary": binary or "/opt/" + harness + "/bin/" + harness,
+            "version": {"value": "fixture " + harness + " 1.0"}}
 
 
 class LauncherTests(unittest.TestCase):
@@ -166,6 +167,8 @@ class LauncherTests(unittest.TestCase):
                        startup_timeout=30, reply_timeout=30)
         config = json.loads((job / "config.json").read_text())
         self.assertEqual(config["participants"][0]["version"], "fixture codex 1.0")
+        # The probed executable is recorded so readiness can match evidence to it later.
+        self.assertEqual(config["participants"][0]["binary"], "/opt/codex/bin/codex")
         processes = []
         launch = self.tmux.launch
         self.tmux.launch = lambda record, name, argv: processes.append(name) or launch(record, name, argv)
@@ -186,7 +189,8 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(len(list((job / "run").glob("report-*.json"))), 1)
         report = json.loads(next((job / "run").glob("report-*.json")).read_text())
         # The retained report carries the run identity and the preflight doctor probe.
-        self.assertEqual(report["environment"]["capability_probes"], {"codex": supported("codex")})
+        self.assertEqual(report["environment"]["capability_probes"],
+                         {"alpha": supported("codex"), "beta": supported("codex")})
         self.assertEqual(summary["source"], report["environment"]["source"])
         self.assertEqual({name: (entry["observed_model"], entry["observed_reasoning"])
                           for name, entry in summary["native_settings"].items()},
@@ -439,6 +443,41 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((job / "run").exists())
         self.assertEqual(json.loads((job / "session.json").read_text())["state"], "error")
         self.assertIsNone(self.tmux.owner)
+
+    def test_preflight_probes_and_records_each_configured_executable(self):
+        calls = []
+        def observed(harness, binary=None):
+            calls.append((harness, binary))
+            if binary is None:
+                # The PATH default: absent for grok, another release for codex.
+                return ({"harness": harness, "status": "unavailable"} if harness == "grok" else
+                        {**supported(harness), "version": {"value": "path " + harness + " 1.0"}})
+            return {**supported(harness, binary), "version": {"value": "custom " + binary}}
+        job = self.job([{"name": "alpha", "harness": "codex", "binary": "/opt/custom/codex"},
+                        {"name": "beta", "harness": "grok", "binary": "/opt/custom/grok"},
+                        {"name": "gamma", "harness": "codex"},
+                        {"name": "delta", "harness": "codex", "binary": "/opt/custom/codex"}], doctor=observed)
+        # A valid executable outside PATH passes; each distinct executable is probed once.
+        self.assertEqual(sorted(calls, key=str), sorted([("codex", "/opt/custom/codex"), ("grok", "/opt/custom/grok"),
+                                                         ("codex", None)], key=str))
+        participants = {row["name"]: row for row in json.loads((job / "config.json").read_text())["participants"]}
+        self.assertEqual((participants["alpha"]["binary"], participants["alpha"]["version"]),
+                         ("/opt/custom/codex", "custom /opt/custom/codex"))
+        self.assertEqual((participants["beta"]["binary"], participants["beta"]["version"]),
+                         ("/opt/custom/grok", "custom /opt/custom/grok"))
+        self.assertEqual(participants["delta"]["version"], "custom /opt/custom/codex")
+        self.assertEqual((participants["gamma"]["binary"], participants["gamma"]["version"]),
+                         ("/opt/codex/bin/codex", "path codex 1.0"))
+        preflight = json.loads((job / "preflight.json").read_text())
+        self.assertEqual(preflight["participants"]["alpha"]["binary"], "/opt/custom/codex")
+
+    def test_preflight_names_an_unavailable_configured_executable(self):
+        def observed(harness, binary=None):
+            return {"harness": harness, "status": "unavailable"} if binary else supported(harness)
+        with self.assertRaisesRegex(ValueError, r"codex \(/opt/missing/codex\): unavailable"):
+            self.job([{"name": "alpha", "harness": "codex", "binary": "/opt/missing/codex"},
+                      {"name": "beta", "harness": "codex"}], doctor=observed)
+        self.assertFalse((self.folder / "job" / "run").exists())
 
     def test_reserved_window_names_are_refused(self):
         with self.assertRaisesRegex(ValueError, "reserved"):

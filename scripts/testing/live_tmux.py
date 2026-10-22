@@ -157,10 +157,20 @@ def preflight(config, doctor):
     names = required_names(config)
     if RESERVED & set(names):
         raise ValueError("Participant names dashboard/broker are reserved by the launcher")
+    # One probe per distinct executable (harness and configured binary), keyed by participant;
+    # its own observation supplies that participant's recorded version and executable.
     observations = live.probe_harnesses(config, doctor)
-    gaps = [harness + ": " + observation.get("status", "unknown") for harness, observation in observations.items()
-            if observation.get("status") != "supported"]
-    return {"harnesses": observations}, gaps
+    gaps = []
+    for participant in config["participants"]:
+        observation = observations.get(participant["name"])
+        if observation is None or observation.get("status") == "supported":
+            continue
+        binary = participant.get("binary")
+        gap = participant["harness"] + (" (" + binary + ")" if binary else "") + ": " + observation.get(
+            "status", "unknown")
+        if gap not in gaps:
+            gaps.append(gap)
+    return {"participants": observations}, gaps
 
 
 def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, reply_timeout=300, port=None,
@@ -192,11 +202,15 @@ def prepare_job(config_path, job, *, phase_timeout=30, startup_timeout=600, repl
         write_json(job / "session.json", record)
         raise ValueError(record["error"] + "; inspect " + str(job / "preflight.json"))
     for participant in config["participants"]:
-        observed = found["harnesses"].get(participant["harness"], {}).get("version", {}).get("value")
+        probe = found["participants"].get(participant["name"], {})
+        observed = probe.get("version", {}).get("value")
         if "version" not in participant and observed:
             participant["version"] = observed[:500]  # Observed --version output, still an operator observation.
+        # Record the probed executable; panes launch exactly it, and readiness matches it later.
+        if "binary" not in participant and isinstance(probe.get("binary"), str) and os.path.isabs(probe["binary"]):
+            participant["binary"] = probe["binary"]
     write_json(job / "config.json", config)
-    live.prepare(config, job / "run", probes=found["harnesses"])  # The report embeds the probes.
+    live.prepare(config, job / "run", probes=found["participants"])  # The report embeds the probes.
     for participant in config["participants"]:
         workspace = job / "workspaces" / participant["name"]
         workspace.mkdir(parents=True, mode=0o700)
@@ -245,7 +259,10 @@ def exec_pane(job, role):
         for key in ("model", "reasoning"):
             if participant.get(key):
                 argv += ["--" + key, participant[key]]
+        if participant.get("binary"):
+            argv += ["--binary", participant["binary"]]
     else:
+        # live.py adapter launches the participant's recorded executable itself.
         argv = [sys.executable, str(HERE.parent / "live.py"), "adapter", "--run", str(run),
                 "--participant", role, "--project", str(cwd)]
     os.chdir(cwd)

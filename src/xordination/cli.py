@@ -112,6 +112,16 @@ def parser():
             command.add_argument("--params", default="{}", help="JSON operation parameters")
         command.add_argument("--endpoint", default="http://127.0.0.1:8765")
         command.add_argument("--token-env", default="XORDINATION_TOKEN")
+    readiness = sub.add_parser("readiness", help="Report package, service, adapter and communication "
+                               "readiness separately without starting native sessions")
+    readiness.add_argument("--state", help="Durable state location to check; never created or opened")
+    readiness.add_argument("--endpoint", help="Broker endpoint for the service level")
+    readiness.add_argument("--token-env", help="Participant token variable (default XORDINATION_TOKEN, if set)")
+    readiness.add_argument("--harness", action="append", choices=("codex", "claude", "grok"), default=[],
+                           help="Probe installed adapter capabilities; repeatable")
+    readiness.add_argument("--binary", help="Explicit executable for a single --harness")
+    readiness.add_argument("--evidence", action="append", default=[],
+                           help="Retained operator_native verification report; repeatable")
     doctor = sub.add_parser("doctor", help="Observe installed harness capabilities without model calls")
     doctor.add_argument("--harness", choices=("codex", "claude", "grok"))
     doctor.add_argument("--binary")
@@ -164,6 +174,16 @@ def main(argv=None):
             names = [args.harness] if args.harness else ["codex", "claude", "grok"]
             write_json({"harnesses": {name: doctor(name, binary=args.binary) for name in names},
                         "live_communication_verified": False})
+            return 0
+        if args.command == "readiness":
+            from .readiness import report
+            if args.binary and len(set(args.harness)) != 1:
+                raise ValueError("--binary requires exactly one --harness")
+            # An explicitly named variable must exist; the default is used only when present.
+            token = (token_from_env(args.token_env) if args.token_env
+                     else os.environ.get("XORDINATION_TOKEN") or None)
+            write_json(report(state=args.state, endpoint=args.endpoint, token=token,
+                              harnesses=args.harness, binary=args.binary, evidence=args.evidence))
             return 0
         token = token_from_env(args.token_env)
         if args.command == "stdio":

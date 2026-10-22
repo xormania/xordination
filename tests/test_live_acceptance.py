@@ -1,6 +1,8 @@
 """Adversarial verifier tests use synthetic native events, never vendor sessions."""
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import queue
@@ -14,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from helpers import owned_broker
+from xordination.cli import main
 from xordination.client import Client
 from xordination.store import Store
 
@@ -29,8 +32,10 @@ class LiveAcceptanceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name) / "run"
-        live.prepare({"participants": [{"name": "alice", "harness": "codex", "version": "fixture"},
-                                        {"name": "bob", "harness": "grok", "version": "fixture"}]}, self.directory)
+        live.prepare({"participants": [{"name": "alice", "harness": "codex", "version": "fixture",
+                                         "binary": "/opt/codex/bin/codex"},
+                                        {"name": "bob", "harness": "grok", "version": "fixture",
+                                         "binary": "/opt/grok/bin/grok"}]}, self.directory)
         self.store = Store(self.directory / "broker.sqlite3")
         self.addCleanup(self.store.close)
         self.contexts = {}
@@ -123,6 +128,61 @@ class LiveAcceptanceTests(unittest.TestCase):
                 connection.execute("UPDATE messages SET body='mutation'")
         token = live.load(self.directory / "alice.connection.json")["token"]
         self.assertNotIn(token, json.dumps(report))
+
+    def readiness(self, *args):
+        # The installed executables the run recorded; `--binary` stands for a different one.
+        def doctor(name, binary=None):
+            return {"harness": name, "status": "supported", "binary": binary or "/opt/" + name + "/bin/" + name,
+                    "version": {"value": "fixture", "returncode": 0}}
+        stdout = io.StringIO()
+        with patch("xordination.adapters.doctor", side_effect=doctor), \
+                patch.dict(os.environ, {"XORDINATION_TOKEN": ""}), contextlib.redirect_stdout(stdout):
+            self.assertEqual(main(["readiness", *args]), 0)
+        return json.loads(stdout.getvalue())["levels"]
+
+    def retained_verification(self):
+        before = set(self.directory.glob("report-*.json"))
+        report = live.verify(self.directory)
+        (path,) = set(self.directory.glob("report-*.json")) - before
+        return report, str(path)
+
+    def test_retained_verifier_reports_are_readiness_evidence(self):
+        # Producer -> consumer: the report live.py retains is what `xordination readiness` accepts.
+        failed, failed_path = self.retained_verification()
+        self.assertEqual(failed["status"], "fail")
+        for case in self.frozen["cases"]:
+            self.exercise(case)
+        passed, passed_path = self.retained_verification()
+        self.assertEqual(passed["status"], "pass")
+        levels = self.readiness("--harness", "codex", "--harness", "grok", "--evidence", passed_path)
+        communication = levels["communication"]
+        self.assertEqual(communication["status"], "passed")
+        (evidence,) = communication["reports"]
+        self.assertEqual((evidence["run_id"], evidence["source_sha256"]), (passed["run_id"], passed["source_sha256"]))
+        self.assertEqual(evidence["sha256"], hashlib.sha256(Path(passed_path).read_bytes()).hexdigest())
+        self.assertEqual({(pair["sender_harness"], pair["recipient_harness"], pair["status"])
+                          for pair in evidence["pairs"]}, {("codex", "grok", "pass"), ("grok", "codex", "pass")})
+        for name in ("codex", "grok"):
+            self.assertEqual(levels["adapter"]["harnesses"][name]["checks"]["session_identity"], "passed", name)
+        self.assertEqual(levels["adapter"]["status"], "passed")
+        levels = self.readiness("--harness", "codex", "--harness", "grok", "--evidence", failed_path,
+                                "--evidence", passed_path)
+        self.assertEqual(levels["communication"]["status"], "failed")
+        self.assertEqual([pair["status"] for pair in levels["communication"]["reports"][0]["pairs"]],
+                         ["fail", "fail"])
+        # The verifier's source fingerprint is the one readiness recomputes from the package.
+        self.assertEqual(passed["runner_sha256"], hashlib.sha256(SCRIPT.read_bytes()).hexdigest())
+        paths = [SCRIPT] + sorted((SCRIPT.parents[2] / "src" / "xordination").glob("*.py"))
+        self.assertEqual(passed["source_sha256"], live.digest(
+            {str(path.relative_to(SCRIPT.parents[2])): hashlib.sha256(path.read_bytes()).hexdigest()
+             for path in paths}))
+        # Evidence from another executable, or for a harness left unprobed, certifies nothing.
+        levels = self.readiness("--harness", "codex", "--binary", "/usr/local/bin/codex-next",
+                                "--evidence", passed_path)
+        self.assertEqual(levels["communication"]["status"], "unverified")
+        self.assertIn("alice: binary_mismatch", levels["communication"]["reports"][0]["scope"]["gaps"])
+        self.assertIn("bob: harness_not_probed", levels["communication"]["reports"][0]["scope"]["gaps"])
+        self.assertEqual(levels["adapter"]["harnesses"]["codex"]["checks"]["session_identity"], "unverified")
 
     def test_broker_ack_and_reply_without_native_observation_cannot_pass(self):
         for case in self.frozen["cases"]:

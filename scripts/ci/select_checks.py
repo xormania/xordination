@@ -22,6 +22,10 @@ SOURCE_GROUPS = {
     # Public dispatch and subprocess entry points are explicit dependency edges.
     # The benchmark runs a separate broker process through cli.serve.
     "cli.py": ("adapters", "mcp", "server", "cli", "end_to_end", "behavior", "performance", "live_acceptance", "live_native_busy", "live_tmux"),
+    # Lazily imported by CLI dispatch; end_to_end runs it in a separate client process.
+    # It consumes the live.py verifier report; live_acceptance feeds a retained one through it.
+    # live.py lazily imports its source fingerprint from here, so every live group depends on it.
+    "readiness.py": ("cli", "end_to_end", "live_acceptance", "live_native_busy", "live_tmux"),
     "__init__.py": GROUPS,
     "__main__.py": GROUPS,
 }
@@ -30,6 +34,8 @@ TEST_GROUPS["tests/live_native_fixture.py"] = ("live_native_busy",)
 SCRIPT_GROUPS = {
     "scripts/testing/benchmark.py": ("performance",),
     # The managed launcher imports live.py and starts the broker through the public CLI.
+    # live.py produces the verifier report that `xordination readiness` consumes; the
+    # live_acceptance group carries that producer -> consumer integration case.
     "scripts/testing/live.py": ("live_acceptance", "live_native_busy", "live_tmux"),
     "scripts/testing/live_tmux.py": ("live_tmux",),
 }
@@ -76,7 +82,8 @@ def classify_paths(paths):
             package = image = True
             reasons.append("Package/image input: " + path)
         elif path == ".dockerignore":
-            image = True
+            # The image smoke's cross-profile client installs the package artifact.
+            package = image = True
             reasons.append("Image context input: " + path)
         elif (path.startswith("docs/") and path.endswith(".md")) or path == "AGENTS.md":
             package = True

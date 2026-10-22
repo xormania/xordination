@@ -139,6 +139,23 @@ Use `claude` or `grok` in place of `codex` for the other adapters. `--binary` se
 
 The adapter preserves the project's available tools and operator policy. Consumer roles and work-order policies are supplied through the public contract. Proof-only tools, fixture workloads, and fixed peers remain test controls.
 
+## Readiness report
+
+`readiness` reports the four readiness levels separately and lists only those that passed. It never launches a native session or calls a model:
+
+```sh
+xordination readiness --state .xordination/broker.sqlite3 --endpoint http://127.0.0.1:8765 --token-env XORDINATION_TOKEN --harness codex
+```
+
+| Level | Passes when | Otherwise |
+| --- | --- | --- |
+| `package` | The imported module is the installed distribution at the running version, the `xordination` console entry point is declared and the command found on `PATH` is the console script that distribution recorded installing, and the `--state` location is usable. The store is never created or opened | `unverified` without `--state` or when the distribution records no installed files; `failed` for a checkout, a mismatched installation or another environment's `xordination` earlier on `PATH` |
+| `service` | Broker health and an authenticated read-only `identity` operation succeed | `unverified` with health alone (no token); `failed` when unreachable or rejected |
+| `adapter` | Each `--harness` has installed capability (`doctor`) and an observed native session identity from supplied passing evidence that matches the current runtime | `unverified` with no `--harness` or capability only; `failed` when unavailable or unsupported |
+| `communication` | Every `--evidence` report from `scripts/testing/live.py verify` passed and matches the current runtime | `unverified` without evidence or when any report does not match or cannot be matched; `failed` when a matching report failed |
+
+Evidence reports are structurally checked, including the verifier's own pass rule, but not re-verified. Unreadable or inconsistent evidence is refused. A report counts only when it describes this runtime: its `source_sha256` must equal the fingerprint recomputed from the imported package and the report's `runner_sha256` (the same computation `live.py` uses), its `config_sha256` must match the configuration its participants and cases describe, and each exercised participant's recorded `binary` and `version` must equal the current `doctor` result for its harness. Select every harness a report uses with `--harness`; an unprobed harness, a different `--binary`, other source, or a report without these fingerprints leaves both levels `unverified`, never passed. Without `--token-env`, `XORDINATION_TOKEN` is used only when set. Communication readiness does not establish application-work completion.
+
 ## Optional broker sidecar
 
 Build the local broker-only image. It contains no vendor CLIs or vendor credentials:
