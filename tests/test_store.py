@@ -486,8 +486,8 @@ sys.stdin.buffer.read(1)
             "db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
             "db.execute('PRAGMA journal_mode=WAL')\n"
             "db.execute('PRAGMA wal_autocheckpoint=0')\n"
-            "db.executescript(\"CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');"
-            "PRAGMA user_version=%d;\" % int(sys.argv[2]))\n"
+            "db.executescript(\"CREATE TABLE future (value TEXT); INSERT INTO future VALUES ('kept');\")\n"
+            "db.execute('PRAGMA user_version=' + str(int(sys.argv[2])))\n"
             "os._exit(0)\n"), str(path), str(Store.SCHEMA_VERSION + 1)], check=True)
         files = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
         self.assertTrue(all(file.exists() for file in files))
