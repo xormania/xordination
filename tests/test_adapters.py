@@ -827,6 +827,49 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
             child.stdout.close()
 
 
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    async def test_termination_during_cleanup_still_kills_stubborn_family(self):
+        # The broker stopped the adapter, so cleanup is already in its grace
+        # period when SIGTERM arrives; the signal must not cut it short.
+        lock = str(Path(self.temporary.name) / "cleanup.lock")
+        script = (
+            "import asyncio,sys\n"
+            "from xordination.adapters import CodexAdapter, supervise\n"
+            "class Client:\n"
+            "    def call(self, operation, **params):\n"
+            "        return {'stopped': True} if operation == 'claim' else {}\n"
+            "adapter = CodexAdapter(Client(), sys.executable, '.')\n"
+            "async def start():\n"
+            "    await adapter.spawn([sys.executable, '-u', '-c', sys.argv[1], sys.argv[2], 'stubborn'], jsonrpc=False)\n"
+            "    await adapter.rpc.request('fixture/held', {}, timeout=10)\n"
+            "    adapter.rpc.stop_grace = 1.5\n"
+            "    send = adapter.rpc.send\n"
+            "    def sent(group, kill):\n"
+            "        send(group, kill)\n"
+            "        print('killed' if kill else 'terminated', flush=True)\n"
+            "    adapter.rpc.send = sent\n"
+            "adapter.start = start\n"
+            "sys.exit(asyncio.run(supervise(adapter)))\n")
+        import xordination
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(Path(xordination.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])}
+        child = subprocess.Popen([sys.executable, "-c", script, FAMILY_NATIVE, lock], cwd=self.temporary.name,
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            line = await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)
+            self.assertEqual(line, b"terminated\n")
+            self.assertTrue(self.lock_held(lock), "The grandchild ignores SIGTERM")
+            child.terminate()
+            self.assertEqual(await asyncio.wait_for(asyncio.to_thread(child.wait), 10), 128 + 15)
+            # Checked at the supervisor's return, not after a later reprieve.
+            self.assertFalse(self.lock_held(lock), "supervise returned while the family survived")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+
+
 class ProbeAndChannelTests(unittest.TestCase):
     def test_mismatched_authenticated_harness_never_probes_launches_or_mutates_binding(self):
         from xordination.store import Store

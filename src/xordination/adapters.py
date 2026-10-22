@@ -226,6 +226,7 @@ class NativeAdapter:
         self.stderr_task = None
         self.tasks = set()
         self.pending_attempts = {}
+        self.cleanup = None
         self.permission_lock = asyncio.Lock()
         self.binding_lock = asyncio.Lock()
         self.activity_sequence = 0
@@ -351,6 +352,17 @@ class NativeAdapter:
             await self.close()
 
     async def close(self):
+        """Run cleanup once, to completion, even if the awaiting task is cancelled.
+
+        A termination signal can arrive after cleanup began; it must not
+        interrupt the family stop, so the cleanup runs as its own task and a
+        later close() waits for that same task.
+        """
+        if self.cleanup is None:
+            self.cleanup = asyncio.ensure_future(self._close())
+        await asyncio.shield(self.cleanup)
+
+    async def _close(self):
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -879,6 +891,9 @@ async def supervise(adapter):
     except asyncio.CancelledError:
         if not received:
             raise
+        # The signal may have interrupted cleanup already under way; wait for
+        # that cleanup, which is shielded, rather than return while it runs.
+        await adapter.close()
         return 128 + int(received[0])
     finally:
         for number in installed:

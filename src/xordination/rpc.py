@@ -98,6 +98,7 @@ class RPC:
         self.write_lock = asyncio.Lock()
         self.dead = asyncio.Event()
         self.failure = None
+        self.stopping = None
         self.reader = asyncio.create_task(self.read())
 
     def packet(self, **fields):
@@ -216,19 +217,39 @@ class RPC:
         signalled through a pidfd, so a reused group ID or PID is never hit,
         including after a crashed leader was reaped. Elsewhere the group is
         signalled only while the unreaped leader still holds its ID.
+
+        The stop runs once, as its own task, so cancelling a caller neither
+        interrupts nor repeats it; a later stop() waits for the same task.
         """
-        group, self.group = self.group, None
+        if self.stopping is None:
+            self.stopping = asyncio.ensure_future(self._stop())
+        await asyncio.shield(self.stopping)
+
+    async def _stop(self):
+        group = self.group
         if group is None and self.process.returncode is not None:
             return
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.stop_grace
-        self.send(group, kill=False)
         try:
-            await asyncio.wait_for(self.process.wait(), self.stop_grace)
-        except asyncio.TimeoutError:
-            pass
-        while group is not None and self.occupied(group) and loop.time() < deadline:
-            await asyncio.sleep(.05)
-        if self.process.returncode is None or (group is not None and self.occupied(group)):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.stop_grace
+            self.send(group, kill=False)
+            try:
+                await asyncio.wait_for(self.process.wait(), self.stop_grace)
+            except asyncio.TimeoutError:
+                pass
+            while group is not None and self.occupied(group) and loop.time() < deadline:
+                await asyncio.sleep(.05)
+            if self.process.returncode is None or (group is not None and self.occupied(group)):
+                self.send(group, kill=True)
+                await self.process.wait()
+                # Killed members are gone from the scan once they have exited.
+                deadline = loop.time() + 1
+                while group is not None and self.occupied(group) and loop.time() < deadline:
+                    await asyncio.sleep(.01)
+        except asyncio.CancelledError:
+            # Only loop shutdown reaches here; never leave the family on a grace period.
             self.send(group, kill=True)
-            await self.process.wait()
+            raise
+        finally:
+            # The handle is dropped only once escalation is done.
+            self.group = None
