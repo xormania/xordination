@@ -306,6 +306,14 @@ class _Server:
                     return
                 if identity.get("capabilities", {}).get("channel_registered") is not True:
                     continue
+                if identity.get("native_identity_source") == "conflict":
+                    # The broker fences claims; say why once instead of polling failures.
+                    if last_failure != "native_identity_conflict":
+                        self.error_output.write("xordination: native session changed; peer delivery is fenced "
+                                                "until explicit participant replacement\n")
+                        self.error_output.flush()
+                        last_failure = "native_identity_conflict"
+                    continue
                 attempt = self.client.call("claim")
                 message = attempt.get("message")
                 if not message:

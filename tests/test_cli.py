@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from helpers import observe_fsync, owned_broker
+from helpers import isolated_process_env, observe_fsync, owned_broker
 from xordination.adapters import _mcp_args
 from xordination.cli import main
 from xordination.store import Store
@@ -107,6 +107,32 @@ class BootstrapSafety(unittest.TestCase):
                 self.assertEqual(store.authenticate(original["token"])["generation"], original["generation"])
             finally:
                 store.close()
+
+    def test_claude_hook_entry_point_refuses_retired_generation_without_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with owned_broker(Path(folder) / "state.sqlite") as (store, _, endpoint):
+                store.create_space("project")
+                sender = store.authenticate(store.join("project", "sender")["token"])
+                retired = store.join("project", "claude", harness="claude", native_id="old-session")
+                old_message = store.send(sender, "claude", "For the old generation", "old")
+                current = store.join("project", "claude", harness="claude", native_id="new-session", replace=True)
+                context = store.authenticate(current["token"])
+                store.bind(context, "new-session", {"channel_registered": True})
+                before = (store.identity(context), store.authenticate(retired["token"], allow_retired=True),
+                          store.status(sender, old_message["id"]))
+                packet = {"session_id": "cleared-session", "hook_event_name": "SessionStart", "source": "clear"}
+                result = subprocess.run(
+                    [sys.executable, "-m", "xordination", "claude-hook", "--endpoint", endpoint,
+                     "--token-env", "XORDINATION_TEST_TOKEN"],
+                    input=json.dumps(packet), capture_output=True, text=True, timeout=30, cwd=folder,
+                    env=isolated_process_env(folder, token=retired["token"]))
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("", result.stdout)  # No native hook decision or continuation override.
+                self.assertIn("superseded", result.stderr)
+                self.assertNotIn(retired["token"], result.stderr)
+                after = (store.identity(context), store.authenticate(retired["token"], allow_retired=True),
+                         store.status(sender, old_message["id"]))
+                self.assertEqual(before, after)
 
 
 class DiagnosticsBundle(unittest.TestCase):
@@ -243,6 +269,72 @@ class DiagnosticsBundle(unittest.TestCase):
             self.assertTrue(lookup(written, key), key)
         self.assertEqual("<redacted 14 chars>", written[0]["params"]["arguments"]["metadata"]["id"])
         self.assertEqual("<redacted 14 chars>", written[1]["result"]["structuredContent"]["metadata"]["id"])
+
+    def test_native_identity_conflict_fields_stay_redacted(self):
+        observed, native = "observed-session-5b2e", "native-session-81c0"
+        source, withheld = "hook-reported-77aa", "native_identity_conflict"
+        frames = [
+            # An identity tool result now carries the fenced conflict record.
+            {"jsonrpc": "2.0", "id": "call-identity", "result": {
+                "content": [{"type": "text", "text": "{}"}], "isError": False,
+                "structuredContent": {"id": "participant-1", "native_id": native,
+                                      "native_identity_source": "conflict",
+                                      "native_identity_conflict": {"observed_native_id": observed,
+                                                                   "identity_source": source, "observed": 1.5}}}},
+            # A withheld message keeps correlation identifiers only.
+            {"jsonrpc": "2.0", "id": "call-status", "result": {
+                "content": [{"type": "text", "text": "{}"}], "isError": False,
+                "structuredContent": {"id": "m-1", "message_id": "m-1", "body": None, "metadata": None,
+                                      "content_withheld": withheld,
+                                      "messages": [{"id": "m-2", "content_withheld": withheld,
+                                                    "native_id": native}]}}},
+            # Fenced tool errors surface only as text content.
+            {"jsonrpc": "2.0", "id": "call-send", "result": {"isError": True, "content": [{"type": "text", "text":
+                json.dumps({"error": {"code": "replacement_required", "message": "fenced " + observed}})}]}},
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            path = folder / "conflict.trace"
+            trace = Trace(path, "mcp-stdio")
+            for frame in frames:
+                trace.record("out", frame)
+            trace.close()
+            with path.open("a") as stream:
+                for index, frame in enumerate(frames):
+                    stream.write(json.dumps({"format": "xordination-trace/1", "trace": "legacy", "seq": index + 1,
+                                             "stream": "mcp-stdio", "direction": "out", "event": "frame",
+                                             "monotonic_ns": 1, "time": 1.0, "frame": frame}) + "\n")
+            traced = path.read_text()
+            output = folder / "support.zip"
+            bundle(output, traces=[path])
+            with zipfile.ZipFile(output) as archive:
+                bundled = archive.read("traces/00-conflict.trace").decode()
+        written = [json.loads(line)["frame"] for line in traced.splitlines()
+                   if '"legacy"' not in line and "frame" in json.loads(line)]
+        def leaves(value):
+            if isinstance(value, dict):
+                return [leaf for item in value.values() for leaf in leaves(item)]
+            if isinstance(value, list):
+                return [leaf for item in value for leaf in leaves(item)]
+            return [value] if isinstance(value, str) else []
+        rebundled = [json.loads(line)["frame"] for line in bundled.splitlines() if "frame" in json.loads(line)]
+        self.assertEqual(written + written, rebundled)
+        kept = leaves(rebundled)
+        # Key names stay structural; no new conflict value is kept anywhere.
+        for value in (observed, native, source, "replacement_required"):
+            self.assertNotIn(value, bundled)
+            self.assertFalse(any(value in leaf for leaf in kept), value)
+        for value in (withheld, "conflict"):
+            self.assertNotIn(value, kept)
+        identity = written[0]["result"]["structuredContent"]
+        self.assertEqual("participant-1", identity["id"])
+        self.assertEqual("<redacted 21 chars>", identity["native_identity_conflict"]["observed_native_id"])
+        self.assertEqual(1.5, identity["native_identity_conflict"]["observed"])
+        status = written[1]["result"]["structuredContent"]
+        self.assertEqual(("m-1", "m-1", "m-2"), (status["id"], status["message_id"], status["messages"][0]["id"]))
+        self.assertEqual("<redacted 24 chars>", status["content_withheld"])
+        self.assertIsNone(status["body"])
+        self.assertTrue(written[2]["result"]["content"][0]["text"].startswith("<redacted "))
 
     def test_trace_stops_with_marker_at_size_limit(self):
         with tempfile.TemporaryDirectory() as folder:

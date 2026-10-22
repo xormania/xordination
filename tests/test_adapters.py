@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -860,6 +861,69 @@ class ProbeAndChannelTests(unittest.TestCase):
         self.assertEqual(client.calls[0][0], "bind")
         self.assertEqual(client.calls[0][1]["native_id"], "actual-native")
         self.assertTrue(client.calls[0][1]["capabilities"]["identity_observed"])
+
+    def test_claude_session_change_fences_channel_delivery_until_replacement(self):
+        from xordination.mcp import _Server
+        from xordination.store import Store, StoreError
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(Path(folder) / "broker.sqlite")
+            store.create_space("project")
+            sender = store.authenticate(store.join("project", "sender", harness="codex")["token"])
+            joined = store.join("project", "recipient", harness="claude", native_id="launch-session")
+            context = store.authenticate(joined["token"])
+            store.bind(context, "launch-session", {"channel_registered": True})
+            class StoreClient:
+                endpoint, token = "http://127.0.0.1:1", joined["token"]
+                def call(self, operation, **params):
+                    return getattr(store, operation)(context, **params)
+            written = []
+            class Output:
+                def write(self, wire):
+                    written.append(json.loads(wire))
+                def flush(self):
+                    pass
+            def delivered(message_id):
+                return any(packet.get("method") == "notifications/claude/channel"
+                           and packet["params"]["meta"]["message_id"] == message_id for packet in written)
+            diagnostics = io.StringIO()
+            server = _Server(StoreClient(), Output(), channel=True, error_output=diagnostics)
+            try:
+                server.receive({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "claude", "version": "fixture"}}})
+                server.receive({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                before = store.send(sender, "recipient", "Before /clear", "before")
+                deadline = time.monotonic() + 5
+                while not delivered(before["id"]) and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(delivered(before["id"]))
+                # /clear: the same channel process now writes into a new conversation.
+                with patch("xordination.client.Client", return_value=StoreClient()):
+                    with self.assertRaises(StoreError) as refused:
+                        claude_hook("http://127.0.0.1:1", joined["token"], packet={
+                            "session_id": "cleared-session", "hook_event_name": "SessionStart", "source": "clear"})
+                self.assertEqual("replacement_required", refused.exception.code)
+                after = store.send(sender, "recipient", "After /clear", "after")
+                time.sleep(1)  # Several channel polling cycles.
+                self.assertFalse(delivered(after["id"]))
+                self.assertEqual(1, diagnostics.getvalue().count("peer delivery is fenced"))
+            finally:
+                server.close()
+            status = store.status(sender, after["id"])
+            self.assertEqual(("queued", []), (status["state"], status["attempts"]))
+            with self.assertRaises(StoreError) as fenced:
+                store.claim(context)
+            self.assertEqual("replacement_required", fenced.exception.code)
+            peer = next(row for row in store.peers(sender)["peers"] if row["participant"] == "recipient")
+            self.assertEqual(("launch-session", "conflict"), (peer["native_id"], peer["native_identity_source"]))
+            self.assertEqual("cleared-session", peer["native_identity_conflict"]["observed_native_id"])
+            # Fencing is not replacement: the same generation stays authenticated
+            # and only an explicit join --replace plus recovery moves the message.
+            self.assertEqual(joined["generation"], store.identity(context)["generation"])
+            replacement = store.authenticate(store.join("project", "recipient", harness="claude", replace=True)["token"])
+            self.assertTrue(store.recover(replacement, after["id"])["recovered"])
+            self.assertEqual(after["id"], store.claim(replacement)["message"]["id"])
+            store.close()
 
 
 CLAUDE_FLAGS = ("--session-id", "--mcp-config", "--debug-file", "--dangerously-load-development-channels")
